@@ -1,9 +1,13 @@
-//! 扩展钩子端口：工具调用进入原生执行管线，结果改写进入统一模型视图。
+//! 扩展钩子端口：连接共享 DSH 宿主的运行时工具管线与提供方端口。
 //!
-//! 端口由 daemon 注入（ExtensionBus 的适配器）。扩展只能阻止或提出改写，不能批准：
-//! - `tool.call` 在账本指纹、路径与并发分类、权限和审批之前生效；改写后的参数用本轮工具定义
-//!   重新校验，之后原生管线对**最终内容**照常裁决，不复用原参数的任何批准；
-//! - `tool.result` 在请求投影时只改模型可见副本，实时与 canonical 重建共用同一入口。
+//! 端口由 daemon 注入（共享 DSH 宿主 `PluginServicesBridge` 的适配器）：
+//! - `tool_call` 对应 `tools/pre-execute` + `tools.guard` + `ctx.approval` 决策：允许插件
+//!   放行（含审批来源标注）、要求审批、改写参数或拒绝；
+//! - `tool_result` 对应 `tools/post-execute` + `toolResultPruner` + `tools/result`；
+//! - `system_prompt_assemble` 对应 `system-prompt/assemble`（允许完整改写或追加段，并与缓存谱系联动）；
+//! - `approval_decide` 对应 `ctx.approval`（审批链放行或拒绝，审计由 daemon 记录来源）；
+//! - `project_request_messages` / `extend_llm_request` / `intercept_llm_stream` 对应消息投影与模型请求/流环绕；
+//! - `dispatch_agent_loop` 对应显式选中的插件 `ctx.agentLoop`。
 
 use crate::tool_call_validation::validate_tool_call_batch;
 use magi_bridge_client::{ChatToolCall, ChatToolDefinition};
@@ -21,15 +25,108 @@ pub struct ToolHookScope<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolCallDecision {
-    /// 继续执行。`arguments` 为改写后的参数 JSON（未改写为 `None`）；`rewritten_by` 为改写过它的插件。
+    /// 继续执行（仍按 Magi 原生审批/权限策略裁决）。`arguments` 为改写后的参数 JSON（未改写为 `None`）。
     Proceed {
         arguments: Option<String>,
         rewritten_by: Vec<String>,
+    },
+    /// 插件通过 `tools/pre-execute` + `ctx.approval` 明确放行；daemon 记录审批来源插件。
+    AllowByPlugin {
+        plugin: String,
+        arguments: Option<String>,
+        rewritten_by: Vec<String>,
+    },
+    /// 插件 `tools/pre-execute` 返回 `ask`，要求显式审批确认。
+    RequireApproval {
+        plugin: String,
+        reason: String,
     },
     Blocked {
         plugin: String,
         reason: String,
     },
+}
+
+/// `system-prompt/assemble` 的返回：允许插件整体替换（`complete = true`）或追加系统提示文本。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemPromptOverride {
+    pub complete: bool,
+    pub text: String,
+}
+
+/// 审批请求视图（供 `ctx.approval` 插件参与审批链裁决）。
+#[derive(Clone, Copy, Debug)]
+pub struct ApprovalHookRequest<'a> {
+    pub call_id: &'a str,
+    pub tool_name: &'a str,
+    pub reason: &'a str,
+}
+
+/// `ctx.approval` 插件的审批结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApprovalHookDecision {
+    Allow { plugin: String },
+    Deny { plugin: String, reason: String },
+    Defer,
+}
+
+/// `host.llm.extendRequest` 给插件看的当前模型请求视图（只含非凭据元数据与参数）。
+#[derive(Clone, Copy, Debug)]
+pub struct LlmRequestExtendView<'a> {
+    pub provider: &'a str,
+    pub model: Option<&'a str>,
+    pub max_output_tokens: Option<u32>,
+    pub message_count: usize,
+    pub tool_count: usize,
+}
+
+/// `deepseekLlmApiExtensions` / `llm/stream` 扩展对单次模型请求的增量改写。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LlmRequestExtension {
+    pub max_output_tokens: Option<u32>,
+    pub append_user_messages: Vec<String>,
+}
+
+/// `llm/stream` 环绕钩子在模型响应完成后收到的结构化视图。
+#[derive(Clone, Debug)]
+pub struct LlmStreamInterceptView<'a> {
+    pub provider: &'a str,
+    pub model: Option<&'a str>,
+    pub attempt: u32,
+    pub content: &'a str,
+    pub reasoning_content: Option<&'a str>,
+    pub tool_call_names: &'a [String],
+    pub finish_reason: Option<&'a str>,
+}
+
+/// `llm/stream` 环绕钩子对已返回模型响应的裁决（支持验收、正文替换或有界重试）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LlmStreamInterceptDecision {
+    Accept,
+    Replace {
+        content: String,
+    },
+    Retry {
+        reason: Option<String>,
+        append_user_message: Option<String>,
+    },
+}
+
+/// `ctx.agentLoop` 接管主线 Turn 执行时的输入视图。
+#[derive(Clone, Debug)]
+pub struct PluginAgentLoopRequest<'a> {
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub task_id: &'a str,
+    pub prompt: &'a str,
+}
+
+/// `ctx.agentLoop` 调度结果；显式选中外部循环不可用或失败时必须返回 `Failed`，绝不静默回退到原生循环。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PluginAgentLoopOutcome {
+    Native,
+    Completed { output: String },
+    Failed { error: String },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -201,6 +298,11 @@ impl RequestHistoryProjection {
                 context_window_tokens,
                 &mut report,
             ),
+            None => history,
+        };
+        let history = match hooks.and_then(|hooks| hooks.project_request_messages(scope, &history))
+        {
+            Some(projected) => projected,
             None => history,
         };
         (history, report)
@@ -545,6 +647,70 @@ pub trait ExtensionHooks: Send + Sync {
         SpawnDecision::Proceed
     }
 
+    /// `system-prompt/assemble`：允许插件整体改写系统提示（`complete: true`）或附加系统段。
+    fn system_prompt_assemble(
+        &self,
+        _scope: &ToolHookScope<'_>,
+        _base_prompt: &str,
+    ) -> Option<SystemPromptOverride> {
+        None
+    }
+
+    /// `ctx.approval`：允许插件参与审批链裁决（放行、拒绝或交给原生审批）。
+    fn approval_decide(
+        &self,
+        _scope: &ToolHookScope<'_>,
+        _request: &ApprovalHookRequest<'_>,
+    ) -> ApprovalHookDecision {
+        ApprovalHookDecision::Defer
+    }
+
+    /// `tools.restrict`：按插件在当前会话作用域注册的限制过滤可见工具名。
+    fn filter_visible_tools(&self, _scope: &ToolHookScope<'_>, names: Vec<String>) -> Vec<String> {
+        names
+    }
+
+    /// `sessions.registerMessageProjection` + `agent/pre-step`：在模型请求发送前投影消息序列。
+    fn project_request_messages(
+        &self,
+        _scope: &ToolHookScope<'_>,
+        _messages: &[magi_bridge_client::ChatMessage],
+    ) -> Option<Vec<magi_bridge_client::ChatMessage>> {
+        None
+    }
+
+    /// `deepseekLlmApiExtensions` / `llm/stream`：在单次模型请求冻结前扩展请求参数。
+    fn extend_llm_request(
+        &self,
+        _scope: &ToolHookScope<'_>,
+        _view: &LlmRequestExtendView<'_>,
+    ) -> Option<LlmRequestExtension> {
+        None
+    }
+
+    /// `llm/stream` 环绕：允许插件检查已完成的模型响应流，决定放行、替换正文或触发有界重试。
+    fn intercept_llm_stream(
+        &self,
+        _scope: &ToolHookScope<'_>,
+        _view: &LlmStreamInterceptView<'_>,
+    ) -> LlmStreamInterceptDecision {
+        LlmStreamInterceptDecision::Accept
+    }
+
+    /// `ctx.agentLoop`：若当前显式选中了非 `magi-native` 的插件执行循环，返回其执行结果。
+    fn dispatch_agent_loop(
+        &self,
+        _request: &PluginAgentLoopRequest<'_>,
+        _cancelled: &std::sync::atomic::AtomicBool,
+    ) -> PluginAgentLoopOutcome {
+        PluginAgentLoopOutcome::Native
+    }
+
+    /// 是否有非 `magi-native` 的插件 `ctx.agentLoop` 处于显式选中状态（O(1) 快速检查）。
+    fn has_selected_plugin_agent_loop(&self) -> bool {
+        false
+    }
+
     /// 一个工具调用即将进入原生管线。
     fn tool_call(&self, scope: &ToolHookScope<'_>, call: &ChatToolCall) -> ToolCallDecision;
     /// 工具结果的模型可见投影即将交给模型；返回 `Some` 替换投影。
@@ -608,11 +774,18 @@ pub(crate) fn prepare_tool_calls(
             ToolCallDecision::Proceed {
                 arguments: Some(arguments),
                 ..
+            }
+            | ToolCallDecision::AllowByPlugin {
+                arguments: Some(arguments),
+                ..
             } => arguments.as_str(),
             _ => call.function.arguments.as_str(),
         };
-        let spawn_block = (matches!(decision, ToolCallDecision::Proceed { .. })
-            && crate::task_helpers::canonical_tool_call_name(tool) == "agent_spawn")
+        let spawn_block = (matches!(
+            decision,
+            ToolCallDecision::Proceed { .. } | ToolCallDecision::AllowByPlugin { .. }
+        ) && crate::task_helpers::canonical_tool_call_name(tool)
+            == "agent_spawn")
             .then(|| spawn_view(spawn_arguments))
             .flatten()
             .and_then(|view| {
@@ -646,6 +819,93 @@ pub(crate) fn prepare_tool_calls(
                     &format!("扩展 {plugin} 阻止了该调用：{reason}"),
                     Some(&plugin),
                 ));
+            }
+            ToolCallDecision::RequireApproval { plugin, reason } => {
+                match hooks.approval_decide(
+                    scope,
+                    &ApprovalHookRequest {
+                        call_id: &call.id,
+                        tool_name: tool,
+                        reason: &reason,
+                    },
+                ) {
+                    ApprovalHookDecision::Allow { plugin: approver } => {
+                        tracing::info!(
+                            session_id = %scope.session_id,
+                            tool,
+                            approver = %approver,
+                            "工具调用已由插件审批提供方放行"
+                        );
+                        batch.execute_positions.push(index);
+                        batch.execute.push(call.clone());
+                    }
+                    ApprovalHookDecision::Deny {
+                        plugin: denier,
+                        reason: deny_reason,
+                    } => {
+                        batch.immediate[index] = Some(rejected(
+                            tool,
+                            "extension_approval_denied",
+                            &format!("扩展 {denier} 拒绝了审批：{deny_reason}"),
+                            Some(&denier),
+                        ));
+                    }
+                    ApprovalHookDecision::Defer => {
+                        // 无插件审批者答复时按 DSH fail-closed 要求进入拒绝/显式审批边界。
+                        batch.immediate[index] = Some(rejected(
+                            tool,
+                            "extension_approval_required",
+                            &format!("扩展 {plugin} 要求审批且当前无审批答复：{reason}"),
+                            Some(&plugin),
+                        ));
+                    }
+                }
+            }
+            ToolCallDecision::AllowByPlugin {
+                plugin,
+                arguments: None,
+                ..
+            } => {
+                tracing::info!(
+                    session_id = %scope.session_id,
+                    tool,
+                    approver = %plugin,
+                    "工具调用已由插件 tools/pre-execute 放行"
+                );
+                batch.execute_positions.push(index);
+                batch.execute.push(call.clone());
+            }
+            ToolCallDecision::AllowByPlugin {
+                plugin,
+                arguments: Some(arguments),
+                rewritten_by,
+            } => {
+                tracing::info!(
+                    session_id = %scope.session_id,
+                    tool,
+                    approver = %plugin,
+                    "工具调用已由插件 tools/pre-execute 改写并放行"
+                );
+                let mut rewritten = call.clone();
+                rewritten.function.arguments = arguments;
+                let validation =
+                    validate_tool_call_batch(std::slice::from_ref(&rewritten), definitions);
+                if let Some(invalid) = validation.invalid_calls.first() {
+                    batch.immediate[index] = Some(rejected(
+                        tool,
+                        "extension_rewrite_invalid",
+                        &format!(
+                            "扩展 {} 改写后的参数未通过工具校验：{}",
+                            rewritten_by.join(","),
+                            invalid.issue.message
+                        ),
+                        rewritten_by.first().map(String::as_str),
+                    ));
+                    continue;
+                }
+                batch.rewritten_by[index] = rewritten_by;
+                batch.execute_positions.push(index);
+                batch.execute.push(rewritten);
             }
             ToolCallDecision::Proceed {
                 arguments: None, ..

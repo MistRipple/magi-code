@@ -1,0 +1,67 @@
+[
+  {
+    "case": "cancel-dispatch",
+    "turnId": "turn-session-action-1795024724749",
+    "status": "running",
+    "calls": [
+      {
+        "callId": "call_00_HxrrZ1dkM0WbfD2FvaE84265",
+        "status": "running",
+        "resultStatus": "awaiting_approval",
+        "errorCode": "tool_policy_needs_approval"
+      }
+    ]
+  },
+  {
+    "case": "rea-analysis-cancel-turn",
+    "turnId": "turn-session-action-1795024724749",
+    "status": "cancelled",
+    "calls": [
+      {
+        "callId": "call_00_HxrrZ1dkM0WbfD2FvaE84265",
+        "status": "cancelled",
+        "resultStatus": "running",
+        "errorCode": null
+      }
+    ]
+  },
+  {
+    "case": "crash-dispatch",
+    "turnId": "turn-session-action-1795024730513",
+    "status": "running",
+    "calls": [
+      {
+        "callId": "call_00_D5ytHlFbfEdmqiszgOlF6889",
+        "status": "running",
+        "resultStatus": "awaiting_approval",
+        "errorCode": "tool_policy_needs_approval"
+      }
+    ]
+  },
+  {
+    "case": "rea-analysis-crash-turn",
+    "turnId": "turn-session-action-1795024730513",
+    "status": "failed",
+    "calls": [
+      {
+        "callId": "call_00_D5ytHlFbfEdmqiszgOlF6889",
+        "status": "failed",
+        "resultStatus": "failed",
+        "errorCode": "plugin_tool_rpc_error"
+      }
+    ]
+  },
+  {
+    "case": "rea-analysis-recovered-turn",
+    "turnId": "turn-session-action-1795024746811",
+    "status": "completed",
+    "calls": [
+      {
+        "callId": "call_00_Koav3ccbY1pEHc18Lw1v4738",
+        "status": "completed",
+        "resultStatus": "succeeded",
+        "errorCode": null
+      }
+    ]
+  }
+]

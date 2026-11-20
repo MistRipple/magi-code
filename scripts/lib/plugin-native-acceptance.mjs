@@ -1,5 +1,21 @@
 import { pageTools, waitFor } from './electron-harness.mjs';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+
+export function acceptanceChildrenOf(parent, command) {
+  return execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,command='], { encoding: 'utf8' })
+    .split('\n').map(line => line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)).filter(Boolean)
+    .filter(row => Number(row[2]) === parent && row[3].includes(command))
+    .map(row => Number(row[1]));
+}
+
+export function acceptanceHostPid(electronPid) {
+  const daemons = acceptanceChildrenOf(electronPid, '/daemon/magi-daemon-app');
+  assert.equal(daemons.length, 1, '验收 Electron 应有唯一 daemon');
+  const hosts = acceptanceChildrenOf(daemons[0], '/dsh/runtime/entry.mjs');
+  assert.equal(hosts.length, 1, '验收 daemon 应有唯一共享插件宿主');
+  return hosts[0];
+}
 
 // 只固定发给真实 daemon 的版本参数；不替换在线响应、原包或执行结果。
 export async function previewFixedUpstreamFromNative({ page, packageName, version }) {
@@ -16,17 +32,44 @@ export async function previewFixedUpstreamFromNative({ page, packageName, versio
   } finally { await page.call('Fetch.disable'); off(); }
 }
 
+export async function installFixedUpstreamFromNative({ page, request, packageName, version }) {
+  const ui = pageTools(page);
+  if (!await page.evaluate('Boolean(document.querySelector("[data-testid=settings-page]")?.getClientRects().length)')) {
+    await ui.click('[data-testid=sidebar-settings]');
+  }
+  const nav = '[data-testid="settings-nav-plugins"]';
+  await waitFor(() => ui.exists(nav), '插件设置导航');
+  await ui.click(nav);
+  await waitFor(() => ui.exists('[data-testid="plugin-search"]'), '在线搜索');
+  await page.evaluate(`(() => {
+    const input = document.querySelector('[data-testid="plugin-search"]');
+    input.value = ${JSON.stringify(packageName)};
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  const row = `[data-testid="plugin-row"][data-plugin-id=${JSON.stringify('upstream:dsh:' + packageName)}]`;
+  await waitFor(() => ui.exists(row), '真实 npm 搜索结果', 60_000);
+  await ui.click(row);
+  await previewFixedUpstreamFromNative({ page, packageName, version });
+  const confirm = '[data-action="confirm-candidate"]';
+  await waitFor(() => ui.exists(confirm), '固定原包安装预览');
+  await ui.click(confirm);
+  return await waitFor(async () => {
+    const plugin = (await request('/api/plugins')).plugins.find(row => row.manifest.id === packageName);
+    return plugin?.manifest.version === version && plugin.runtime?.state === 'running' && plugin;
+  }, '设置页安装并激活固定原包', 300_000);
+}
+
 // 上游先发布启动目录，再异步刷新在线目录；只在验收驱动等待，不改变产品选模。
-export async function waitForPluginModel({ request, pluginId, modelId = 'deepseek-v4.1-flash', record }) {
+export async function waitForPluginModel({ request, pluginId, sourceId, modelId = 'deepseek-v4.1-flash', record }) {
   let previous, stableSince = Date.now();
   const result = await waitFor(async () => {
     const groups = (await request('/api/settings/models/catalog')).groups.filter(group => group.pluginId === pluginId);
     const models = groups.flatMap(group => group.models.map(model => ({ ...model, sourceId: group.sourceId })));
     const fingerprint = JSON.stringify(models);
     if (previous !== fingerprint) { previous = fingerprint; stableSince = Date.now(); }
-    const selected = models.find(model => model.id === modelId);
+    const selected = models.find(model => model.id === modelId && (sourceId === undefined || model.sourceId === sourceId));
     return selected && Date.now() - stableSince >= 6000 && { selected, groups };
-  }, `真实在线目录稳定后的指定模型 ${modelId}`, 90_000, 500);
+  }, `真实在线目录稳定后的指定模型 ${sourceId ? `${sourceId}/` : ''}${modelId}`, 90_000, 500);
   await record(result);
   return result.selected;
 }

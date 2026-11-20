@@ -45,6 +45,7 @@ pub use project::{
 pub use public_text::{
     PUBLIC_REDACTED_PATH, PUBLIC_REDACTED_VALUE, PUBLIC_RUNTIME_SUMMARY_MAX_CHARS,
     public_runtime_excerpt, public_runtime_summary, public_runtime_text,
+    redact_credentials_json_strings, redact_credentials_text,
 };
 pub use status::{
     ApprovalRequirement, ExecutionResultStatus, RiskLevel, SessionLifecycleStatus,

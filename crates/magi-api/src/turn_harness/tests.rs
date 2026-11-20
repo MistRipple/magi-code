@@ -2802,6 +2802,37 @@ fn job_side_effect_command() -> &'static str {
 async fn background_job_cancel_during_start_journal_cannot_spawn_an_orphan() {
     struct CancelStartingJob;
     impl magi_session_store::SessionEventWriter for CancelStartingJob {
+        fn append_model_attempt_stream(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelAttemptStream,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "attempt streams are not part of this test".into(),
+            })
+        }
+        fn append_model_request(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelRequestSnapshot,
+        ) -> magi_core::DomainResult<Option<u64>> {
+            Err(magi_core::DomainError::Persistence {
+                message: "model requests are not part of this test".into(),
+            })
+        }
+        fn append_session_title(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "title events are not part of this test".into(),
+            })
+        }
         fn append_session_transaction(
             &self,
             _: &SessionId,
@@ -2900,6 +2931,37 @@ async fn background_job_cancel_commit_failure_remains_retryable() {
         settlement_visible: Arc<AtomicBool>,
     }
     impl magi_session_store::SessionEventWriter for RejectCancellation {
+        fn append_model_attempt_stream(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelAttemptStream,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "attempt streams are not part of this test".into(),
+            })
+        }
+        fn append_model_request(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelRequestSnapshot,
+        ) -> magi_core::DomainResult<Option<u64>> {
+            Err(magi_core::DomainError::Persistence {
+                message: "model requests are not part of this test".into(),
+            })
+        }
+        fn append_session_title(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "title events are not part of this test".into(),
+            })
+        }
         fn append_session_transaction(
             &self,
             _: &SessionId,
@@ -3044,6 +3106,37 @@ async fn background_job_cancel_commit_failure_remains_retryable() {
 async fn background_job_persistence_failure_prevents_process_side_effects() {
     struct RejectJobWriter;
     impl magi_session_store::SessionEventWriter for RejectJobWriter {
+        fn append_model_attempt_stream(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelAttemptStream,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "attempt streams are not part of this test".into(),
+            })
+        }
+        fn append_model_request(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelRequestSnapshot,
+        ) -> magi_core::DomainResult<Option<u64>> {
+            Err(magi_core::DomainError::Persistence {
+                message: "model requests are not part of this test".into(),
+            })
+        }
+        fn append_session_title(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "title events are not part of this test".into(),
+            })
+        }
         fn append_session_transaction(
             &self,
             _: &SessionId,
@@ -4619,7 +4712,7 @@ async fn run_restricted_background_shell_approval_case(
     let task = harness
         .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
         .await;
-    // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+    // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
     let expected_turn_status = if decision == "cancel" {
         CanonicalTurnStatus::Cancelled
     } else {
@@ -5412,7 +5505,7 @@ async fn run_restricted_git_push_case(case_name: &'static str, decision: &'stati
     let allowed = decision == "allow_once";
     assert_eq!(
         turn.status,
-        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
         if decision == "cancel" {
             CanonicalTurnStatus::Cancelled
         } else {
@@ -5697,7 +5790,7 @@ async fn run_restricted_git_pull_case(case_name: &'static str, decision: &'stati
     let allowed = decision == "allow_once";
     assert_eq!(
         turn.status,
-        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
         if decision == "cancel" {
             CanonicalTurnStatus::Cancelled
         } else {
@@ -5998,7 +6091,7 @@ async fn run_restricted_git_merge_case(case_name: &'static str, decision: &'stat
     let allowed = decision == "allow_once";
     assert_eq!(
         turn.status,
-        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
         if decision == "cancel" {
             CanonicalTurnStatus::Cancelled
         } else {
@@ -6296,7 +6389,7 @@ async fn run_restricted_git_worktree_create_case(case_name: &'static str, decisi
     let allowed = decision == "allow_once";
     assert_eq!(
         turn.status,
-        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
         if decision == "cancel" {
             CanonicalTurnStatus::Cancelled
         } else {
@@ -6662,7 +6755,7 @@ async fn run_restricted_git_worktree_remove_case(case_name: &'static str, decisi
     let allowed = decision == "allow_once";
     assert_eq!(
         turn.status,
-        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
         if decision == "cancel" {
             CanonicalTurnStatus::Cancelled
         } else {
@@ -7327,7 +7420,7 @@ async fn restricted_profile_git_branch_create_denial_preserves_branch_state() {
     let task = harness
         .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
         .await;
-    // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+    // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
     assert_eq!(turn.status, CanonicalTurnStatus::Completed);
     assert_eq!(task.status, magi_core::TaskStatus::Completed);
     assert!(
@@ -7437,7 +7530,7 @@ async fn run_restricted_git_branch_create_terminal_case(
         .await;
     assert_eq!(
         turn.status,
-        // 过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        // 过期只结束这次调用，模型拿到结果后完成本轮。
         if lifecycle == "cancel" {
             CanonicalTurnStatus::Cancelled
         } else {
@@ -7732,7 +7825,7 @@ async fn run_restricted_git_branch_delete_case(case_name: &'static str, decision
     let allowed = decision == "allow_once";
     assert_eq!(
         turn.status,
-        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+        // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
         if decision == "cancel" {
             CanonicalTurnStatus::Cancelled
         } else {
@@ -10331,7 +10424,7 @@ async fn restricted_profile_git_branch_switch_allow_for_turn_does_not_cross_turn
     let second_turn = harness
         .wait_for_terminal(&session_id, &second_turn_id)
         .await;
-    // 第二轮的拒绝只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+    // 第二轮的拒绝只结束这次调用，模型拿到结果后完成本轮。
     assert_eq!(second_turn.status, CanonicalTurnStatus::Completed);
     assert_eq!(current_git_branch(&workspace_root), "approval-target");
     let second_provider_requests =
@@ -10463,7 +10556,7 @@ async fn restricted_profile_git_branch_switch_allow_for_turn_does_not_cross_sess
     let second_turn = harness
         .wait_for_terminal(&second_session_id, &second_turn_id)
         .await;
-    // 第二轮的拒绝只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+    // 第二轮的拒绝只结束这次调用，模型拿到结果后完成本轮。
     assert_eq!(second_turn.status, CanonicalTurnStatus::Completed);
     assert_eq!(current_git_branch(&workspace_root), "approval-target");
     let second_provider_requests =
@@ -10526,7 +10619,7 @@ async fn restricted_profile_git_branch_switch_denial_preserves_branch_and_comple
     let task = harness
         .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
         .await;
-    // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+    // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
     assert_eq!(turn.status, CanonicalTurnStatus::Completed);
     assert_eq!(task.status, magi_core::TaskStatus::Completed);
     assert_eq!(
@@ -11038,7 +11131,7 @@ async fn restricted_profile_approval_denial_returns_to_model_without_side_effect
     let task = harness
         .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
         .await;
-    // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+    // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
     assert_eq!(turn.status, CanonicalTurnStatus::Completed);
     assert_eq!(task.status, magi_core::TaskStatus::Completed);
     assert!(!target.exists(), "用户拒绝后不得产生写入副作用");
@@ -11392,7 +11485,7 @@ async fn restricted_profile_file_remove_denial_preserves_path_without_retry() {
     let task = harness
         .wait_for_task_terminal(&magi_core::TaskId::new(root_task_id))
         .await;
-    // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮（P1-9）。
+    // 拒绝或过期只结束这次调用，模型拿到结果后完成本轮。
     assert_eq!(turn.status, CanonicalTurnStatus::Completed);
     assert_eq!(task.status, magi_core::TaskStatus::Completed);
     assert!(target.exists(), "拒绝 file_remove 后目标文件必须保留");
@@ -13000,6 +13093,37 @@ async fn mainline_skill_flush_precedes_success_and_failure_stops_followup() {
             seen: Arc<AtomicU64>,
         }
         impl magi_session_store::SessionEventWriter for ObserveSkillReceipt {
+            fn append_model_attempt_stream(
+                &self,
+                _: &magi_core::SessionId,
+                _: &str,
+                _: u64,
+                _: magi_session_store::ModelAttemptStream,
+            ) -> magi_core::DomainResult<u64> {
+                Err(magi_core::DomainError::Persistence {
+                    message: "attempt streams are not part of this test".into(),
+                })
+            }
+            fn append_model_request(
+                &self,
+                _: &magi_core::SessionId,
+                _: &str,
+                _: u64,
+                _: magi_session_store::ModelRequestSnapshot,
+            ) -> magi_core::DomainResult<Option<u64>> {
+                Err(magi_core::DomainError::Persistence {
+                    message: "model requests are not part of this test".into(),
+                })
+            }
+            fn append_session_title(
+                &self,
+                _: &magi_core::SessionId,
+                _: &str,
+            ) -> magi_core::DomainResult<u64> {
+                Err(magi_core::DomainError::Persistence {
+                    message: "title events are not part of this test".into(),
+                })
+            }
             fn append_session_transaction(
                 &self,
                 _: &SessionId,
@@ -13870,6 +13994,37 @@ async fn run_transferred_agent_control(action: &str) {
             reject_result: bool,
         }
         impl magi_session_store::SessionEventWriter for RejectSkillActivation {
+            fn append_model_attempt_stream(
+                &self,
+                _: &magi_core::SessionId,
+                _: &str,
+                _: u64,
+                _: magi_session_store::ModelAttemptStream,
+            ) -> magi_core::DomainResult<u64> {
+                Err(magi_core::DomainError::Persistence {
+                    message: "attempt streams are not part of this test".into(),
+                })
+            }
+            fn append_model_request(
+                &self,
+                _: &magi_core::SessionId,
+                _: &str,
+                _: u64,
+                _: magi_session_store::ModelRequestSnapshot,
+            ) -> magi_core::DomainResult<Option<u64>> {
+                Err(magi_core::DomainError::Persistence {
+                    message: "model requests are not part of this test".into(),
+                })
+            }
+            fn append_session_title(
+                &self,
+                _: &magi_core::SessionId,
+                _: &str,
+            ) -> magi_core::DomainResult<u64> {
+                Err(magi_core::DomainError::Persistence {
+                    message: "title events are not part of this test".into(),
+                })
+            }
             fn append_session_transaction(
                 &self,
                 _: &SessionId,
@@ -15347,6 +15502,37 @@ async fn interrupt_replacement_commit_failure_retains_input_and_revision_checked
 {
     struct FailCancellation(std::sync::atomic::AtomicBool);
     impl magi_session_store::SessionEventWriter for FailCancellation {
+        fn append_model_attempt_stream(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelAttemptStream,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "attempt streams are not part of this test".into(),
+            })
+        }
+        fn append_model_request(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelRequestSnapshot,
+        ) -> magi_core::DomainResult<Option<u64>> {
+            Err(magi_core::DomainError::Persistence {
+                message: "model requests are not part of this test".into(),
+            })
+        }
+        fn append_session_title(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "title events are not part of this test".into(),
+            })
+        }
         fn append_session_transaction(
             &self,
             _: &SessionId,

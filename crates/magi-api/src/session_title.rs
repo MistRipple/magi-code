@@ -138,7 +138,7 @@ async fn refine_new_session_title_and_publish(
         .session_store
         .session(&session_id)
         .and_then(|session| state.session_workspace_id(&session));
-    publish_session_title_updated(&state, &session_id, workspace_id, &renamed.title);
+    publish_session_title_updated(&state, &session_id, workspace_id, &renamed.session.title);
     true
 }
 

@@ -1,0 +1,41 @@
+{
+  "platform": "macOS arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "1c853fe3efc221571b32afa35322e9f1c90b33d1a3d3078752917f93c9307b1f",
+  "sdkLockSha256": "7af3cb1d8834be2fd81b29aadbbab3c08c051876746b4a6a2075aa8afe286e9e",
+  "runtimeEntrySha256": "ea779aed05e641419adaef2b5e329f77afb9dae82983a03099e5095d14d4d405",
+  "observerSha256": "15377ce1632bb9a624d9e46b9617afa31ef7c86c97e3191ea6942741a413a23c",
+  "samples": [
+    {
+      "name": "dsh-plugin-message-history",
+      "version": "1.0.6",
+      "sha256": "515d9940416782c95c4487e77985a3eb41beb0ddd50836211aa1af072503e82b",
+      "integrity": "sha512-QKn0vz7nap+IB2kwKs4RKkx01qG8wVhMhHmceTGaHikAmXfi8WGieUQQihL+rbw9DopJtXz4CRzCjs9gDgqSwA=="
+    },
+    {
+      "name": "dsh-connect-workbuddy",
+      "version": "5.21.2",
+      "sha256": "3237011989e3d52483c1ec0e76874dd4d2f296a5b119cd25a08385cee0ab3fc0",
+      "integrity": "sha512-Yu2W+/WUCzPhP2fUi45B+L98GP7xTYQqSc0/XM7lQedaids5Kmj2LBqyJ3zI7SsrN4gtt84ZOnFqdlbKVU5NZg=="
+    }
+  ],
+  "checks": {
+    "liveOriginalRoute": {
+      "matchedSession": true,
+      "model": "deepseek-v4.1-flash",
+      "turnStatus": "completed",
+      "eventSeq": 2
+    },
+    "disabledInputNotObserved": {
+      "disabledRouteStatus": 403,
+      "replacedInstanceStatus": 409,
+      "presentMessages": 1
+    },
+    "restartReadsOriginalStorage": {
+      "retainedInput": true,
+      "newInput": true,
+      "presentMessages": 2
+    }
+  },
+  "dependencyLockSha256": "acead6c19264aa67b9c27369c87a1ce54cd90c457e0277b7495287998d2a830a"
+}

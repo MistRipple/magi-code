@@ -84,11 +84,121 @@ pub(super) struct BodyStreamTiming {
     pub(super) usage_observed: bool,
 }
 
-#[derive(Default)]
-pub(super) struct StreamDeltaProgress {
+/// 一次尝试的流记录状态：墙钟起点（毫秒）、单调起点、工具名解码器、事件通道与记录器。
+pub(super) struct StreamRecording {
+    wall_started_ms: u64,
+    started_at: Instant,
+    last_time_ms: u64,
+    tool_name_codec: ProviderToolNameCodec,
+    tx: mpsc::Sender<StreamMessage>,
+    recorder: Option<crate::AttemptStreamRecorder>,
+}
+
+impl StreamRecording {
+    pub(super) fn start(
+        tool_name_codec: ProviderToolNameCodec,
+        tx: mpsc::Sender<StreamMessage>,
+    ) -> Self {
+        let wall_started_ms = magi_core::UtcMillis::now().0;
+        let _ = tx.send(StreamMessage::Observation(
+            ModelTransportEvent::LiveStreamStart,
+        ));
+        Self {
+            wall_started_ms,
+            started_at: Instant::now(),
+            last_time_ms: wall_started_ms,
+            tool_name_codec,
+            tx,
+            recorder: Some(crate::AttemptStreamRecorder::new()),
+        }
+    }
+
+    fn timestamp(&mut self, elapsed: Duration) -> u64 {
+        let at = self
+            .wall_started_ms
+            .saturating_add(elapsed.as_millis() as u64)
+            .max(self.last_time_ms);
+        self.last_time_ms = at;
+        at
+    }
+
+    fn emit_live(&self, chunks: Vec<crate::LiveStreamChunk>) {
+        for chunk in chunks {
+            let _ = self.tx.send(StreamMessage::Observation(
+                ModelTransportEvent::LiveStreamChunk(chunk),
+            ));
+        }
+    }
+
+    pub(super) fn push(&mut self, received_at: Duration, chunk: &crate::llm_types::LlmStreamChunk) {
+        let at = self.timestamp(received_at);
+        let live = if let Some(recorder) = self.recorder.as_mut() {
+            recorder.push_emitting(at, chunk, &|name| self.tool_name_codec.decode_name(name))
+        } else {
+            return;
+        };
+        self.emit_live(live);
+    }
+
+    /// `replace` 语义的提供方整段改写已交付文本，没有精确增量流可言；放弃本次流记录并通知实时流结束。
+    pub(super) fn invalidate(&mut self) {
+        if self.recorder.take().is_some() {
+            let _ = self.tx.send(StreamMessage::Observation(
+                ModelTransportEvent::LiveStreamAbandon,
+            ));
+        }
+    }
+
+    pub(super) fn finish(
+        &mut self,
+        received_at: Duration,
+        stop_reason: Option<&str>,
+    ) -> Option<Vec<Value>> {
+        let finished_at = self.timestamp(received_at);
+        let recorder = self.recorder.take()?;
+        let Some((stream, live)) =
+            recorder.finish_with_emitting(finished_at, stop_reason, &|name| {
+                self.tool_name_codec.decode_name(name)
+            })
+        else {
+            let _ = self.tx.send(StreamMessage::Observation(
+                ModelTransportEvent::LiveStreamAbandon,
+            ));
+            return None;
+        };
+        self.emit_live(live);
+        Some(stream)
+    }
+
+    pub(super) fn fail(&mut self, error: &BridgeClientError) -> Option<Vec<Value>> {
+        let recorder = self.recorder.take()?;
+        let finished_at = self.timestamp(self.started_at.elapsed());
+        let (failure, aborted) = crate::AttemptStreamFailure::from_bridge_error(error);
+        let (stream, live) = recorder.fail_with_emitting(finished_at, failure, aborted, &|name| {
+            self.tool_name_codec.decode_name(name)
+        });
+        self.emit_live(live);
+        Some(stream)
+    }
+}
+
+/// 一次流式尝试的进度：已发给界面的增量长度，以及外层持有的流记录器借用。
+pub(super) struct StreamDeltaProgress<'a> {
     pub(super) content_len: usize,
     pub(super) thinking_len: usize,
     pub(super) tool_call_count: usize,
+    recording: &'a mut StreamRecording,
+}
+
+impl<'a> StreamDeltaProgress<'a> {
+    pub(super) fn new(recording: &'a mut StreamRecording) -> Self {
+        Self {
+            content_len: 0,
+            thinking_len: 0,
+            tool_call_count: 0,
+            recording,
+        }
+    }
 }
 
 impl BodyStreamTiming {
@@ -194,7 +304,7 @@ pub(super) fn apply_provider_stream_event(
     provider_family: ProviderFamily,
     event: &crate::protocol::streaming::SseEvent,
     accumulator: &mut StreamAccumulator,
-    delta_progress: &mut StreamDeltaProgress,
+    delta_progress: &mut StreamDeltaProgress<'_>,
     tx: &std::sync::mpsc::Sender<StreamMessage>,
     timing: &mut BodyStreamTiming,
     received_at: Duration,
@@ -219,6 +329,10 @@ pub(super) fn apply_provider_stream_event(
     );
     if !has_usage {
         llm_chunks.retain(|chunk| chunk.usage.is_none());
+    }
+    // 记录在合并之前、按这次 HTTP 读取的到达时间（绝对毫秒）逐块进行。
+    for chunk in &llm_chunks {
+        delta_progress.recording.push(received_at, chunk);
     }
     accumulator.apply_all(&llm_chunks);
     // Responses 兼容网关可能先发 usage snapshot，再在 response.completed
@@ -259,6 +373,7 @@ pub(super) fn apply_provider_stream_event(
             new_suffix(&accumulated_thinking, delta_progress.thinking_len);
         let replace = content_rewritten || thinking_rewritten;
         if replace {
+            delta_progress.recording.invalidate();
             // 改写帧两个字段都携带完整文字。
             content = accumulated_content.clone();
             thinking = accumulated_thinking.clone();
@@ -412,6 +527,7 @@ pub(super) fn execute_streaming_http_post(
             Ok(StreamMessage::Observation(event)) => observer(&event)?,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = observer(&ModelTransportEvent::LiveStreamAbandon);
                 return Err(BridgeClientError::CallFailed {
                     layer: BridgeErrorLayer::Transport,
                     code: Some(-32005),
@@ -474,9 +590,9 @@ pub(super) fn execute_streaming_http_post_with_retries(
             })?;
         }
         transport_finished(&result, controls.observer)?;
-        let can_retry =
-            !emitted_delta.load(Ordering::SeqCst) && retries < MODEL_PROVIDER_MAX_RETRIES;
-        let can_retry_empty_stream = retries < MODEL_PROVIDER_EMPTY_STREAM_RETRIES;
+        let can_retry = !emitted_delta.load(Ordering::SeqCst) && retries < controls.max_retries;
+        let empty_stream_retries = MODEL_PROVIDER_EMPTY_STREAM_RETRIES.min(controls.max_retries);
+        let can_retry_empty_stream = retries < empty_stream_retries;
         let timeout_budget_left = result.as_ref().err().is_none_or(|error| {
             !is_timeout_error(error) || timeout_retries < MODEL_PROVIDER_TIMEOUT_RETRIES
         });
@@ -496,9 +612,9 @@ pub(super) fn execute_streaming_http_post_with_retries(
                     provider_retry_delay(retries, provider_error_retry_after(&error))
                 };
                 let max_attempts = if is_empty_stream {
-                    MODEL_PROVIDER_EMPTY_STREAM_RETRIES
+                    empty_stream_retries
                 } else {
-                    MODEL_PROVIDER_MAX_RETRIES
+                    controls.max_retries
                 };
                 (controls.on_retry)(&ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::Scheduled,
@@ -530,8 +646,8 @@ pub(super) fn execute_streaming_http_post_with_retries(
                         .as_ref()
                         .err()
                         .filter(|error| retryable_empty_stream_error(error))
-                        .map(|_| MODEL_PROVIDER_EMPTY_STREAM_RETRIES)
-                        .unwrap_or(MODEL_PROVIDER_MAX_RETRIES);
+                        .map(|_| empty_stream_retries)
+                        .unwrap_or(controls.max_retries);
                     (controls.on_retry)(&ModelRetryRuntimeEvent {
                         phase: ModelRetryRuntimePhase::Settled,
                         attempt: retries,
@@ -558,6 +674,24 @@ pub(super) struct StreamingHttpIoRequest {
 }
 
 pub(super) async fn streaming_http_io(request: StreamingHttpIoRequest) -> StreamingHttpResult {
+    let tx = request.tx.clone();
+    let tool_name_codec = request.tool_name_codec.clone();
+    let mut recording = StreamRecording::start(tool_name_codec, tx.clone());
+    let result = streaming_http_io_inner(request, &mut recording).await;
+    if let Err(error) = &result
+        && let Some(stream) = recording.fail(error)
+    {
+        let _ = tx.send(StreamMessage::Observation(
+            ModelTransportEvent::StreamRecorded(stream),
+        ));
+    }
+    result
+}
+
+async fn streaming_http_io_inner(
+    request: StreamingHttpIoRequest,
+    recording: &mut StreamRecording,
+) -> StreamingHttpResult {
     let StreamingHttpIoRequest {
         provider_key,
         url,
@@ -581,7 +715,7 @@ pub(super) async fn streaming_http_io(request: StreamingHttpIoRequest) -> Stream
         req_builder = req_builder.header(name.as_str(), value.as_str());
     }
 
-    let started_at = Instant::now();
+    let started_at = recording.started_at;
     let mut response = tokio::select! {
         _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
         result = tokio::time::timeout(stream_idle_timeout, req_builder.send()) => {
@@ -656,7 +790,7 @@ pub(super) async fn streaming_http_io(request: StreamingHttpIoRequest) -> Stream
     // 用于累积跨 read 调用的不完整 UTF-8 字节，防止多字节字符（如中文 3 字节）
     // 被 4096 buffer 边界切割后 lossy 替换为 U+FFFD 导致数据损坏。
     let mut utf8_remainder: Vec<u8> = Vec::new();
-    let mut delta_progress = StreamDeltaProgress::default();
+    let mut delta_progress = StreamDeltaProgress::new(recording);
     let mut saw_sse_event = false;
     let mut saw_protocol_terminal = false;
     let mut terminal_drain_deadline = None;
@@ -792,6 +926,7 @@ pub(super) async fn streaming_http_io(request: StreamingHttpIoRequest) -> Stream
         });
     }
 
+    let accumulator_stop_reason = accumulator.stop_reason().map(str::to_owned);
     // 流聚合结果直接转换为统一模型响应，不再构造中间协议 JSON。
     let adapted = tool_name_codec.decode_adapted_response(accumulator.finalize());
     if adapted.content.trim().is_empty()
@@ -809,6 +944,13 @@ pub(super) async fn streaming_http_io(request: StreamingHttpIoRequest) -> Stream
         });
     }
     body_timing.response_received_at = received_at;
+    // 成功的尝试交出流记录；终止原因无法归一时不交（没有记录，不编造 `finish`）。
+    let stop_reason = accumulator_stop_reason.as_deref();
+    if let Some(stream) = delta_progress.recording.finish(received_at, stop_reason) {
+        let _ = tx.send(StreamMessage::Observation(
+            ModelTransportEvent::StreamRecorded(stream),
+        ));
+    }
     if let Some(timing) = body_timing.finish(
         provider_family,
         adapted.usage.output_tokens,

@@ -1,0 +1,70 @@
+{
+  "platform": "macOS arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "20affebb69601dc57e2a51dc0dde43076104bc9ebc1db2fedbe25931f432f532",
+  "readerSha256": "2832edb92c8ac79948d8a2c48f9a91f40e0e3e5175d41ea9e89c75637c81c895",
+  "clientSha256": "dd4602670f7a83c292be9f3cb196b0282d01a5622121e21fc7a49edc6760e0ca",
+  "rendererEntrySha256": "372459f177b5aff8708e17e381f41de47ea0e556601c25cf8a74516aebaf4c9f",
+  "sdkLockSha256": "91cc0c27d189c8b844222a7d652850ce59d7a3fc53863863382f34db5f1a9443",
+  "sample": {
+    "name": "dsh-better-sidebar",
+    "version": "0.32.1",
+    "sha256": "cd0a88c0da237622a83d465ed824f17c39c74e7edf2609c14cf21c813d70c517",
+    "integrity": "sha512-UcIEAkLuZXz0SkNDwMtycCoO59yCasowG6DqhxkG+jAjQfofF0BbXIOctfjqsU8WyaP6XoSvi4LgMFhEfinBsw=="
+  },
+  "checks": {
+    "activation": {
+      "instanceId": "1:1:include:better-sidebar",
+      "runtime": "running",
+      "views": [
+        "文件",
+        "Git",
+        "任务管理",
+        "侧边对话(beta)",
+        "Git",
+        "文件"
+      ],
+      "unmountedSlots": [
+        "conversation.session.header.utilities",
+        "shell.overlay",
+        "sidebar.right.tab.guide"
+      ]
+    },
+    "unmountedSlotsDisclosed": true,
+    "routeScope": {
+      "actualWorkspace": true,
+      "mismatchedSessionDenied": true
+    },
+    "committedHistory": {
+      "blankBeforeTurn": true,
+      "blankAfterTurn": false
+    },
+    "fileExplorer": {
+      "filename": "sidebar-check.txt",
+      "originalRow": true
+    },
+    "collapsedEditor": {
+      "hiddenOutsideLayoutAndFocus": true,
+      "originalDocumentRetained": true,
+      "unsavedTextRetained": true,
+      "fileNotWritten": true
+    },
+    "fileEditor": {
+      "editedOnDisk": true,
+      "nativeComposerVisible": true,
+      "nativeReplyVisible": true
+    },
+    "closeEditor": true,
+    "instanceRevocation": {
+      "removesCollapsedDocuments": true,
+      "stoppedRoute": 403,
+      "obsoleteRoute": 409,
+      "obsoleteSlotReport": 409
+    },
+    "restart": {
+      "committedHistory": true,
+      "editedFileReadBackByOriginalPlugin": true
+    }
+  },
+  "installLockSha256": "b2b8f0b0515bab7ce06b2ea6959c7ae7a1d4c3818ac4eebcb8287ce1243ed78b"
+}

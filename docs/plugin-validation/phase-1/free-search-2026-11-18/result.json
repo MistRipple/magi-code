@@ -1,0 +1,85 @@
+{
+  "completed": true,
+  "package": "dsh-free-search",
+  "version": "0.9.41",
+  "archiveSha256": "a9440128741e4e5f2d09810873fbd057a149c1117230550a98f79cab5fa05030",
+  "integrity": "sha512-d77vythaU13nuEsJN2LxScTWqiLKbj5zA0tFgxCqHLSnid7wa2Ep9/iqzM39sgvYpcqZ9dk9n/9r2nF0oA64XQ==",
+  "selection": {
+    "fetchProvider": "fs-quality-fetch",
+    "searchProvider": "ddg"
+  },
+  "buildIdentity": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+  "daemonSha256": "d2ff6961ef5ab825e540375d55a0e3cb6095f28bf3ee8c2268b9a9a4c6cdfc69",
+  "sdkLockSha256": "d3c2f75c3212b96733ec7cf9afda06de9d228f708f2e970eadda0279444f8679",
+  "dependenciesSha256": "89fa667b9f4f287b8696bb63f2befeaf8a3a206a55735b9e2ad1bcd9b89de7bd",
+  "checks": [
+    {
+      "name": "官方原包在线安装、原生授权并实际运行",
+      "ok": true
+    },
+    {
+      "name": "原包声明的全局搜索和抓取提供方已由 daemon 保存",
+      "ok": true
+    },
+    {
+      "name": "原页面完整加载引擎、提示词和官网链接",
+      "ok": true
+    },
+    {
+      "name": "原页面保存引擎后原生配置实际持久化",
+      "ok": true
+    },
+    {
+      "name": "原页面测试引擎返回真实来源并展示结果",
+      "ok": true
+    },
+    {
+      "name": "重新打开设置显示已保存引擎",
+      "ok": true
+    },
+    {
+      "name": "原包拒绝带旧修订的设置保存并保留外部编辑",
+      "ok": true
+    },
+    {
+      "name": "原包设置重新读取文件编辑后的值",
+      "ok": true
+    },
+    {
+      "name": "新会话的 web_search 返回实际业务结果",
+      "ok": true
+    },
+    {
+      "name": "新会话的 web_fetch 返回实际业务结果",
+      "ok": true
+    },
+    {
+      "name": "停用后原生网页抓取读取同址 JSON",
+      "ok": true
+    },
+    {
+      "name": "停用后原包旧页面请求被拒绝",
+      "ok": true
+    },
+    {
+      "name": "重新激活恢复原选择及设置，释放旧实例",
+      "ok": true
+    },
+    {
+      "name": "重新启用后旧页面仍然失效",
+      "ok": true
+    },
+    {
+      "name": "完整应用重启保留全局选择、原设置和授权并恢复新实例",
+      "ok": true
+    },
+    {
+      "name": "整机重启保留已完成的会话轮次",
+      "ok": true
+    },
+    {
+      "name": "Renderer 和原包页面无异常",
+      "ok": true
+    }
+  ]
+}

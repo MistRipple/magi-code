@@ -13,6 +13,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+mod package;
+pub use package::{NativePackage, NativePackageIdentity, is_valid_package_name};
+
 /// tarball（压缩态）上限。
 pub const MAX_TARBALL_BYTES: usize = 64 * 1024 * 1024;
 /// 解包后总量上限。

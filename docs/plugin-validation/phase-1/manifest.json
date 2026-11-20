@@ -1,0 +1,212 @@
+{
+  "schemaVersion": 1,
+  "phase": 1,
+  "capturedAt": "2026-11-17T13:00:29.423Z",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "runtime": {
+    "sdkVersion": "0.2.2-rc.3",
+    "sdkSource": "crates/magi-extension-host/runtime/dsh/package.json#dshVersion",
+    "sdkBuildCommit": null,
+    "hostLock": "crates/magi-extension-host/runtime/dsh/package-lock.json",
+    "hostLockSha256": "f72f1c95ade8ed319991a06085789236ee4c4c753eaeffba185a553384c5bb92",
+    "capabilities": [],
+    "status": "shared-lifecycle-source-preparation-domain-revisions",
+    "upstreamInspectionCommit": "39163dd30f703a79079e2d2446545cff3c453738",
+    "upstreamInspectionNote": "Remote HEAD inspected; not asserted to be the SDK release build commit.",
+    "previousBaseline": "docs/plugin-validation/phase-1/baselines/admission-2026-11-17.json",
+    "baselineNote": "Previous baseline metadata is retained; its host lock was superseded and is not retained at the original source path. No business result existed for that baseline."
+  },
+  "packages": [
+    {
+      "name": "dsh-connect-workbuddy",
+      "version": "5.21.2",
+      "tarball": "https://registry.npmjs.org/dsh-connect-workbuddy/-/dsh-connect-workbuddy-5.21.2.tgz",
+      "integrity": "sha512-Yu2W+/WUCzPhP2fUi45B+L98GP7xTYQqSc0/XM7lQedaids5Kmj2LBqyJ3zI7SsrN4gtt84ZOnFqdlbKVU5NZg==",
+      "archive": "target/dsh-phase-1/originals/dsh-connect-workbuddy-5.21.2.tgz",
+      "bytes": 3208459,
+      "sha256": "3237011989e3d52483c1ec0e76874dd4d2f296a5b119cd25a08385cee0ab3fc0",
+      "engines": {
+        "node": "^22.19.0 || >=24.0.0"
+      },
+      "peerDependencies": {
+        "@deepseek-ai/cordis": ">=4.0.1-rc.1 <5.0.0 || >=4.0.2 <5.0.0",
+        "@deepseek-ai/dsh-atomic-write": ">=0.1.7-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-attachment": ">=0.1.7-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-client-ui-primitives": ">=0.1.7-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-client-ui-renderer": ">=0.1.7-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-client-ui-settings": ">=0.1.7-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-home-paths": ">=0.1.7-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-host-webserver": ">=0.1.7-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-llm-pi-ai": ">=0.1.7-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-settings": ">=0.1.7-rc.1 <0.3.0-0",
+        "@deepseek-ai/schemastery": ">=3.18.1-rc.1 <4.0.0 || >=3.18.2 <4.0.0",
+        "@earendil-works/pi-ai": ">=0.85.0 <0.88.0 || >=1.0.0-0 <2.0.0",
+        "react": "^18.2.0"
+      },
+      "dependencies": {
+        "@deepseek-ai/schemastery": "3.18.4"
+      },
+      "entry": {
+        "types": "./lib/index.d.ts",
+        "default": "./lib/index.js"
+      },
+      "client": "./lib/client.js",
+      "dependencyLock": "docs/plugin-validation/phase-1/admission-2026-11-17/dependencies/mgr-0.2.13/package-lock.json",
+      "status": "artifact-and-admission-verified",
+      "businessStatus": "not-run",
+      "dependencyLockSha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+    },
+    {
+      "name": "dsh-plugin-ops-bundle",
+      "version": "0.20.8",
+      "tarball": "https://registry.npmjs.org/dsh-plugin-ops-bundle/-/dsh-plugin-ops-bundle-0.20.8.tgz",
+      "integrity": "sha512-QV/NVtRNqVfdLN0hT1HashQdu7cUhAFmpf7CFQn8MCBpsB+gHX9Ii2ZPiLQo3bY4b9+D1CmOcaOYSmcPKmnoXw==",
+      "archive": "target/dsh-phase-1/originals/dsh-plugin-ops-bundle-0.20.8.tgz",
+      "bytes": 56891,
+      "sha256": "14b914c803cbdec515b61d44c41fa9f0be3cfc720e9b24c696980a06e24d1794",
+      "engines": {
+        "node": "^22.19.0 || >=24.0.0"
+      },
+      "peerDependencies": {
+        "@deepseek-ai/cordis": "^4.0.0"
+      },
+      "dependencies": {
+        "dsh-plugin-ops-core": "^0.20.8"
+      },
+      "entry": {
+        "types": "./lib/index.d.ts",
+        "default": "./lib/index.js"
+      },
+      "client": {
+        "default": "./lib/client.js"
+      },
+      "dependencyLock": "docs/plugin-validation/phase-1/admission-2026-11-17/dependencies/mgr-0.2.13/package-lock.json",
+      "status": "artifact-and-admission-verified",
+      "businessStatus": "not-run",
+      "dependencyLockSha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+    },
+    {
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.12",
+      "tarball": "https://registry.npmjs.org/dsh-plugin-mgr/-/dsh-plugin-mgr-0.2.12.tgz",
+      "integrity": "sha512-NlEUaaJ6uOekU95H0pw0sGCfluOaiOJV3FFKLzaI4NiD+F5GGqb2srrqP179vemWaF7M+QzxroZk04Wg2vnmCQ==",
+      "archive": "target/dsh-phase-1/originals/dsh-plugin-mgr-0.2.12.tgz",
+      "bytes": 28963,
+      "sha256": "694b301bdd9c116e8fb01b1820e13932b9ad398bda5d1e6139db0de35372be9c",
+      "engines": {
+        "node": ">=18"
+      },
+      "peerDependencies": {
+        "@deepseek-ai/cordis": "^4.0.1",
+        "@deepseek-ai/dsh-tools": "^0.1.0-rc.8 || ^0.2.0-rc.2"
+      },
+      "dependencies": {
+        "js-yaml": "^4.1.0"
+      },
+      "entry": "./dist/index.js",
+      "client": "./dist/client.js",
+      "dependencyLock": "docs/plugin-validation/phase-1/admission-2026-11-17/dependencies/mgr-0.2.12/package-lock.json",
+      "status": "artifact-and-admission-verified",
+      "businessStatus": "not-run",
+      "dependencyLockSha256": "817e6aadef3872a6ed13a2a5ac9f4463b2867dcd011bfce037843f4248263ca0"
+    },
+    {
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.13",
+      "tarball": "https://registry.npmjs.org/dsh-plugin-mgr/-/dsh-plugin-mgr-0.2.13.tgz",
+      "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+      "archive": "target/dsh-phase-1/originals/dsh-plugin-mgr-0.2.13.tgz",
+      "bytes": 30444,
+      "sha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+      "engines": {
+        "node": ">=18"
+      },
+      "peerDependencies": {
+        "@deepseek-ai/cordis": "^4.0.1",
+        "@deepseek-ai/dsh-tools": "^0.1.0-rc.8 || ^0.2.0-rc.2"
+      },
+      "dependencies": {
+        "js-yaml": "^4.1.0"
+      },
+      "entry": "./dist/index.js",
+      "client": "./dist/client.js",
+      "dependencyLock": "docs/plugin-validation/phase-1/admission-2026-11-17/dependencies/mgr-0.2.13/package-lock.json",
+      "status": "artifact-and-admission-verified",
+      "businessStatus": "not-run",
+      "dependencyLockSha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+    },
+    {
+      "name": "dsh-free-search",
+      "version": "0.9.41",
+      "tarball": "https://registry.npmjs.org/dsh-free-search/-/dsh-free-search-0.9.41.tgz",
+      "integrity": "sha512-d77vythaU13nuEsJN2LxScTWqiLKbj5zA0tFgxCqHLSnid7wa2Ep9/iqzM39sgvYpcqZ9dk9n/9r2nF0oA64XQ==",
+      "archive": "target/dsh-phase-1/originals/dsh-free-search-0.9.41.tgz",
+      "bytes": 285012,
+      "sha256": "a9440128741e4e5f2d09810873fbd057a149c1117230550a98f79cab5fa05030",
+      "engines": {
+        "node": ">=20"
+      },
+      "peerDependencies": {
+        "@deepseek-ai/cordis": "^4.0.1",
+        "@deepseek-ai/dsh-client-ui-commands": "^0.1.7-rc.1 || ^0.2.0-rc.1",
+        "@deepseek-ai/dsh-client-ui-plugin-manager": "^0.1.7-rc.1 || ^0.2.0-rc.1",
+        "@deepseek-ai/dsh-client-ui-renderer": "^0.1.7-rc.1 || ^0.2.0-rc.1",
+        "@deepseek-ai/dsh-settings": "^0.1.7-rc.1 || ^0.2.0-rc.1",
+        "@deepseek-ai/dsh-tools": "^0.1.7-rc.1 || ^0.2.0-rc.1",
+        "@deepseek-ai/schemastery": ">=3.18.4 <4",
+        "react": "^18.2.0"
+      },
+      "dependencies": {},
+      "entry": "./lib/index.js",
+      "client": "./lib/client.js",
+      "dependencyLock": "docs/plugin-validation/phase-1/admission-2026-11-17/dependencies/mgr-0.2.13/package-lock.json",
+      "status": "artifact-and-admission-verified",
+      "businessStatus": "not-run",
+      "dependencyLockSha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+    },
+    {
+      "name": "dsh-rea",
+      "version": "1.2.0",
+      "tarball": "https://registry.npmjs.org/dsh-rea/-/dsh-rea-1.2.0.tgz",
+      "integrity": "sha512-nioBr1WqCACU9K7N6h6NLw9i03vAg/IWnJRtprTA7kdsGYRg/gptO70obW51ijtnZJw5dR5BjiV5R4KkcBfigA==",
+      "archive": "target/dsh-phase-1/originals/dsh-rea-1.2.0.tgz",
+      "bytes": 21119,
+      "sha256": "3671ae98e98d3f736cccb2d89a822d72fa2e142da5b89aa437f7082f3ee621b3",
+      "engines": {
+        "node": ">=20"
+      },
+      "peerDependencies": {
+        "@deepseek-ai/dsh-mcp-client": ">=0.2.0-rc.0 <0.3.0",
+        "@deepseek-ai/dsh-typert-protocol": ">=0.2.0-rc.0 <0.3.0",
+        "@deepseek-ai/schemastery": "^3.18.0"
+      },
+      "dependencies": {},
+      "entry": "./lib/index.js",
+      "client": "./client/client.js",
+      "dependencyLock": "docs/plugin-validation/phase-1/admission-2026-11-17/dependencies/mgr-0.2.13/package-lock.json",
+      "status": "artifact-and-admission-verified",
+      "businessStatus": "not-run",
+      "dependencyLockSha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+    }
+  ],
+  "unverified": [
+    "SDK release build commit provenance is not verified; upstream inspection commit is separate.",
+    "The production installer and immutable online graph replacement are not wired yet.",
+    "No sample was activated in the new host.",
+    "No Electron or daemon business task was run.",
+    "Domain source revisions and inert graph preparation are verified, but the formal daemon coordinator, Loader/Include mutation/flush, file intake and runtime graph application are not implemented.",
+    "No platform cutover or old implementation removal has occurred."
+  ],
+  "preparationEvidence": "docs/plugin-validation/phase-1/admission-2026-11-17/results.json",
+  "updatedAt": "2026-11-17T14:16:41.795204+00:00",
+  "configurationPreparationEvidence": "docs/plugin-validation/phase-1/loading-preparation-2026-11-17/result.json"
+}

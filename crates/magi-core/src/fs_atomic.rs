@@ -57,7 +57,31 @@ fn create_unique_temp_file(path: &Path) -> io::Result<(PathBuf, File)> {
 /// 不负责创建父目录；调用方应在写前确保父目录存在（与既有 store 行为一致）。
 /// 写入失败时尽量清理残留的临时文件，避免目录里堆积 `.tmp`。
 pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
-    write_atomic_with_permissions(path, contents.as_ref(), None)
+    write_atomic_with(path, |file| file.write_all(contents.as_ref()))
+}
+
+/// Stream a replacement through the same durable temporary file as `write_atomic`.
+pub fn write_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    write_atomic_inner(path, write, None, |temporary, target| {
+        fs::rename(temporary, target)
+    })
+}
+
+/// 原子创建文件。如果目标已存在则返回 AlreadyExists 并保留其原文。
+pub fn write_atomic_create_new(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    write_atomic_inner(
+        path,
+        |file| file.write_all(contents.as_ref()),
+        None,
+        |temporary, target| {
+            fs::hard_link(temporary, target)?;
+            let _ = fs::remove_file(temporary);
+            Ok(())
+        },
+    )
 }
 
 /// 写用户文件：与 `write_atomic` 共用同一套临时文件、fsync 与 rename 机制，另外保证
@@ -72,18 +96,24 @@ pub fn write_atomic_preserving_target(path: &Path, contents: impl AsRef<[u8]>) -
     let permissions = fs::metadata(&target)
         .ok()
         .map(|metadata| metadata.permissions());
-    write_atomic_with_permissions(&target, contents.as_ref(), permissions)
+    write_atomic_inner(
+        &target,
+        |file| file.write_all(contents.as_ref()),
+        permissions,
+        |temporary, target| fs::rename(temporary, target),
+    )
 }
 
-fn write_atomic_with_permissions(
+fn write_atomic_inner(
     path: &Path,
-    contents: &[u8],
+    write: impl FnOnce(&mut File) -> io::Result<()>,
     permissions: Option<fs::Permissions>,
+    publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let (temp_path, mut file) = create_unique_temp_file(path)?;
     // 写临时文件并 fsync，确保内容真正落盘后再 rename。
     let flush_result = (|| -> io::Result<()> {
-        file.write_all(contents)?;
+        write(&mut file)?;
         if let Some(permissions) = permissions {
             file.set_permissions(permissions)?;
         }
@@ -93,7 +123,7 @@ fn write_atomic_with_permissions(
         let _ = fs::remove_file(&temp_path);
         return Err(error);
     }
-    if let Err(error) = fs::rename(&temp_path, path) {
+    if let Err(error) = publish(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(error);
     }
@@ -119,6 +149,17 @@ mod tests {
         let path = dir.path().join("state.json");
         write_atomic(&path, b"hello").expect("write");
         assert_eq!(fs::read_to_string(&path).expect("read"), "hello");
+    }
+
+    #[test]
+    fn write_atomic_create_new_preserves_existing_contents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("initial.yml");
+        write_atomic_create_new(&path, b"first").expect("create");
+        let error = write_atomic_create_new(&path, b"replacement").expect_err("already exists");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

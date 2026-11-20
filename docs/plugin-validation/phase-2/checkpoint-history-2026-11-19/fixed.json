@@ -1,0 +1,40 @@
+{
+  "platform": "macOS arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "ac70887e2402021b3007b83531d959ef7c6ec66641e385f977d4ea0a91b22dd1",
+  "sdkLockSha256": "7af3cb1d8834be2fd81b29aadbbab3c08c051876746b4a6a2075aa8afe286e9e",
+  "sample": {
+    "name": "dsh-plugin-message-history",
+    "version": "1.0.6",
+    "sha256": "515d9940416782c95c4487e77985a3eb41beb0ddd50836211aa1af072503e82b",
+    "integrity": "sha512-QKn0vz7nap+IB2kwKs4RKkx01qG8wVhMhHmceTGaHikAmXfi8WGieUQQihL+rbw9DopJtXz4CRzCjs9gDgqSwA=="
+  },
+  "checks": {
+    "beforeRestart": {
+      "completedTurns": 10,
+      "checkpointSeq": 160,
+      "pluginHistoryCount": 10
+    },
+    "archive": {
+      "fromSeq": 1,
+      "toSeq": 160,
+      "transactions": 128,
+      "matchedUserInputs": 10,
+      "compressedBytes": 108967,
+      "originalBytes": 683473,
+      "sha256": "0e1fd504c0ac5075114dfa55923b758e0df68ce3182528498dafaa6676722687"
+    },
+    "afterRestart": {
+      "retainedOriginalHistory": 10,
+      "nextEventSeq": 172,
+      "newCompletionRequests": 1,
+      "archiveUnchanged": true
+    }
+  },
+  "dependencyLockSha256": "0d138218aa8fceee7fa030c7940e42acd340c270e1ed533cce4373fa706ac1a4",
+  "providerRequests": {
+    "POST /v1/chat/completions": 11,
+    "GET /v1/models": 1,
+    "GET /v1/models?client_version=3.0.62": 1
+  }
+}

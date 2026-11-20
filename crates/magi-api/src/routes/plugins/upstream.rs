@@ -1,52 +1,25 @@
-//! 上游生态插件（DSH、pi）：搜索、预览与安装。
-//!
-//! 用户安装上游发布的 npm 原包或公开 GitHub 仓库的固定提交。来源获取分别核对 registry
-//! integrity 与 GitHub 提交；公共解包和翻译入口保留原包并声明宿主权限，再沿相同的预览、
-//! 授权与生命周期提交。安装期不运行 npm/git 安装或构建脚本，
-//! 上游代码只在翻译器的受限子进程里被执行一次以记录它声明了什么。
-//!
-//! 预览翻译出的包就是用户确认的包：安装按确认的摘要取回这份产物，不再重新翻译，
-//! 因为依赖版本和上游启动时序在两次翻译之间可能变化（见 `previewed`）。
+//! Discover published packages and forward original package actions to the DSH platform.
 
 use super::*;
+use crate::native_plugins::InstalledUpstreamPlugins;
 use magi_app_server_protocol::generated::{
-    PluginEcosystem, PluginTranslationNote, PluginTranslationSummary, PluginUpstreamEntry,
-    PluginUpstreamEntryState, PluginUpstreamPreview, PluginUpstreamProjection,
-    PluginUpstreamRequest,
+    PluginEcosystem, PluginUpstreamEntry, PluginUpstreamEntryState, PluginUpstreamPreview,
+    PluginUpstreamProjection, PluginUpstreamRequest,
 };
 use magi_plugin_system::npm;
 use std::path::Path as FsPath;
 
 mod artifacts;
-pub(super) mod github;
+pub use artifacts::{
+    NpmArchive, fetch_npm_archive, fetch_npm_packument, fetch_npm_release_archive,
+};
 pub(super) mod icons;
-mod previewed;
-
-type UpstreamPackageKey = (String, String);
-type InstalledPluginIdentity = (String, String);
-type InstalledUpstreamPlugins =
-    std::collections::HashMap<UpstreamPackageKey, InstalledPluginIdentity>;
-
-struct TranslatorInput<'a> {
-    ecosystem: &'a PluginEcosystem,
-    upstream_dir: &'a FsPath,
-    out_dir: &'a FsPath,
-    archive: &'a FsPath,
-    integrity: &'a str,
-    github: Option<&'a magi_app_server_protocol::generated::PluginGithubSource>,
-}
 
 /// registry 的开发与验收覆盖入口；默认使用 npm 官方 registry。
 pub(super) const NPM_REGISTRY_ENV: &str = "MAGI_NPM_REGISTRY";
 const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const MAX_REGISTRY_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 const SEARCH_PAGE_SIZE: usize = 20;
-const TRANSLATE_TIMEOUT: Duration = Duration::from_secs(180);
-// 覆盖元数据、原包、翻译排队与执行，必须在宿主管理 RPC 的等待预算内结束。
-const PREPARATION_TIMEOUT: Duration = Duration::from_secs(840);
-/// 同一时间只翻译一个包：翻译会在子进程里执行上游代码，并发只会放大资源占用。
-static TRANSLATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// 发布在这些作用域下的包属于上游官方发布者。这只说明“谁发布的”，不说明包适配 Magi 或经过 Magi 审核。
 const OFFICIAL_SCOPES: &[&str] = &["@deepseek-ai/", "@earendil-works/"];
 
@@ -57,12 +30,10 @@ pub(super) fn registry() -> Result<String, ApiError> {
         .to_string())
 }
 
-/// 上游生态在 daemon 侧的唯一描述：协议名、搜索关键词、本机是否有翻译器。
-/// 新增生态必须在这里登记，并同时提供自己的准入证据校验（见设计文档 6.5）。
+/// 上游生态的协议名与发现关键词。
 struct EcosystemSpec {
     name: &'static str,
     search_keyword: &'static str,
-    translator: bool,
 }
 
 fn ecosystem_spec(ecosystem: &PluginEcosystem) -> EcosystemSpec {
@@ -70,12 +41,10 @@ fn ecosystem_spec(ecosystem: &PluginEcosystem) -> EcosystemSpec {
         PluginEcosystem::Dsh => EcosystemSpec {
             name: "dsh",
             search_keyword: "dsh-plugin",
-            translator: true,
         },
         PluginEcosystem::Pi => EcosystemSpec {
             name: "pi",
             search_keyword: "pi-package",
-            translator: false,
         },
     }
 }
@@ -85,56 +54,21 @@ pub(super) fn ecosystem_name(ecosystem: &PluginEcosystem) -> &'static str {
 }
 
 /// 本机能否安装该生态的包。返回不能的原因，界面原样展示。
-fn blocked_reason(state: &PluginOperations, ecosystem: &PluginEcosystem) -> Option<String> {
-    let spec = ecosystem_spec(ecosystem);
-    if !spec.translator {
-        return Some(format!("{} 翻译器尚未提供，当前只能浏览", spec.name));
+fn blocked_reason(state: &ApiState, ecosystem: &PluginEcosystem) -> Option<String> {
+    match ecosystem {
+        PluginEcosystem::Dsh if state.native_plugin_platform.is_some() => None,
+        PluginEcosystem::Dsh => Some("DSH 插件宿主尚未装配".into()),
+        PluginEcosystem::Pi => Some("pi 插件宿主尚未提供，当前只能浏览".into()),
     }
-    if let Err(reason) = state.translation_runtime_id() {
-        return Some(reason);
-    }
-    None
 }
 
 /// npm 包名：可选作用域加名称，只含 npm 允许的小写字符。拒绝任何带路径、查询或空白的输入。
 pub(super) fn validate_package_name(name: &str) -> Result<(), ApiError> {
-    let valid = |part: &str| {
-        !part.is_empty()
-            && !part.starts_with('.')
-            && !part.starts_with('_')
-            && part
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-._~".contains(c))
-    };
-    let ok = name.len() <= 214
-        && match name.strip_prefix('@') {
-            Some(scoped) => scoped
-                .split_once('/')
-                .is_some_and(|(scope, rest)| valid(scope) && valid(rest)),
-            None => valid(name),
-        };
-    if ok {
+    if npm::is_valid_package_name(name) {
         Ok(())
     } else {
         Err(ApiError::InvalidInput("npm 包名无效".into()))
     }
-}
-
-pub(super) fn validate_source(
-    package: Option<&str>,
-    github: Option<&magi_app_server_protocol::generated::PluginGithubSource>,
-) -> Result<(), ApiError> {
-    if let Some(name) = package {
-        validate_package_name(name)?;
-    }
-    if let Some(source) = github {
-        github::validate(source)?;
-    } else if package.is_none() {
-        return Err(ApiError::InvalidInput(
-            "请选择 npm 包或 GitHub 仓库来源".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn package_path(name: &str) -> String {
@@ -173,6 +107,19 @@ struct SearchPublisher {
     username: String,
 }
 
+impl From<VersionDocument> for SearchPackage {
+    fn from(document: VersionDocument) -> Self {
+        Self {
+            name: document.name,
+            version: document.version,
+            description: document.description,
+            publisher: document.npm_user.map(|user| SearchPublisher {
+                username: user.name,
+            }),
+        }
+    }
+}
+
 /// 搜索上游生态的 npm 包（需要关键词）。结果只是发现线索：条目是否可安装、是否官方发布者都按事实标注。
 pub(super) async fn search(
     State(state): State<ApiState>,
@@ -182,29 +129,61 @@ pub(super) async fn search(
     let installed = installed_upstream(&state)?;
     let mut entries = Vec::new();
     let mut errors = Vec::new();
-    for ecosystem in [PluginEcosystem::Dsh, PluginEcosystem::Pi] {
-        // 空查询时 registry 会返回按下载量排序的成千上万个包，不是有意义的浏览列表：
-        // 只在用户输入关键词后搜索；已安装的上游包仍会在下面检查更新。
-        if query.q.trim().is_empty() {
-            break;
+    let text = query.q.trim();
+    if !text.is_empty() {
+        let exact_dsh = async {
+            let name = text.to_ascii_lowercase();
+            validate_package_name(&name).ok()?;
+            let document = artifacts::registry_document(&registry, &name, None)
+                .await
+                .ok()?;
+            document
+                .dsh
+                .get("bundle")
+                .is_some_and(Value::is_object)
+                .then_some(document)
+        };
+        let (dsh, pi, exact) = tokio::join!(
+            search_ecosystem(&registry, &PluginEcosystem::Dsh, text),
+            search_ecosystem(&registry, &PluginEcosystem::Pi, text),
+            exact_dsh,
+        );
+        let exact_name = exact.as_ref().map(|document| document.name.clone());
+        if let Some(document) = exact {
+            let ecosystem = PluginEcosystem::Dsh;
+            entries.push(entry_from_search(
+                document.into(),
+                &ecosystem,
+                &blocked_reason(&state, &ecosystem),
+                &installed,
+            ));
         }
-        match search_ecosystem(&registry, &ecosystem, query.q.trim()).await {
-            Ok(found) => {
-                let reason = blocked_reason(&PluginOperations::from_state(&state), &ecosystem);
-                for package in found {
-                    entries.push(entry_from_search(package, &ecosystem, &reason, &installed));
+        for (ecosystem, result) in [(PluginEcosystem::Dsh, dsh), (PluginEcosystem::Pi, pi)] {
+            match result {
+                Ok(found) => {
+                    let reason = blocked_reason(&state, &ecosystem);
+                    entries.extend(
+                        found
+                            .into_iter()
+                            .filter(|package| {
+                                ecosystem != PluginEcosystem::Dsh
+                                    || exact_name.as_deref() != Some(&package.name)
+                            })
+                            .map(|package| {
+                                entry_from_search(package, &ecosystem, &reason, &installed)
+                            }),
+                    );
                 }
+                Err(error) => errors.push(format!(
+                    "{}：{}",
+                    ecosystem_name(&ecosystem),
+                    error.message()
+                )),
             }
-            // 一个生态的搜索失败不应遮住另一个生态的结果。
-            Err(error) => errors.push(format!(
-                "{}：{}",
-                ecosystem_name(&ecosystem),
-                error.message()
-            )),
         }
     }
     // 已安装的上游包即使不在本次搜索结果里，也要查它的最新版本，否则无法提示升级。
-    for ((eco, package), (plugin_id, version)) in &installed {
+    for (eco, package) in installed.keys() {
         let ecosystem = match eco.as_str() {
             "dsh" => PluginEcosystem::Dsh,
             "pi" => PluginEcosystem::Pi,
@@ -217,35 +196,16 @@ pub(super) async fn search(
         {
             continue;
         }
-        let url = format!("{registry}/{}/latest", package_path(package));
-        let Ok(bytes) = download_bytes(&url, MAX_REGISTRY_DOCUMENT_BYTES, "上游插件元数据").await
-        else {
+        let Ok(document) = artifacts::registry_document(&registry, package, None).await else {
             continue;
         };
-        let Ok(document) = serde_json::from_slice::<VersionDocument>(&bytes) else {
-            continue;
-        };
-        let reason = blocked_reason(&PluginOperations::from_state(&state), &ecosystem);
-        entries.push(PluginUpstreamEntry {
-            official: OFFICIAL_SCOPES
-                .iter()
-                .any(|scope| package.starts_with(scope)),
-            publisher: document
-                .npm_user
-                .as_ref()
-                .map(|user| user.name.clone())
-                .unwrap_or_default(),
-            name: package.clone(),
-            description: document.description.clone(),
-            state: upstream_state(Some(version), &document.version),
-            installed_plugin_id: Some(plugin_id.clone()),
-            installed_version: Some(version.clone()),
-            version: document.version,
-            installable: reason.is_none(),
-            blocked_reason: reason,
-            package: package.clone(),
-            ecosystem,
-        });
+        let reason = blocked_reason(&state, &ecosystem);
+        entries.push(entry_from_search(
+            document.into(),
+            &ecosystem,
+            &reason,
+            &installed,
+        ));
     }
     // 保留 registry 的相关度顺序；发布者身份与名称不能覆盖用户的搜索匹配度。
     Ok(Json(PluginUpstreamProjection {
@@ -288,23 +248,7 @@ async fn search_ecosystem(
 /// 已安装的上游来源包：(生态, 包名) → (插件 ID, 已安装版本)。
 fn installed_upstream(state: &ApiState) -> Result<InstalledUpstreamPlugins, ApiError> {
     let manager = locked(state, "读取已安装的上游插件")?;
-    Ok(manager
-        .state()
-        .plugins
-        .values()
-        .filter_map(|plugin| match &plugin.source {
-            PluginSource::Upstream {
-                ecosystem,
-                package,
-                version,
-                github: None,
-            } => Some((
-                (ecosystem.clone(), package.clone()),
-                (plugin.id.clone(), version.clone()),
-            )),
-            _ => None,
-        })
-        .collect())
+    native_platform(state)?.installed_upstream(&manager)
 }
 
 fn entry_from_search(
@@ -361,6 +305,10 @@ pub(super) struct VersionDocument {
     pub(super) version: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    icon: Value,
+    #[serde(default)]
+    dsh: Value,
     dist: Dist,
     #[serde(default, rename = "_npmUser")]
     npm_user: Option<NpmUser>,
@@ -377,448 +325,32 @@ struct NpmUser {
     name: String,
 }
 
-/// 一次翻译的结果：已校验的 Magi 包，加上给用户看的翻译摘要。
-#[derive(Clone)]
-pub(super) struct Translated {
-    pub(super) package: PluginPackage,
-    integrity: String,
-    publisher: String,
-    summary: PluginTranslationSummary,
-    pub(super) source: PluginSource,
-}
-
 pub(super) async fn preview(
     State(state): State<ApiState>,
     Json(request): Json<PluginUpstreamRequest>,
 ) -> Result<Json<PluginUpstreamPreview>, ApiError> {
-    preview_candidate(&PluginOperations::from_state(&state), &request)
+    native_platform(&state)?
+        .preview_upstream(request)
         .await
         .map(Json)
 }
 
-pub(super) async fn preview_candidate(
-    operations: &PluginOperations,
-    request: &PluginUpstreamRequest,
-) -> Result<PluginUpstreamPreview, ApiError> {
-    let translated = translate(operations, request).await?;
-    previewed::remember(&translated);
-    let source = translated.source.clone();
-    let (candidate, translation_runtime) = {
-        let manager = operations.locked("预览上游插件")?;
-        let candidate = manager
-            .preview(&translated.package, &source)
-            .map_err(plugin_error)?;
-        let installed = manager.state().plugins.get(&candidate.manifest.id);
-        let translation_runtime = if installed.is_some() {
-            let package = manager
-                .package(&candidate.manifest.id)
-                .map_err(plugin_error)?;
-            operations.translation_runtime_status(
-                &package,
-                operations.translation_runtime_id().as_deref(),
-            )
-        } else {
-            None
-        };
-        (candidate, translation_runtime)
-    };
-    let PluginSource::Upstream {
-        package,
-        version,
-        github,
-        ..
-    } = translated.source
-    else {
-        return Err(ApiError::InternalAssemblyError(
-            "翻译结果缺少上游来源".into(),
-        ));
-    };
-    Ok(PluginUpstreamPreview {
-        candidate,
-        official: github.is_none()
-            && OFFICIAL_SCOPES
-                .iter()
-                .any(|scope| package.starts_with(scope)),
-        github,
-        publisher: translated.publisher,
-        integrity: translated.integrity,
-        package,
-        version,
-        translation_runtime,
-        translation: translated.summary,
-    })
-}
-
 pub(super) async fn install(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(request): Json<PluginUpstreamRequest>,
-) -> Result<Json<magi_app_server_protocol::PluginList>, ApiError> {
-    install_candidate(&PluginOperations::from_state(&state), &request, None).await?;
-    snapshot(&state, &*locked(&state, "读取插件安装结果")?)
-}
-
-pub(super) async fn install_candidate(
-    operations: &PluginOperations,
-    request: &PluginUpstreamRequest,
-    caller: Option<super::operations::OperationCaller<'_>>,
-) -> Result<(), ApiError> {
-    let expected = request
-        .expected_digest
-        .as_deref()
-        .filter(|digest| !digest.trim().is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("安装前必须先预览并携带预览摘要".into()))?;
-    if request.github.is_none()
-        && request
-            .version
-            .as_deref()
-            .is_none_or(|version| version.trim().is_empty())
-    {
-        return Err(ApiError::InvalidInput(
-            "安装必须指定预览时的精确版本".into(),
-        ));
-    }
-    if request
-        .github
-        .as_ref()
-        .is_some_and(|source| source.commit.is_none())
-    {
-        return Err(ApiError::InvalidInput(
-            "GitHub 安装必须指定预览固定的提交".into(),
-        ));
-    }
-    // 预览确认的是具体摘要：安装使用预览时翻译出的这份产物。摘要缺失、已过期、
-    // 来自另一次运行或与请求来源不符时拒绝，要求重新预览。
-    let translated = previewed::recall(expected, request)
-        .ok_or_else(|| ApiError::Conflict("预览已失效或与请求不符，请重新预览后再确认".into()))?;
-    let source = translated.source.clone();
-    if let Some((id, digest, lease, background)) = caller {
-        if background {
-            operations.admitted(id, digest, lease, "background")?;
-        }
-        operations.admitted(id, digest, lease, "install")?;
-        if translated.package.manifest().id == id {
-            let owner = super::operations::installation_owner(id, digest, lease, background)?;
-            let result = operations
-                .install_bundle_prepared(
-                    owner,
-                    magi_app_server_protocol::generated::PluginBundleInstallRequest {
-                        request_id: magi_core::EventId::unique("self-update").to_string(),
-                        ecosystem: request.ecosystem.clone(),
-                        package: request.package.clone(),
-                        version: request.version.clone(),
-                        github: request.github.clone(),
-                        enabled: Some(true),
-                        change_id: None,
-                    },
-                    Some(translated),
-                )
-                .await?;
-            if result.application
-                != magi_app_server_protocol::generated::PluginBundleInstallApplication::Applied
-            {
-                return Err(ApiError::Conflict(
-                    result
-                        .error
-                        .map(|error| error.message)
-                        .unwrap_or_else(|| "自更新未完成，请核对当前安装状态".into()),
-                ));
-            }
-            return Ok(());
-        }
-    }
-    operations
-        .install_or_upgrade(&translated.package, source, caller)
+) -> Result<Response, ApiError> {
+    let outcome = native_platform(&state)?
+        .install_upstream(request, install_request_id(&headers)?)
         .await?;
-    Ok(())
-}
-
-async fn translate(
-    state: &PluginOperations,
-    request: &PluginUpstreamRequest,
-) -> Result<Translated, ApiError> {
-    tokio::time::timeout(PREPARATION_TIMEOUT, prepare(state, request, None))
-        .await
-        .map_err(|_| ApiError::InvalidInput("插件安装准备超时，尚未提交版本；请稍后重试".into()))?
-}
-
-pub(super) async fn prepare(
-    state: &PluginOperations,
-    request: &PluginUpstreamRequest,
-    document: Option<VersionDocument>,
-) -> Result<Translated, ApiError> {
-    if let Some(reason) = blocked_reason(state, &request.ecosystem) {
-        return Err(ApiError::InvalidInput(reason));
+    if matches!(
+        outcome,
+        crate::native_plugins::PluginInstallOutcome::Cancelled
+    ) {
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    let toolchain = state
-        .plugin_toolchain
-        .clone()
-        .ok_or_else(|| ApiError::InvalidInput("本机不能翻译上游插件".into()))?;
-    validate_source(request.package.as_deref(), request.github.as_ref())?;
-    let (tarball, integrity, github, document) = if let Some(source) = &request.github {
-        let (bytes, integrity, pinned) = github::acquire(source).await?;
-        (std::sync::Arc::new(bytes), integrity, Some(pinned), None)
-    } else {
-        let name = request.package.as_deref().unwrap();
-        let version = match request.version.as_deref() {
-            None => "latest",
-            Some(version) => {
-                semver::Version::parse(version)
-                    .map_err(|_| ApiError::InvalidInput("版本必须是精确的语义版本".into()))?;
-                version
-            }
-        };
-        let document = if let Some(document) = document {
-            document
-        } else {
-            let registry = registry()?;
-            let bytes = download_bytes(
-                &format!("{registry}/{}/{version}", package_path(name)),
-                MAX_REGISTRY_DOCUMENT_BYTES,
-                "上游插件元数据",
-            )
-            .await?;
-            serde_json::from_slice::<VersionDocument>(&bytes)
-                .map_err(|_| ApiError::InvalidInput("registry 元数据格式无效".into()))?
-        };
-        if document.name != name || version != "latest" && document.version != version {
-            return Err(ApiError::InvalidInput(
-                "registry 返回的包名或版本与请求不一致".into(),
-            ));
-        }
-        let integrity = document.dist.integrity.clone().ok_or_else(|| {
-            ApiError::InvalidInput("该版本没有 sha512 完整性摘要，拒绝安装".into())
-        })?;
-        let bytes = artifacts::tarball(&document.dist.tarball, &integrity, "上游插件包").await?;
-        (bytes, integrity, None, Some(document))
-    };
-    let repository_archive = github.is_some();
-
-    let _serial = TRANSLATE_LOCK.lock().await;
-    // 解包任务拥有临时目录；取消等待时目录跟随阻塞任务完成清理，
-    // 不会在外层 TempDir 已释放后继续写入一个无人拥有的路径。
-    let (work, upstream_dir) = tokio::task::spawn_blocking(move || {
-        let work = tempfile::tempdir()
-            .map_err(|error| ApiError::internal_assembly("创建翻译工作目录失败", error))?;
-        let target = work.path().join("upstream");
-        std::fs::create_dir(&target)
-            .map_err(|error| ApiError::internal_assembly("创建翻译工作目录失败", error))?;
-        (if repository_archive {
-            npm::unpack_repository_tarball(&tarball, &target)
-        } else {
-            npm::unpack_tarball(&tarball, &target)
-        })
-        .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
-        Ok::<_, ApiError>((work, target))
-    })
-    .await
-    .map_err(|error| ApiError::internal_assembly("解包上游插件失败", error))??;
-    let extracted: Value = serde_json::from_slice(
-        &std::fs::read(upstream_dir.join("package.json"))
-            .map_err(|error| ApiError::InvalidInput(error.to_string()))?,
-    )
-    .map_err(|error| ApiError::InvalidInput(error.to_string()))?;
-    let name = extracted["name"].as_str().unwrap_or_default();
-    let version = extracted["version"].as_str().unwrap_or_default();
-    validate_package_name(name)?;
-    semver::Version::parse(version)
-        .map_err(|_| ApiError::InvalidInput("上游原包缺少精确语义版本".into()))?;
-    if document
-        .as_ref()
-        .is_some_and(|d| d.name != name || d.version != version)
-        || request
-            .package
-            .as_deref()
-            .is_some_and(|expected| expected != name)
-        || repository_archive
-            && request
-                .version
-                .as_deref()
-                .is_some_and(|expected| expected != version)
-    {
-        return Err(ApiError::InvalidInput(
-            "原包名称或版本与来源声明不一致".into(),
-        ));
-    }
-    let source = PluginSource::Upstream {
-        ecosystem: ecosystem_name(&request.ecosystem).into(),
-        package: name.into(),
-        version: version.into(),
-        github: github.clone(),
-    };
-    let publisher = document
-        .and_then(|document| document.npm_user)
-        .map(|user| user.name)
-        .unwrap_or_default();
-    let out_dir = work.path().join("package");
-    let archive_path = work.path().join("package.zip");
-    let stdout = run_translator(
-        state,
-        &toolchain,
-        TranslatorInput {
-            ecosystem: &request.ecosystem,
-            upstream_dir: &upstream_dir,
-            out_dir: &out_dir,
-            archive: &archive_path,
-            integrity: &integrity,
-            github: github.as_ref(),
-        },
-    )
-    .await?;
-    let archive = std::fs::read(&archive_path)
-        .map_err(|error| ApiError::internal_assembly("读取翻译结果失败", error))?;
-    let package = PluginPackage::from_archive(&archive)
-        .map_err(|error| ApiError::InvalidInput(format!("翻译结果不是有效的 Magi 包：{error}")))?;
-    Ok(Translated {
-        summary: summarize(&stdout),
-        package,
-        source,
-        integrity,
-        publisher,
-    })
-}
-
-async fn run_translator(
-    state: &PluginOperations,
-    toolchain: &crate::state::PluginToolchain,
-    input: TranslatorInput<'_>,
-) -> Result<String, ApiError> {
-    let TranslatorInput {
-        ecosystem,
-        upstream_dir,
-        out_dir,
-        archive,
-        integrity,
-        github,
-    } = input;
-    let mut args = vec![
-        "prepare".to_string(),
-        ecosystem_name(ecosystem).to_string(),
-        upstream_dir.to_string_lossy().into_owned(),
-        "--out".into(),
-        out_dir.to_string_lossy().into_owned(),
-        "--integrity".into(),
-        integrity.to_string(),
-        "--archive".into(),
-        archive.to_string_lossy().into_owned(),
-    ];
-    if let Some(source) = github {
-        args.extend([
-            "--github".into(),
-            serde_json::to_string(source)
-                .map_err(|e| ApiError::internal_assembly("编码 GitHub 来源失败", e))?,
-        ]);
-    }
-    run_toolchain(state, toolchain, ecosystem, &args).await
-}
-
-/// 调用翻译器工具链。兼容策略只传给对应生态：DSH 的版本豁免不对其他生态生效。
-pub(super) async fn run_toolchain(
-    state: &PluginOperations,
-    toolchain: &crate::state::PluginToolchain,
-    ecosystem: &PluginEcosystem,
-    args: &[String],
-) -> Result<String, ApiError> {
-    use tokio::io::AsyncReadExt;
-    let mut command = magi_process::tokio_command(&toolchain.node);
-    command
-        .arg(toolchain.compat.join("cli.mjs"))
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    command.env("MAGI_TRANSLATOR_OWNER_PIPE", "1");
-    if matches!(ecosystem, PluginEcosystem::Dsh) {
-        command.env(
-            "MAGI_DSH_COMPATIBILITY_POLICY",
-            serde_json::to_string(&state.dsh_compatibility()?)
-                .map_err(|error| ApiError::internal_assembly("编码兼容策略失败", error))?,
-        );
-    }
-    let mut child = magi_process::spawn_managed_tokio_in_group(&state.processes, &mut command)
-        .map_err(|error| ApiError::internal_assembly("启动翻译器失败", error))?;
-    let owner = child.take_stdin();
-    let mut out = child.take_stdout();
-    let mut err = child.take_stderr();
-    let collect = async {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let read_out = async {
-            if let Some(out) = out.as_mut() {
-                let _ = out.take(8 * 1024 * 1024).read_to_end(&mut stdout).await;
-            }
-        };
-        let read_err = async {
-            if let Some(err) = err.as_mut() {
-                let _ = err.take(64 * 1024).read_to_end(&mut stderr).await;
-            }
-        };
-        tokio::join!(read_out, read_err);
-        let status = child.wait().await;
-        (status, stdout, stderr)
-    };
-    let (status, stdout, stderr) = match tokio::time::timeout(TRANSLATE_TIMEOUT, collect).await {
-        Ok(result) => result,
-        Err(_) => {
-            let _ = child.terminate().await;
-            return Err(ApiError::InvalidInput("翻译上游插件超时".into()));
-        }
-    };
-    drop(owner);
-    let status = status.map_err(|error| ApiError::internal_assembly("等待翻译器失败", error))?;
-    if !status.success() {
-        let message = String::from_utf8_lossy(&stderr);
-        let message = message.trim();
-        let message: String = message.chars().take(2000).collect();
-        return Err(ApiError::InvalidInput(if message.is_empty() {
-            "翻译器失败，没有返回原因".into()
-        } else {
-            message
-        }));
-    }
-    Ok(String::from_utf8_lossy(&stdout).into_owned())
-}
-
-/// 把翻译器的报告整理成给用户看的摘要。报告缺字段时按空处理：摘要只是展示，
-/// 授权判断只依据清单与权限差异。
-pub(super) fn summarize(stdout: &str) -> PluginTranslationSummary {
-    let value: Value = serde_json::from_str(stdout).unwrap_or(Value::Null);
-    let report = &value["report"];
-    let names = |items: &Value, key: &str| -> Vec<String> {
-        items
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|item| item[key].as_str().map(str::to_string))
-            .collect()
-    };
-    let strings = |items: &Value| -> Vec<String> {
-        items
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|item| item.as_str().map(str::to_string))
-            .collect()
-    };
-    PluginTranslationSummary {
-        tools: names(&report["tools"], "id"),
-        commands: names(&report["commands"], "id"),
-        model_sources: strings(&report["modelSources"]),
-        unmounted_slots: names(&report["ui"]["unmountedSlots"], "name"),
-        degraded: report["static"]["degraded"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|item| PluginTranslationNote {
-                name: item["name"].as_str().unwrap_or_default().to_string(),
-                status: item["status"].as_str().unwrap_or_default().to_string(),
-                note: item["note"].as_str().unwrap_or_default().to_string(),
-            })
-            .collect(),
-        omitted_files: report["files"]["omitted"]
-            .as_array()
-            .map_or(0, |files| files.len() as i64),
-    }
+    publish_plugin_registry_changed(&state);
+    Ok(snapshot(&state, &*locked(&state, "读取插件安装结果")?)?.into_response())
 }
 
 #[cfg(test)]
@@ -857,23 +389,5 @@ mod tests {
         assert_eq!(upstream_state(Some("1.0.0"), "1.0.1"), Updatable);
         assert_eq!(upstream_state(Some("1.2.0"), "1.1.9"), Installed);
         assert_eq!(upstream_state(Some("1.0.0"), "not-semver"), Installed);
-    }
-
-    #[test]
-    fn summary_reads_report_and_tolerates_missing_fields() {
-        let summary = summarize(
-            r#"{"report":{"tools":[{"id":"t"}],"commands":[{"id":"c"}],"modelSources":["m"],
-            "ui":{"unmountedSlots":[{"name":"main"}]},
-            "static":{"degraded":[{"name":"x","status":"dropped","note":"n"}]},
-            "files":{"omitted":["a","b"]}}}"#,
-        );
-        assert_eq!(summary.tools, ["t"]);
-        assert_eq!(summary.commands, ["c"]);
-        assert_eq!(summary.model_sources, ["m"]);
-        assert_eq!(summary.unmounted_slots, ["main"]);
-        assert_eq!(summary.degraded.len(), 1);
-        assert_eq!(summary.omitted_files, 2);
-        let empty = summarize("not json");
-        assert!(empty.tools.is_empty() && empty.omitted_files == 0);
     }
 }

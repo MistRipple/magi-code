@@ -149,6 +149,7 @@ impl<'a> StepModelClient<'a> {
     ) -> Result<ModelResponse, BridgeClientError> {
         self.invoke_recorded(
             request,
+            Some(delta),
             retry,
             cancelled,
             limit,
@@ -210,10 +211,123 @@ impl<'a> StepModelClient<'a> {
     fn invoke_recorded(
         &self,
         mut request: ModelInvocationRequest,
+        on_delta: Option<&dyn Fn(&ModelStreamingDelta)>,
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         cancelled: &dyn Fn() -> bool,
         max_output_tokens: Option<u32>,
-        invoke: impl FnOnce(
+        invoke: impl Fn(
+            &dyn ModelBridgeClient,
+            ModelInvocationRequest,
+            &dyn Fn(&ModelRetryRuntimeEvent),
+            &dyn Fn() -> bool,
+            Option<u32>,
+            &magi_bridge_client::ModelTransportObserver<'_>,
+        ) -> Result<ModelResponse, BridgeClientError>,
+    ) -> Result<ModelResponse, BridgeClientError> {
+        const MAX_PLUGIN_LLM_STREAM_RETRIES: u32 = 3;
+        let mut plugin_attempt = 0u32;
+        loop {
+            let mut response = self.invoke_recorded_once(
+                request.clone(),
+                on_retry,
+                cancelled,
+                max_output_tokens,
+                &invoke,
+            )?;
+            let Some(hooks) = self.extension_hooks else {
+                return Ok(response);
+            };
+            let tool_call_names: Vec<String> = response
+                .tool_calls
+                .iter()
+                .map(|call| call.function.name.clone())
+                .collect();
+            let scope = crate::extension_hooks::ToolHookScope {
+                session_id: self.session_id.as_str(),
+                task_id: self.task_id.map_or("", |id| id.as_str()),
+                workspace_id: None,
+                worker_id: None,
+                round: self.sequence.load(Ordering::SeqCst),
+            };
+            let view = crate::extension_hooks::LlmStreamInterceptView {
+                provider: &request.provider,
+                model: self
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.model.as_deref()),
+                attempt: plugin_attempt,
+                content: response.content.as_deref().unwrap_or(""),
+                reasoning_content: response.thinking.as_deref(),
+                tool_call_names: &tool_call_names,
+                finish_reason: response.finish_reason.as_deref(),
+            };
+            match hooks.intercept_llm_stream(&scope, &view) {
+                crate::extension_hooks::LlmStreamInterceptDecision::Accept => return Ok(response),
+                crate::extension_hooks::LlmStreamInterceptDecision::Replace { content } => {
+                    if let Some(delta_cb) = on_delta {
+                        delta_cb(&ModelStreamingDelta {
+                            content: content.clone(),
+                            thinking: response.thinking.clone().unwrap_or_default(),
+                            tool_calls: response.tool_calls.clone(),
+                            replace: true,
+                        });
+                    }
+                    response.content = Some(content);
+                    return Ok(response);
+                }
+                crate::extension_hooks::LlmStreamInterceptDecision::Retry {
+                    reason,
+                    append_user_message,
+                } => {
+                    if plugin_attempt >= MAX_PLUGIN_LLM_STREAM_RETRIES || cancelled() {
+                        tracing::warn!(
+                            session_id = %self.session_id,
+                            attempt = plugin_attempt,
+                            reason = reason.as_deref().unwrap_or(""),
+                            "llm/stream 环绕重试已达到上限或已取消，按当前响应继续"
+                        );
+                        return Ok(response);
+                    }
+                    if let Some(delta_cb) = on_delta {
+                        delta_cb(&ModelStreamingDelta {
+                            content: String::new(),
+                            thinking: String::new(),
+                            tool_calls: Vec::new(),
+                            replace: true,
+                        });
+                    }
+                    plugin_attempt += 1;
+                    tracing::info!(
+                        session_id = %self.session_id,
+                        attempt = plugin_attempt,
+                        reason = reason.as_deref().unwrap_or(""),
+                        "llm/stream 环绕插件触发有界重试"
+                    );
+                    if let Some(text) = append_user_message.filter(|t| !t.trim().is_empty()) {
+                        let target = request.messages.get_or_insert_with(Vec::new);
+                        target.push(magi_bridge_client::ChatMessage {
+                            input_request_id: None,
+                            context_origin: magi_bridge_client::ChatMessageOrigin::ContextReference,
+                            role: "user".to_string(),
+                            content: Some(text),
+                            images: Vec::new(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            provider_context: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn invoke_recorded_once(
+        &self,
+        mut request: ModelInvocationRequest,
+        on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        cancelled: &dyn Fn() -> bool,
+        mut max_output_tokens: Option<u32>,
+        invoke: &impl Fn(
             &dyn ModelBridgeClient,
             ModelInvocationRequest,
             &dyn Fn(&ModelRetryRuntimeEvent),
@@ -224,6 +338,48 @@ impl<'a> StepModelClient<'a> {
     ) -> Result<ModelResponse, BridgeClientError> {
         if cancelled() {
             return Err(magi_bridge_client::model_invocation_cancelled_error());
+        }
+        if let Some(hooks) = self.extension_hooks {
+            let scope = crate::extension_hooks::ToolHookScope {
+                session_id: self.session_id.as_str(),
+                task_id: self.task_id.map_or("", |id| id.as_str()),
+                workspace_id: None,
+                worker_id: None,
+                round: self.sequence.load(Ordering::SeqCst),
+            };
+            let view = crate::extension_hooks::LlmRequestExtendView {
+                provider: &request.provider,
+                model: self
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.model.as_deref()),
+                max_output_tokens,
+                message_count: request.messages.as_ref().map_or(0, Vec::len),
+                tool_count: request.tools.as_ref().map_or(0, Vec::len),
+            };
+            if let Some(ext) = hooks.extend_llm_request(&scope, &view) {
+                if let Some(limit) = ext.max_output_tokens {
+                    max_output_tokens = Some(limit);
+                }
+                if !ext.append_user_messages.is_empty() {
+                    let target = request.messages.get_or_insert_with(Vec::new);
+                    for text in ext.append_user_messages {
+                        if !text.trim().is_empty() {
+                            target.push(magi_bridge_client::ChatMessage {
+                                input_request_id: None,
+                                context_origin:
+                                    magi_bridge_client::ChatMessageOrigin::ContextReference,
+                                role: "user".to_string(),
+                                content: Some(text),
+                                images: Vec::new(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                provider_context: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
         }
         let branch = self.prompt_branch.clone().unwrap_or_else(|| {
             if self.purpose == magi_session_store::ModelStepPurpose::ContextCompaction {
@@ -251,7 +407,8 @@ impl<'a> StepModelClient<'a> {
         // 缓存摘要必须读取与实际 Provider renderer 相同的规范化 IR。HTTP
         // client 会在这里完成工具 wire name 编码和能力降级；不能基于原始
         // canonical 工具名先生成一份与真实请求不同的缓存身份。
-        let mut prompt_frame = PromptFrame::from_ir(&client.cache_prompt_ir(&request));
+        let prompt_ir = client.cache_prompt_ir(&request);
+        let mut prompt_frame = PromptFrame::from_ir(&prompt_ir);
         prompt_frame.history_projection = self.history_projection.clone();
         let capabilities = client.executor_capabilities();
         let provider_scope = crate::prompt_lineage::ProviderCacheScope::from_client(client)
@@ -421,9 +578,29 @@ impl<'a> StepModelClient<'a> {
                 }),
             )
         });
+        let request_snapshot = build_model_request_snapshot(
+            &step,
+            &request,
+            &prompt_ir,
+            &capabilities,
+            max_output_tokens,
+        );
         self.store
             .begin_model_step(self.session_id, turn_id, step)
             .map_err(step_start_error)?;
+        if let Some(snapshot) = request_snapshot
+            && let Err(error) = self
+                .store
+                .record_model_request(self.session_id, turn_id, snapshot)
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                turn_id,
+                step_id = %step_id,
+                error = %error,
+                "模型请求记录写入失败，历史检视将缺少该步骤的请求头与系统提示"
+            );
+        }
         if let Some((hooks, identity, request_view)) = &observed {
             let merged = |extra: &serde_json::Value| {
                 let mut value = identity.clone();
@@ -462,7 +639,79 @@ impl<'a> StepModelClient<'a> {
         };
         let transport_record =
             std::sync::Mutex::new(magi_bridge_client::ModelTransportRecorder::default());
+        let stream_recorded = std::sync::atomic::AtomicBool::new(false);
         let on_transport = |event: &magi_bridge_client::ModelTransportEvent| {
+            // 非持久化实时助手流：只转发给在线观察者，不落盘、不进传输回执。
+            match event {
+                magi_bridge_client::ModelTransportEvent::LiveStreamStart => {
+                    self.store.publish_live_assistant_stream(
+                        self.session_id,
+                        turn_id,
+                        &step_id,
+                        magi_session_store::LiveAssistantStreamEvent::Start,
+                    );
+                    return Ok(());
+                }
+                magi_bridge_client::ModelTransportEvent::LiveStreamChunk(chunk) => {
+                    self.store.publish_live_assistant_stream(
+                        self.session_id,
+                        turn_id,
+                        &step_id,
+                        magi_session_store::LiveAssistantStreamEvent::Chunk {
+                            time: chunk.time,
+                            chunk: chunk.chunk.clone(),
+                        },
+                    );
+                    return Ok(());
+                }
+                magi_bridge_client::ModelTransportEvent::LiveStreamAbandon => {
+                    self.store.publish_live_assistant_stream(
+                        self.session_id,
+                        turn_id,
+                        &step_id,
+                        magi_session_store::LiveAssistantStreamEvent::Abandon,
+                    );
+                    return Ok(());
+                }
+                magi_bridge_client::ModelTransportEvent::StreamRecorded(stream) => {
+                    stream_recorded.store(true, Ordering::Release);
+                    // 流记录不属于传输回执，单独提交成会话日志事件。它只服务历史回放与检视：
+                    // 写入失败（或超过上限被放弃）不应让这次模型调用失败，记一条警告并通知实时流放弃即可。
+                    match self.store.record_model_attempt_stream(
+                        self.session_id,
+                        turn_id,
+                        &step_id,
+                        stream.clone(),
+                    ) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            self.store.publish_live_assistant_stream(
+                                self.session_id,
+                                turn_id,
+                                &step_id,
+                                magi_session_store::LiveAssistantStreamEvent::Abandon,
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id = %self.session_id,
+                                turn_id,
+                                step_id = %step_id,
+                                error = %error,
+                                "模型尝试流记录写入失败，历史回放将缺少这次尝试的流"
+                            );
+                            self.store.publish_live_assistant_stream(
+                                self.session_id,
+                                turn_id,
+                                &step_id,
+                                magi_session_store::LiveAssistantStreamEvent::Abandon,
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
             let mut records = transport_record.lock().expect("transport observation lock");
             let record = records.apply(event)?;
             self.store
@@ -479,6 +728,24 @@ impl<'a> StepModelClient<'a> {
         );
         if let Some(error) = retry_write_error.into_inner().expect("retry journal lock") {
             return Err(step_start_error(error));
+        }
+        // 非 HTTP 外部执行器：若未走 HTTP 协议块层录制，但执行器确实回传了响应正文或工具调用，
+        // 按用户确认（仅记其回传流，不记系统提示和请求头）归一并写入 ModelAttemptStreamRecorded。
+        if !stream_recorded.load(Ordering::Acquire)
+            && is_external_executor(&capabilities)
+            && let Ok(response) = &result
+            && let Some(stream) = build_external_executor_attempt_stream(response)
+            && let Err(error) =
+                self.store
+                    .record_model_attempt_stream(self.session_id, turn_id, &step_id, stream)
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                turn_id,
+                step_id = %step_id,
+                error = %error,
+                "外部执行器回传流记录写入失败"
+            );
         }
         let response_fingerprint = result.as_ref().ok().map(fingerprint).transpose()?;
         let executor_failure = result
@@ -588,6 +855,7 @@ impl ModelBridgeClient for StepModelClient<'_> {
     ) -> Result<ModelResponse, BridgeClientError> {
         self.invoke_recorded(
             request,
+            None,
             retry,
             cancelled,
             None,
@@ -627,6 +895,7 @@ impl ModelBridgeClient for StepModelClient<'_> {
     ) -> Result<ModelResponse, BridgeClientError> {
         self.invoke_recorded(
             request,
+            None,
             retry,
             cancelled,
             Some(limit),
@@ -752,6 +1021,185 @@ pub(crate) fn root_input_request_id(
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         })
+}
+
+fn is_external_executor(capabilities: &magi_bridge_client::ExecutorCapabilities) -> bool {
+    capabilities.tools == magi_bridge_client::ExecutorToolMode::ExecutorOwned
+        || capabilities.context == magi_bridge_client::ExecutorContextOwnership::ExecutorOwned
+}
+
+/// 将外部执行器实际回传的响应（文本、思考、工具调用）经 `AttemptStreamRecorder` 归一为 DSH 紧凑流记录。
+/// 仅在执行器未走 HTTP 原始块层录制但回传了有效内容时生成；若无终止原因或无可归一内容则返回 `None`。
+fn build_external_executor_attempt_stream(
+    response: &ModelResponse,
+) -> Option<Vec<serde_json::Value>> {
+    let has_reasoning = response
+        .thinking
+        .as_deref()
+        .is_some_and(|text| !text.is_empty());
+    let has_content = response
+        .content
+        .as_deref()
+        .is_some_and(|text| !text.is_empty());
+    let has_tools = !response.tool_calls.is_empty();
+    if !has_reasoning && !has_content && !has_tools {
+        return None;
+    }
+    let now_ms = magi_core::UtcMillis::now().0;
+    let mut recorder = magi_bridge_client::AttemptStreamRecorder::default();
+    if let Some(thinking) = response.thinking.as_deref().filter(|text| !text.is_empty()) {
+        recorder.push(
+            now_ms,
+            &magi_bridge_client::llm_types::LlmStreamChunk {
+                kind: magi_bridge_client::llm_types::LlmStreamChunkType::Thinking,
+                content: None,
+                tool_call: None,
+                thinking: Some(thinking.to_string()),
+                usage: None,
+                stop_reason: None,
+            },
+        );
+    }
+    if let Some(content) = response.content.as_deref().filter(|text| !text.is_empty()) {
+        recorder.push(
+            now_ms,
+            &magi_bridge_client::llm_types::LlmStreamChunk {
+                kind: magi_bridge_client::llm_types::LlmStreamChunkType::ContentDelta,
+                content: Some(content.to_string()),
+                tool_call: None,
+                thinking: None,
+                usage: None,
+                stop_reason: None,
+            },
+        );
+    }
+    for (idx, call) in response.tool_calls.iter().enumerate() {
+        recorder.push(
+            now_ms,
+            &magi_bridge_client::llm_types::LlmStreamChunk {
+                kind: magi_bridge_client::llm_types::LlmStreamChunkType::ToolCallStart,
+                content: None,
+                tool_call: Some(magi_bridge_client::llm_types::PartialToolCall {
+                    id: Some(call.id.clone()),
+                    name: Some(call.function.name.clone()),
+                    arguments: Some(serde_json::Value::String(call.function.arguments.clone())),
+                    index: Some(idx),
+                }),
+                thinking: None,
+                usage: None,
+                stop_reason: None,
+            },
+        );
+    }
+    let stop_reason = response.finish_reason.as_deref().or(if has_tools {
+        Some("tool_calls")
+    } else {
+        Some("stop")
+    });
+    recorder.finish(now_ms, stop_reason)
+}
+
+/// 采集一次主线执行步骤的请求快照（系统提示与请求头），外部执行器不记录；
+/// 写入前按现有凭据脱敏规则处理，命中时保留脱敏正文并标记 `redacted = true`。
+fn build_model_request_snapshot(
+    step: &ModelStep,
+    request: &ModelInvocationRequest,
+    prompt_ir: &magi_bridge_client::prompt_ir::PromptIr,
+    capabilities: &magi_bridge_client::ExecutorCapabilities,
+    max_output_tokens: Option<u32>,
+) -> Option<magi_session_store::ModelRequestSnapshot> {
+    if step.purpose != Some(magi_session_store::ModelStepPurpose::Execution)
+        || is_external_executor(capabilities)
+    {
+        return None;
+    }
+    let binding = step.binding.as_ref()?;
+    let model = binding
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())?
+        .to_string();
+    let provider = binding
+        .provider
+        .as_deref()
+        .filter(|provider| !provider.trim().is_empty())
+        .unwrap_or(step.provider.as_str())
+        .to_string();
+    if provider.trim().is_empty() {
+        return None;
+    }
+
+    let raw_system = request
+        .messages
+        .iter()
+        .flatten()
+        .filter(|message| message.role == "system")
+        .filter_map(|message| message.content.as_deref())
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let (system_prompt, mut redacted) = magi_core::redact_credentials_text(&raw_system);
+
+    let reasoning_effort = prompt_ir.reasoning_effort.and_then(|effort| {
+        serde_json::to_value(effort)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+    });
+    let stop = prompt_ir
+        .stop
+        .iter()
+        .map(|entry| {
+            let (clean, hit) = magi_core::redact_credentials_text(entry);
+            redacted |= hit;
+            clean
+        })
+        .collect();
+    let tools = request
+        .tools
+        .as_deref()
+        .filter(|tools| !tools.is_empty())
+        .map(|tools| {
+            magi_bridge_client::canonical_tool_surface(tools)
+                .into_iter()
+                .map(|tool| {
+                    let (description, hit) =
+                        magi_core::redact_credentials_text(&tool.function.description);
+                    redacted |= hit;
+                    let mut parameters = if tool.function.parameters.is_object() {
+                        tool.function.parameters
+                    } else {
+                        serde_json::json!({"type": "object", "properties": {}})
+                    };
+                    if magi_core::redact_credentials_json_strings(&mut parameters) {
+                        redacted = true;
+                    }
+                    magi_session_store::ModelRequestToolSchema {
+                        name: tool.function.name,
+                        description,
+                        parameters,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(magi_session_store::ModelRequestSnapshot {
+        step_id: step.step_id.clone(),
+        system_prompt,
+        header: magi_session_store::ModelRequestHeader {
+            config: magi_session_store::ModelRequestCallConfig {
+                provider,
+                model,
+                reasoning_effort,
+                temperature: prompt_ir.temperature,
+                max_tokens: max_output_tokens.or(prompt_ir.max_tokens),
+                stop,
+            },
+            tools,
+        },
+        context_window: None,
+        redacted,
+    })
 }
 
 #[cfg(test)]

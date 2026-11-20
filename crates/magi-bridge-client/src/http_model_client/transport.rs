@@ -26,6 +26,7 @@ pub(super) struct TransportRetryControls<'a> {
     pub(super) on_retry: &'a dyn Fn(&ModelRetryRuntimeEvent),
     pub(super) is_cancelled: &'a dyn Fn() -> bool,
     pub(super) observer: &'a ModelTransportObserver<'a>,
+    pub(super) max_retries: usize,
 }
 
 pub(super) fn receive_cancellable_http_result(
@@ -197,11 +198,11 @@ pub(super) fn execute_cancellable_http_post_with_retries(
         let delay = match &result {
             Ok((status, response_body, retry_after))
                 if retryable_http_response(*status, response_body)
-                    && retries < MODEL_PROVIDER_MAX_RETRIES =>
+                    && retries < controls.max_retries =>
             {
                 Some(provider_retry_delay(retries + 1, *retry_after))
             }
-            Err(error) if retryable_bridge_error(error) && retries < MODEL_PROVIDER_MAX_RETRIES => {
+            Err(error) if retryable_bridge_error(error) && retries < controls.max_retries => {
                 Some(provider_retry_delay(retries + 1, None))
             }
             _ => None,
@@ -211,7 +212,7 @@ pub(super) fn execute_cancellable_http_post_with_retries(
                 (controls.on_retry)(&ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::Settled,
                     attempt: retries,
-                    max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                    max_attempts: controls.max_retries,
                     delay_ms: None,
                 });
             }
@@ -221,7 +222,7 @@ pub(super) fn execute_cancellable_http_post_with_retries(
         (controls.on_retry)(&ModelRetryRuntimeEvent {
             phase: ModelRetryRuntimePhase::Scheduled,
             attempt: retries,
-            max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+            max_attempts: controls.max_retries,
             delay_ms: Some(delay.as_millis() as u64),
         });
         if !sleep_retry_delay_cancellable(delay, controls.is_cancelled) {
@@ -229,7 +230,7 @@ pub(super) fn execute_cancellable_http_post_with_retries(
             (controls.on_retry)(&ModelRetryRuntimeEvent {
                 phase: ModelRetryRuntimePhase::Settled,
                 attempt: retries,
-                max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                max_attempts: controls.max_retries,
                 delay_ms: None,
             });
             return Err(model_invocation_cancelled_error());
@@ -237,7 +238,7 @@ pub(super) fn execute_cancellable_http_post_with_retries(
         (controls.on_retry)(&ModelRetryRuntimeEvent {
             phase: ModelRetryRuntimePhase::AttemptStarted,
             attempt: retries,
-            max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+            max_attempts: controls.max_retries,
             delay_ms: None,
         });
     }

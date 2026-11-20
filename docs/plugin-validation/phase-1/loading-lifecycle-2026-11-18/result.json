@@ -1,0 +1,169 @@
+{
+  "schemaVersion": 1,
+  "scope": "loading-acceptance-and-asynchronous-startup",
+  "capturedAt": "2026-11-17T17:05:14.281411+00:00",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "sourceSha256": {
+    "crates/magi-extension-host/runtime/dsh/build-include-journal.mjs": "2bc5b4a44f251918c9061aeeb0178462cdddd0c008a8cfafd4462ea74c88cdcf",
+    "crates/magi-extension-host/runtime/dsh/committed-tree.mjs": "9022e57f4d2b0dc6d471c841acdc28bd7b0bd4002b90aa4b911e3b1b2c338aec",
+    "crates/magi-extension-host/runtime/dsh/configuration-edit.mjs": "c44f0e4b5bb1e4c8a8890c89235f93919fafebb0aaa50d74d1f10b484ac4aa5e",
+    "crates/magi-extension-host/runtime/dsh/configuration.mjs": "fe16417c32defc627a30d01d75d320334e16884986f1312267c53c35a5e73bc1",
+    "crates/magi-extension-host/runtime/dsh/entry.mjs": "5d563499b4084a1a9f9cbb67fd1844e2b41072aeebe33c9ac74cf416d8669ffd",
+    "crates/magi-extension-host/runtime/dsh/include-journal.entry.mjs": "b049ff555dcb1834bf912109e33ca9ee9653071facc5019b16704b250c8326be",
+    "crates/magi-extension-host/runtime/dsh/include-journal.generated.mjs": "0edb8528eaf015e8384a1918bfa353d6432777700754a3f4561cd945117f2ad8",
+    "crates/magi-extension-host/runtime/dsh/lifecycle.mjs": "828c59d0837dddf424c23168eea4aa06eb2c5760b301f999e8ae9d1ecd41ae01",
+    "crates/magi-extension-host/runtime/dsh/packages.mjs": "ac10dcd3a6f67fee94caf1abcafc28637ab3eac0c059453eb2be8c8c60f4572d",
+    "crates/magi-extension-host/runtime/dsh/test/committed-tree.test.mjs": "b667118d7ab35db63ca51c754c4a67afea730c704ce30e7729071d3488632278",
+    "crates/magi-plugin-system/src/loading_runtime/source_monitor.rs": "5147c1ca6c2fa68c2d4f2f0ad4bf9e671b74ff409c9bc19fe078cd59b639b667",
+    "crates/magi-plugin-system/src/loading_runtime.rs": "413eac070137d0c3e60324c9c27daa2462f73004735bd3e239ec7e35b5408949",
+    "crates/magi-plugin-system/tests/loading_runtime.rs": "3dccbff20bd4c0c168606e56f96a7576e73f7e865b3b4af6bef7e9d96dc48f59"
+  },
+  "hostLock": {
+    "path": "crates/magi-extension-host/runtime/dsh/package-lock.json",
+    "sha256": "9cbccb124b07ce443f6ca31bdfe3fa1f4c538aa58bf8096cfdcfffc416104e3c"
+  },
+  "preparedProject": "target/dsh-phase-1/projects/mgr-loading-lifecycle-2026-11-18",
+  "dependencyLock": {
+    "path": "target/dsh-phase-1/projects/mgr-loading-lifecycle-2026-11-18/package-lock.json",
+    "sha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+  },
+  "original": {
+    "name": "dsh-plugin-mgr",
+    "version": "0.2.13",
+    "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+    "verifiedOriginalFiles": 9
+  },
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "magi-plugin-system",
+    "--test",
+    "loading_host",
+    "original_mgr_",
+    "--locked",
+    "--",
+    "--ignored",
+    "--nocapture"
+  ],
+  "originalResults": [
+    {
+      "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+      "business": "not-run",
+      "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "missingServices": [
+        "loader",
+        "webServer"
+      ],
+      "originalBundleUnchanged": true,
+      "package": "dsh-plugin-mgr@0.2.13",
+      "receipt": {
+        "instances": [
+          {
+            "activationGeneration": 1,
+            "hostGeneration": 1,
+            "instanceId": "include:dsh-plugin-mgr",
+            "missingServices": [
+              "loader",
+              "webServer"
+            ],
+            "pluginId": "dsh-plugin-mgr",
+            "state": "waiting",
+            "version": "0.2.13"
+          }
+        ],
+        "token": {
+          "hostGeneration": 1,
+          "revision": 1,
+          "sequence": 1
+        }
+      },
+      "scope": "committed-graph-execution",
+      "state": "waiting"
+    },
+    {
+      "acceptedRevisions": [
+        1,
+        2,
+        3
+      ],
+      "activationGenerations": [
+        1,
+        2
+      ],
+      "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+      "business": "not-run",
+      "finalStatus": {
+        "activationGeneration": 2,
+        "hostGeneration": 1,
+        "instanceId": "include:dsh-plugin-mgr",
+        "missingServices": [
+          "loader",
+          "webServer"
+        ],
+        "pluginId": "dsh-plugin-mgr",
+        "state": "waiting",
+        "version": "0.2.13"
+      },
+      "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "originalBundleUnchanged": true,
+      "package": "dsh-plugin-mgr@0.2.13",
+      "scope": "source-notification-intake",
+      "states": [
+        "waiting",
+        "removed",
+        "waiting"
+      ]
+    },
+    {
+      "acceptedRevisions": [
+        1,
+        2,
+        3
+      ],
+      "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+      "business": "not-run",
+      "finalStatus": {
+        "activationGeneration": 2,
+        "hostGeneration": 1,
+        "instanceId": "include:dsh-plugin-mgr",
+        "missingServices": [
+          "loader",
+          "webServer"
+        ],
+        "pluginId": "dsh-plugin-mgr",
+        "state": "waiting",
+        "version": "0.2.13"
+      },
+      "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "originalPackageBundleUnchanged": true,
+      "owningCandidateSource": "bundle.patch.yml",
+      "package": "dsh-plugin-mgr@0.2.13",
+      "pendingEditCleared": true,
+      "scope": "source-edit-journal-and-domain-commit",
+      "unrelatedSourcesUnchanged": true
+    }
+  ],
+  "business": "not-run",
+  "mechanismEvidence": {
+    "startupDependency": "real source edit enables provider while launcher is starting",
+    "submissionDuringUpdate": "revision 3 accepted while revision 2 callback waits; final application returns revision 3, original edit keeps accepted_revision 2",
+    "lateStartupFailure": "starting changes to failed and releases resources without stopping healthy sibling",
+    "controlCancellation": "pending original module import is cancelled; host reclaimed, desired configuration retained"
+  },
+  "notValidated": [
+    "public Loader/Entry/Group and Fiber-save integration",
+    "Include flush and dynamic source closure",
+    "production daemon coordinator",
+    "Electron UI and complete Mgr business tasks",
+    "Windows/Linux"
+  ]
+}

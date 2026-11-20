@@ -1,0 +1,32 @@
+{
+  "platform": "darwin arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "89dd5734798ef43a26c08d19153feace2f3a2514b4066b3d132a8707452ccda2",
+  "sdkLockSha256": "7af3cb1d8834be2fd81b29aadbbab3c08c051876746b4a6a2075aa8afe286e9e",
+  "servicesSha256": "281dfd1084facb9ec56584a8c05d0e17eb019c5a4b7849446b84784b6983dc65",
+  "checks": {
+    "nativeCommand": {
+      "canonicalStatus": "completed",
+      "exactSessionIdentity": true,
+      "nestedInvocationRejected": true,
+      "exposedSessionAppend": false,
+      "syntheticSessionEvents": 0
+    },
+    "interrupted": {
+      "canonicalStatus": "cancelled",
+      "reachedProvider": true,
+      "lateSuccessIgnored": true
+    },
+    "revoked": {
+      "canonicalStatus": "failed",
+      "lateSuccessIgnored": true
+    },
+    "disabledRejected": 403
+  },
+  "fixture": {
+    "name": "magi-scoped-command-probe",
+    "sha256": "5a5040e43f52993fb64dc78fbb646f5fab222fb5f7a5c8278adc1c09b7868795",
+    "integrity": "sha512-U1GbcJHJiFeukZN4lB3DjqxIVi6onYw5qhQmpPdClMY4FaeqfAMR77wmR2oytVoMeg495ZkujVZ95dshQuSdpw=="
+  },
+  "dependencyLockSha256": "b7a671d06f744408f97129688d8ef9b23a8967b8ab945294e54d51258101567d"
+}

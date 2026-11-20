@@ -47,9 +47,6 @@ jobs:
       - name: 执行发布前置校验
         run: npm run release:preflight
 
-      - name: 校验官方插件中心与源码一致
-        run: npm run plugin-center:check
-
       - name: 验证插件包、生命周期与扩展宿主
         run: |
           cargo test -p magi-plugin-system -p magi-extension-host --all-targets --locked

@@ -1,0 +1,26 @@
+{
+  "platform": "macOS arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "1c853fe3efc221571b32afa35322e9f1c90b33d1a3d3078752917f93c9307b1f",
+  "sdkLockSha256": "7af3cb1d8834be2fd81b29aadbbab3c08c051876746b4a6a2075aa8afe286e9e",
+  "sample": {
+    "name": "dsh-better-sidebar",
+    "version": "0.32.1",
+    "sha256": "cd0a88c0da237622a83d465ed824f17c39c74e7edf2609c14cf21c813d70c517",
+    "integrity": "sha512-UcIEAkLuZXz0SkNDwMtycCoO59yCasowG6DqhxkG+jAjQfofF0BbXIOctfjqsU8WyaP6XoSvi4LgMFhEfinBsw=="
+  },
+  "checks": {
+    "firstInstall": {
+      "runtimeState": "waiting",
+      "state": "等待依赖",
+      "reason": "等待依赖服务：sessions"
+    },
+    "restart": {
+      "runtimeState": "waiting",
+      "activationReplaced": true,
+      "state": "等待依赖",
+      "reason": "等待依赖服务：sessions"
+    }
+  },
+  "dependencyLockSha256": "8967da98f8fed9cd15162178c9ea2043333de0a2513078ca03a03805c6115fce"
+}

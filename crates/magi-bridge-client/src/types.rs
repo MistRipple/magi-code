@@ -626,6 +626,16 @@ pub enum ModelTransportEvent {
     Finished {
         outcome: magi_app_server_protocol::ModelTransportOutcome,
     },
+    /// 本次尝试的紧凑流记录（DSH `AssistantStreamRecord`，见 `AttemptStreamRecorder`）。它不属于
+    /// 传输回执，由消费方单独持久化；没有这个事件的尝试没有可用的流记录。
+    StreamRecorded(Vec<Value>),
+    /// 非持久化实时助手流：HTTP 流式尝试开始，供 `follow({ assistantStream: true })` 实时转发。
+    LiveStreamStart,
+    /// 非持久化实时助手流：展开后的单条 DSH `TimedStreamChunk`（工具名已还原为规范名）。
+    LiveStreamChunk(crate::LiveStreamChunk),
+    /// 非持久化实时助手流：尝试因 `replace` 语义改写、终止原因不可归一或异常中止而被放弃，
+    /// 不会有对应的 `StreamRecorded` 落盘结算。
+    LiveStreamAbandon,
 }
 
 /// 只持有本次调用的规范化传输回执；canonical 写入和用量投影复用同一个 reducer。
@@ -644,6 +654,16 @@ impl ModelTransportRecorder {
             code: Some(-32096),
             message: "transport observation order invalid".into(),
         };
+        if matches!(
+            event,
+            ModelTransportEvent::StreamRecorded(_)
+                | ModelTransportEvent::LiveStreamStart
+                | ModelTransportEvent::LiveStreamChunk(_)
+                | ModelTransportEvent::LiveStreamAbandon
+        ) {
+            // 流记录与实时流块不改变传输回执：原样返回当前回执。
+            return self.attempts.last().ok_or_else(invalid);
+        }
         match event {
             ModelTransportEvent::Started {
                 request_fingerprint,
@@ -696,6 +716,10 @@ impl ModelTransportRecorder {
                     .ok_or_else(invalid)?;
                 record.outcome = Some(outcome.clone());
             }
+            ModelTransportEvent::StreamRecorded(_)
+            | ModelTransportEvent::LiveStreamStart
+            | ModelTransportEvent::LiveStreamChunk(_)
+            | ModelTransportEvent::LiveStreamAbandon => unreachable!("handled above"),
         }
         let record = self.attempts.last_mut().ok_or_else(invalid)?;
         record.observed_at = Some(

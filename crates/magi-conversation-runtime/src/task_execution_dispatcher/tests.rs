@@ -1331,6 +1331,7 @@ fn assemble_prompt_for_subagent_uses_package_and_current_file_facts_only() {
             updated_at: UtcMillis(1),
             message_count: None,
             workspace_id: Some(workspace_id.to_string()),
+            initial_working_directory_ref: None,
             last_completed_at: None,
             last_viewed_at: None,
             kind: Default::default(),

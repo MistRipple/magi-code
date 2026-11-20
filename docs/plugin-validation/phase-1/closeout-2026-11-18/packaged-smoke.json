@@ -1,0 +1,36 @@
+{
+  "scope": "macOS arm64 Electron directory package",
+  "productVersion": "3.0.62",
+  "buildIdentity": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+  "packageName": "dsh-plugin-mgr",
+  "packageVersion": "0.2.13",
+  "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+  "previewDigest": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+  "running": "running",
+  "generation": 1,
+  "instanceIdBeforeRestart": "1:1:include:dsh-plugin-mgr",
+  "instanceIdAfterRestart": "2:2:include:dsh-plugin-mgr",
+  "gatewayAndResourceStatuses": {
+    "current": [
+      200,
+      200
+    ],
+    "stale": [
+      409,
+      409
+    ],
+    "renewed": [
+      200,
+      200
+    ]
+  },
+  "launchedPackagedDaemon": true,
+  "launchedPackagedNodeAndSdk": true,
+  "originalSettingsFrameMounted": true,
+  "currentDshGuideServed": true,
+  "legacySdk2CenterInstallRejected": true,
+  "gitDirty": true,
+  "daemonSha256": "e6b11b47f88d4759997f9ea780ea29342b664f4c99aca07a322229b127ca1528",
+  "sdkLockSha256": "d3c2f75c3212b96733ec7cf9afda06de9d228f708f2e970eadda0279444f8679",
+  "result": "passed"
+}

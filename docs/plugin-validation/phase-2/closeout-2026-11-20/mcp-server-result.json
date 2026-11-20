@@ -1,0 +1,335 @@
+{
+  "completed": true,
+  "productVersion": "3.0.62",
+  "electronVersion": "45.0.0",
+  "platform": "darwin",
+  "arch": "arm64",
+  "buildIdentity": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+  "daemonSha256": "81d8a019b61667b1598ac718ccbea1a5a40350786bafa33edb270452297ee52e",
+  "checks": [
+    {
+      "name": "MCP 验收工作区注册成功",
+      "ok": true
+    },
+    {
+      "name": "普通会话接纳了真实 Turn",
+      "ok": true
+    },
+    {
+      "name": "MCP 服务管理面可用",
+      "ok": true
+    },
+    {
+      "name": "设置导航始终有 MCP 服务分类",
+      "ok": true
+    },
+    {
+      "name": "MCP 设置提供客户端、网络访问与活动标签",
+      "ok": true
+    },
+    {
+      "name": "可开启服务并监听本机端口",
+      "ok": true
+    },
+    {
+      "name": "监听端口要求令牌（无令牌 401）",
+      "ok": true
+    },
+    {
+      "name": "新令牌默认完整工具目录并逐次询问",
+      "ok": true
+    },
+    {
+      "name": "开放权限无需第二个风险确认，网络开关仍独立可选",
+      "ok": true
+    },
+    {
+      "name": "开放权限网络令牌创建成功",
+      "ok": true
+    },
+    {
+      "name": "始终授权令牌的普通写入无需 Magi 弹窗",
+      "ok": true
+    },
+    {
+      "name": "开放权限也自动执行删除类 MCP 工具",
+      "ok": true
+    },
+    {
+      "name": "开放权限也自动执行命令工具",
+      "ok": true
+    },
+    {
+      "name": "同一令牌两次 HTTP 初始化签发不同传输会话",
+      "ok": true
+    },
+    {
+      "name": "HTTP 统计来自真实传输会话",
+      "ok": true
+    },
+    {
+      "name": "客户端页展开后显示与 daemon 一致的 HTTP 连接数",
+      "ok": true
+    },
+    {
+      "name": "共享工作区中的同目录并发写入仍明确拒绝",
+      "ok": true
+    },
+    {
+      "name": "取消第一个 HTTP 会话不会中断第二个会话",
+      "ok": true
+    },
+    {
+      "name": "终止 HTTP 传输会话取消其 Shell 且不落地迟到副作用",
+      "ok": true
+    },
+    {
+      "name": "已终止传输会话返回 404",
+      "ok": true
+    },
+    {
+      "name": "终止后 HTTP 统计减少一个",
+      "ok": true
+    },
+    {
+      "name": "多个 HTTP 传输会话仍合并到同一 Magi 外部会话",
+      "ok": true
+    },
+    {
+      "name": "客户端配置服务名包含工作区和客户端",
+      "ok": true
+    },
+    {
+      "name": "生成的客户端配置可通过发行包 stdio 中继握手",
+      "ok": true
+    },
+    {
+      "name": "已认证 stdio 连接计入本地统计",
+      "ok": true
+    },
+    {
+      "name": "stdio 握手告知真实绑定工作区及相对路径基准",
+      "ok": true
+    },
+    {
+      "name": "stdio 目录统一包含读取、写入、删除和命令",
+      "ok": true
+    },
+    {
+      "name": "stdio 读取真实工作区内容",
+      "ok": true
+    },
+    {
+      "name": "stdio 开放权限写入实际文件",
+      "ok": true
+    },
+    {
+      "name": "stdio 越出工作区拒绝",
+      "ok": true
+    },
+    {
+      "name": "stdio 取消通知终止指定命令并保留另一条读取结果",
+      "ok": true
+    },
+    {
+      "name": "stdio 错误令牌被拒绝并断开",
+      "ok": true
+    },
+    {
+      "name": "询问模式客户端初始化 HTTP 传输会话",
+      "ok": true
+    },
+    {
+      "name": "可单次允许 MCP 读取操作",
+      "ok": true
+    },
+    {
+      "name": "外部 agent 经 MCP 读取本地文件成功",
+      "ok": true
+    },
+    {
+      "name": "越出工作区的调用被拒绝",
+      "ok": true
+    },
+    {
+      "name": "daemon 为外部客户端建立了外部会话，归属令牌绑定的工作区",
+      "ok": true
+    },
+    {
+      "name": "外部会话进入工作区的统一会话列表",
+      "ok": true
+    },
+    {
+      "name": "外部会话按最近活动时间排在普通会话中",
+      "ok": true
+    },
+    {
+      "name": "侧栏的外部会话以客户端名称标识并标注「外部」",
+      "ok": true
+    },
+    {
+      "name": "点外部会话后顶部标签回到「对话」",
+      "ok": true
+    },
+    {
+      "name": "外部会话在主对话区打开，没有对话输入框",
+      "ok": true
+    },
+    {
+      "name": "打开外部会话后仍保留在统一会话列表",
+      "ok": true
+    },
+    {
+      "name": "en-US/original 外部会话来源按界面语言显示且保持只读",
+      "ok": true
+    },
+    {
+      "name": "en-US/summary 外部会话来源按界面语言显示且保持只读",
+      "ok": true
+    },
+    {
+      "name": "zh-CN/original 外部会话来源按界面语言显示且保持只读",
+      "ok": true
+    },
+    {
+      "name": "zh-CN/summary 外部会话来源按界面语言显示且保持只读",
+      "ok": true
+    },
+    {
+      "name": "外部调用在时间线里按工具卡片展示（读取的文件名）",
+      "ok": true
+    },
+    {
+      "name": "等待确认的写入出现在外部会话自己的授权托盘里",
+      "ok": true
+    },
+    {
+      "name": "待确认在窗口不在前台时发系统通知（带客户端名称与操作摘要）",
+      "ok": true
+    },
+    {
+      "name": "在会话里批准后外部写入成功",
+      "ok": true
+    },
+    {
+      "name": "外部写入在会话里展示为带文件名的卡片",
+      "ok": true
+    },
+    {
+      "name": "每次询问模式对下一次写入再次确认",
+      "ok": true
+    },
+    {
+      "name": "拒绝当前 MCP 写入不产生文件",
+      "ok": true
+    },
+    {
+      "name": "HTTP 取消待审批调用不产生文件",
+      "ok": true
+    },
+    {
+      "name": "取消后的界面没有遗留审批且工具卡片标记已取消",
+      "ok": true
+    },
+    {
+      "name": "MCP 变更账本包含真实写入",
+      "ok": true
+    },
+    {
+      "name": "MCP 审计保留记录且不回显令牌",
+      "ok": true
+    },
+    {
+      "name": "活动页显示审计与保存策略",
+      "ok": true
+    },
+    {
+      "name": "可关闭保存调用内容",
+      "ok": true
+    },
+    {
+      "name": "每次询问模式下的隐私读取也请求确认",
+      "ok": true
+    },
+    {
+      "name": "关闭保存后外部调用本身仍然成功",
+      "ok": true
+    },
+    {
+      "name": "关闭保存后读到的内容不落库、动作与路径保留",
+      "ok": true
+    },
+    {
+      "name": "外部活动段自动收口且实时清理运行状态，无需刷新",
+      "ok": true
+    },
+    {
+      "name": "吊销令牌停止在途命令且不产生后续写入",
+      "ok": true
+    },
+    {
+      "name": "吊销客户端令牌后 HTTP 立即拒绝",
+      "ok": true
+    },
+    {
+      "name": "吊销后会话卡片显示实际取消状态",
+      "ok": true
+    },
+    {
+      "name": "项目移除事务成功",
+      "ok": true
+    },
+    {
+      "name": "移除工作区后保留历史并标记不可用",
+      "ok": true
+    },
+    {
+      "name": "不可用历史没有绕过工作区校验的会话按钮",
+      "ok": true
+    },
+    {
+      "name": "客户端页显示原令牌已吊销",
+      "ok": true
+    },
+    {
+      "name": "重新添加原目录复用工作区身份",
+      "ok": true
+    },
+    {
+      "name": "原工作区恢复后历史重新可用",
+      "ok": true
+    },
+    {
+      "name": "恢复工作区不复活已吊销令牌",
+      "ok": true
+    },
+    {
+      "name": "服务关闭后两种连接统计归零",
+      "ok": true
+    },
+    {
+      "name": "网络设置明确区分直连与公网隧道",
+      "ok": true
+    },
+    {
+      "name": "无需 tunnel 即可监听真实网卡地址",
+      "ok": true
+    },
+    {
+      "name": "内网直连接受网络令牌并拒绝本机令牌",
+      "ok": true
+    },
+    {
+      "name": "移除工作区后 sidecar 维护没有归属错误",
+      "ok": true
+    },
+    {
+      "name": "历史快照与实时事件无 canonical 事实冲突",
+      "ok": true
+    },
+    {
+      "name": "Electron 日志没有 Desktop IPC 协议拒绝",
+      "ok": true
+    }
+  ]
+}

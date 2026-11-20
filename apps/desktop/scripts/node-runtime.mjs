@@ -1,15 +1,15 @@
 // 受信扩展宿主随包携带的固定版本 Node。
 //
 // 版本与每个平台归档的 SHA-256 固定在 apps/desktop/node-runtime.json（随仓库审阅）。
-// 下载内容必须与固定摘要一致；只提取 node 可执行文件和许可证，其余（npm、头文件等）不进入发行物。
+// 从校验过的官方归档提取 Node、随附 npm 和许可证。npm 由 daemon 使用绝对路径调用。
 // 扩展宿主由 daemon 直接启动该可执行文件，不依赖用户 PATH，也不使用 Electron 自带的 Node。
 
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { access, cp, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, cp, mkdir, mkdtemp, readFile, rename, rm, stat } from "node:fs/promises";
 import { constants, createWriteStream } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -21,6 +21,7 @@ const desktopRoot = resolve(scriptDirectory, "..");
 const repositoryRoot = resolve(desktopRoot, "../..");
 
 export const nodeRuntimeFileName = process.platform === "win32" ? "node.exe" : "node";
+export const npmRuntimeEntry = "npm/bin/npm-cli.js";
 export const nodeRuntimeCache = join(repositoryRoot, "target", "node-runtime-cache");
 
 export async function readNodeRuntimePin() {
@@ -28,12 +29,11 @@ export async function readNodeRuntimePin() {
   const key = `${process.platform}-${process.arch}`;
   const archive = pin.archives?.[key];
   if (!archive) throw new Error(`没有为 ${key} 固定的随包 Node`);
-  return { version: pin.version, source: pin.source, archive, key };
+  return { version: pin.version, npmVersion: pin.npmVersion, source: pin.source, archive, key };
 }
 
 /**
- * 准备随包 Node：下载（或复用缓存）并校验归档摘要，再提取可执行文件与许可证。
- * 返回 `{ version, executable, license }`。
+ * 下载或复用缓存的官方归档，校验后准备随包 Node 和 npm。
  */
 export async function stageNodeRuntime(destination) {
   const pin = await readNodeRuntimePin();
@@ -43,12 +43,12 @@ export async function stageNodeRuntime(destination) {
   const extractionRoot = await mkdtemp(join(nodeRuntimeCache, "extract-"));
   try {
     const directory = pin.archive.file.replace(/\.(tar\.gz|tar\.xz|zip)$/u, "");
-    let executable;
-    let license;
+    const archiveRoot = join(extractionRoot, directory);
+    const npmDirectory = process.platform === "win32" ? "node_modules/npm" : "lib/node_modules/npm";
+    const executable = join(archiveRoot, process.platform === "win32" ? "node.exe" : "bin/node");
+    const license = join(archiveRoot, "LICENSE");
     if (pin.archive.file.endsWith(".zip")) {
       await extractZip(archivePath, { dir: extractionRoot });
-      executable = join(extractionRoot, directory, "node.exe");
-      license = join(extractionRoot, directory, "LICENSE");
     } else {
       await execFileAsync("tar", [
         process.platform === "linux" ? "-xJf" : "-xzf",
@@ -56,16 +56,16 @@ export async function stageNodeRuntime(destination) {
         "-C", extractionRoot,
         `${directory}/bin/node`,
         `${directory}/LICENSE`,
+        `${directory}/${npmDirectory}`,
       ], { maxBuffer: 1024 * 1024 });
-      executable = join(extractionRoot, directory, "bin", "node");
-      license = join(extractionRoot, directory, "LICENSE");
     }
     await assertFile(executable, "Node 可执行文件");
     await assertFile(license, "Node 许可证");
     const staged = join(destination, nodeRuntimeFileName);
     await cp(executable, staged);
     await cp(license, join(destination, "LICENSE"));
-    if (process.platform !== "win32") await (await import("node:fs/promises")).chmod(staged, 0o755);
+    await cp(join(archiveRoot, npmDirectory), join(destination, "npm"), { recursive: true });
+    if (process.platform !== "win32") await chmod(staged, 0o755);
     return { version: pin.version, executable: staged, license: join(destination, "LICENSE") };
   } finally {
     await rm(extractionRoot, { recursive: true, force: true });
@@ -104,7 +104,7 @@ async function fileDigest(path) {
 
 /**
  * 最终制品上的实际执行校验：清空环境（防止本地 PATH 或开发工具掩盖漏打包），
- * 确认版本、平台架构与 ESM/网络模块可用。
+ * 确认 Node 版本、平台架构与 ESM/网络模块可用，并实际执行 npm CLI。
  */
 export async function runNodeRuntimePreflight(directory) {
   const pin = await readNodeRuntimePin();
@@ -122,7 +122,13 @@ export async function runNodeRuntimePreflight(directory) {
   if (report.version !== pin.version || `${report.platform}-${report.arch}` !== pin.key || report.net !== "function") {
     throw new Error(`随包 Node 执行校验失败: ${executable} ${stdout.trim()}`);
   }
-  return report;
+  const npm = join(directory, npmRuntimeEntry);
+  const result = await execFileAsync(executable, [npm, "--version"], {
+    env: {}, windowsHide: true, timeout: 20_000, maxBuffer: 4096,
+  });
+  const npmVersion = result.stdout.trim();
+  if (npmVersion !== pin.npmVersion) throw new Error(`随包 npm 版本不符: ${npm} ${npmVersion}`);
+  return { ...report, npmVersion };
 }
 
 async function assertFile(path, label) {
@@ -131,7 +137,7 @@ async function assertFile(path, label) {
 }
 
 // 开发入口：node scripts/node-runtime.mjs stage <目录>，把固定版本 Node 准备到指定目录。
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href && process.argv[2] === "stage") {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href && process.argv[2] === "stage") {
   const destination = resolve(process.argv[3] ?? join(repositoryRoot, "target", "extension-node"));
   const staged = await stageNodeRuntime(destination);
   await runNodeRuntimePreflight(destination);

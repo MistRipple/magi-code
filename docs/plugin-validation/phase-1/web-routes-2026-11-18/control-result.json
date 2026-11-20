@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "scope": "authenticated-cross-process-web-route-service",
+  "capturedAt": "2026-11-18T01:23:48.406989+00:00",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "hostLock": {
+    "path": "crates/magi-extension-host/runtime/dsh/package-lock.json",
+    "sha256": "bd07ad02d666df160691105ca8bf86f6abd6f3c0ed87d020c6b7d8e1245db164"
+  },
+  "webServer": {
+    "name": "@deepseek-ai/dsh-host-webserver",
+    "version": "0.2.2-rc.3",
+    "integrity": "sha512-vx1x4HtVMIAJNJ9kqpMj62vj1CVS+hPsrs/JD0/vN4uR+r+eywjj8HEzy7fb4ywuI/V2cZjgpqNpfIC1MTJIwQ=="
+  },
+  "preparedProject": "target/dsh-phase-1/projects/mgr-web-route-control-2026-11-18",
+  "dependencyLock": {
+    "path": "target/dsh-phase-1/projects/mgr-web-route-control-2026-11-18/package-lock.json",
+    "sha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+  },
+  "original": {
+    "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+    "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+    "name": "dsh-plugin-mgr",
+    "version": "0.2.13",
+    "verifiedOriginalFiles": {
+      "LICENSE": "d650e965595d51ade8795344e77785c82bfa3bb3c1f41f3d5f57c4ca19d5966e",
+      "dist/client.js": "fe305e14c80b6fcf95e54a96c341dbf14d289531b5eefb3205d4f007bd9bec1c",
+      "dist/http-q4G0rVPe.js": "9a2b24830ea79ea2793de04cb49034fccc4fb78ed2a3d175d972dc96ba24e9eb",
+      "dist/index.js": "5c81bd2b0c5e54292294bc5ab70a62b31c48b65b73576539b95889efb084fd0d",
+      "dist/internal.js": "6dce13d22cfce594bed2feee96ee8d100f81321a2919fd77d965cebcd0e90464",
+      "package.json": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "README.md": "69b9eee2f9c249e66800aa0eaa247c3041423532d5a542ec769bbbe38fffe2e3",
+      "icon.svg": "6307668063214a63967fed558e1a73194a3394911288cf833dbea0892f49df74",
+      "cordis.patch.yml": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9"
+    }
+  },
+  "sourceSha256": {
+    "crates/magi-extension-host/runtime/dsh/entry.mjs": "1a29dcfa4f00126ea1b2b5ba3ca7d14ab2448c92bbe7dfbbc816148358d361f3",
+    "crates/magi-extension-host/runtime/dsh/lifecycle.mjs": "ccd529d0982e3980804f01cede59be738c299645d0e9318af85b496fe48efbe2",
+    "crates/magi-extension-host/runtime/dsh/test/web-routes.test.mjs": "197c80a033d51258c3017a0c25e3f6809d9dc652dc8663582b63245790145daa",
+    "crates/magi-extension-host/runtime/dsh/web-routes.mjs": "75de18c6e37dffb86f5c4edec36612fc7b776d7ab43bd41e3e43022ae3354cc2",
+    "crates/magi-extension-host/src/shared.rs": "acc0b46fc65ad971d3a88562cf9138903dd0f346402595522a4ce3e8e9074347",
+    "crates/magi-extension-host/tests/shared_host.rs": "d833c7398ee86173816002dbcfea972cc54fd356d3502a7efbfaf5b916c42324",
+    "crates/magi-plugin-system/tests/loading_host.rs": "688408bfec8e01ed1eee500c62a8ba82be0a80964812e2c0c5c8952a504726cd"
+  },
+  "verification": {
+    "nodePassed": 62,
+    "rustPassed": 184,
+    "rustIgnored": 5,
+    "originalRustPassed": 5,
+    "clippy": "passed"
+  },
+  "crossProcessEvidence": [
+    "authenticated shared control can open one webServer service for the configured origin",
+    "invalid origin and rebind to a different origin are rejected",
+    "separate private port and public origin; wrong process generation may not obtain route authorization",
+    "registered exact route, fallback, local resource read and upstream structured and raw plugin HTML injection",
+    "real HTTP requests with UTF-8 instance identity and loopback transport proof",
+    "stop revokes the route, control credentials and loopback listener"
+  ],
+  "fixedOriginalDependencyProbe": {
+    "afterWebRoutes": {
+      "instances": [
+        {
+          "activationGeneration": 1,
+          "configurationEpoch": 1,
+          "hostGeneration": 1,
+          "instanceId": "include:dsh-plugin-mgr",
+          "missingServices": [
+            "loader"
+          ],
+          "pluginId": "dsh-plugin-mgr",
+          "state": "waiting",
+          "version": "0.2.13"
+        }
+      ],
+      "token": {
+        "hostGeneration": 1,
+        "revision": 1,
+        "sequence": 2
+      }
+    },
+    "beforeWebRoutes": {
+      "instances": [
+        {
+          "activationGeneration": 1,
+          "configurationEpoch": 1,
+          "hostGeneration": 1,
+          "instanceId": "include:dsh-plugin-mgr",
+          "missingServices": [
+            "loader",
+            "webServer"
+          ],
+          "pluginId": "dsh-plugin-mgr",
+          "state": "waiting",
+          "version": "0.2.13"
+        }
+      ],
+      "token": {
+        "hostGeneration": 1,
+        "revision": 1,
+        "sequence": 1
+      }
+    },
+    "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+    "business": "not-run",
+    "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+    "missingServices": [
+      "loader"
+    ],
+    "originalBundleUnchanged": true,
+    "package": "dsh-plugin-mgr@0.2.13",
+    "scope": "committed-graph-execution",
+    "state": "waiting"
+  },
+  "unverified": [
+    "shipping daemon network gateway and page admission",
+    "public loader",
+    "Electron and Mgr list, enable/disable, install, update, uninstall and self-update"
+  ]
+}

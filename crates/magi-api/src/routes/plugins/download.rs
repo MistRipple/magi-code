@@ -7,6 +7,7 @@
 
 use super::*;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 const MAX_REDIRECT_HOPS: usize = 3;
 const MAX_ATTEMPTS: usize = 3;

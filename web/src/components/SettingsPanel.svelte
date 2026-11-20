@@ -53,7 +53,9 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
 
   const pluginManifestsLoaded = $derived(pluginProjection().loaded);
   // 设置导航按“已安装”列出插件页：停用后页面仍在，只剩顶部栏和停用提示，用户可在顶部重新开启；卸载后才消失。
-  const pluginSettingsViews = $derived.by(() => pluginProjection().installed.flatMap((installed) =>
+  const pluginSettingsViews = $derived.by(() => pluginProjection().installed
+    .filter((installed) => !installed.reinstallRequired)
+    .flatMap((installed) =>
     (installed.manifest.contributions.views ?? [])
       .filter((view) => view.placements.includes('settings'))
       .map((view) => ({
@@ -62,6 +64,7 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
         manifest: installed.manifest,
         enabled: installed.enabled,
         digest: installed.digest,
+        instanceId: installed.runtime?.instanceId,
         entry: view.entry,
         // 插件设置页直接以插件名称呈现：导航项与页头一致，不再拼接视图标题。
         label: installed.manifest.name,
@@ -93,6 +96,37 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
       openedPluginSettingsTabs = next;
     }
   });
+
+  function retainPluginScroll(node: HTMLElement, state: { visible: boolean; identity: string }) {
+    let position = 0;
+    let frame = 0;
+    const save = () => {
+      if (state.visible && !frame && node.getClientRects().length) position = node.scrollTop;
+    };
+    node.addEventListener('scroll', save, { passive: true });
+    return {
+      update(next: typeof state) {
+        const returning = next.visible && !state.visible;
+        state = next;
+        if (!next.visible) {
+          cancelAnimationFrame(frame);
+          frame = 0;
+        }
+        if (returning && position > 0) {
+          // An active client moves from parking back to the settings outlet.
+          // Restore after layout has the real iframe height again.
+          frame = requestAnimationFrame(() => requestAnimationFrame(() => {
+            node.scrollTop = position;
+            frame = 0;
+          }));
+        }
+      },
+      destroy() {
+        cancelAnimationFrame(frame);
+        node.removeEventListener('scroll', save);
+      },
+    };
+  }
   const activeTabTitle = $derived(
     'titleKey' in activeTabDefinition ? i18n.t(activeTabDefinition.titleKey) : activeTabDefinition.title,
   );
@@ -713,9 +747,11 @@ import { pluginProjection, trackPluginProjection } from '../stores/plugin-regist
         </div></div></div>
       {/if}
         {#each retainedPluginSettingsTabs as tab (tab.tabId)}
-          <div class="settings-frame" hidden={tab.tabId !== store.activeTab} inert={!active || tab.tabId !== store.activeTab}>
+          {@const visible = active && tab.tabId === store.activeTab}
+          <div class="settings-frame" hidden={tab.tabId !== store.activeTab} inert={!visible}
+            use:retainPluginScroll={{ visible, identity: JSON.stringify([tab.digest, tab.instanceId, tab.enabled]) }}>
             {#if tab.enabled}
-              <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} placement="settings" active={active && tab.tabId === store.activeTab} />
+              <PluginTabContent pluginId={tab.id} entry={tab.entry} label={tab.label} placement="settings" active={visible} />
             {:else}
               <p class="settings-hint" role="status" data-testid="plugin-page-inactive">{i18n.t('settings.plugins.pageHeader.inactive')}</p>
             {/if}

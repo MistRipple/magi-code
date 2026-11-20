@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { access, readFile, readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { extractFile, listPackage } from "@electron/asar";
-import { nodeRuntimeFileName, runNodeRuntimePreflight } from "./node-runtime.mjs";
+import { nodeRuntimeFileName, npmRuntimeEntry, runNodeRuntimePreflight } from "./node-runtime.mjs";
 
 export async function afterPack(context) {
   const resources = context.electronPlatformName === "darwin"
@@ -43,13 +43,20 @@ export async function afterPack(context) {
       || !manifest.files.some((file) => file.path === `daemon/node/${nodeRuntimeFileName}`)) {
     throw new Error("发行资源清单缺少随包 Node");
   }
-  if (!manifest.files.some((file) => file.path === "daemon/compat/cli.mjs")
-      || !manifest.files.some((file) => file.path === "daemon/compat/install/prepare.mjs")
-      || !manifest.files.some((file) => file.path === "daemon/compat/dist/translation-runtime.json")
-      || !manifest.files.some((file) => file.path.startsWith("daemon/compat/node_modules/@deepseek-ai/cordis/"))) {
-    throw new Error("发行资源清单缺少上游插件翻译运行时");
+  for (const path of [
+    `daemon/node/${npmRuntimeEntry}`,
+    "daemon/dsh/runtime/entry.mjs",
+    "daemon/dsh/runtime/prepare-dependencies.mjs",
+    "daemon/dsh/runtime/dist/dsh-client-host.js",
+    "daemon/dsh/runtime/dist/dsh-client-host.css",
+    "daemon/dsh/package-lock.json",
+    "daemon/dsh/node_modules/@deepseek-ai/cordis/package.json",
+  ]) {
+    if (!manifest.files.some((file) => file.path === path)) {
+      throw new Error(`发行资源清单缺少 DSH 执行工具链: ${path}`);
+    }
   }
-  // 校验最终制品里的 Node 能在清空环境下真实执行，且与固定版本一致。
+  // 在最终制品中以空环境实际运行 Node 和 npm，核对发行固定版本。
   await runNodeRuntimePreflight(join(resources, "daemon", "node"));
 
   const packagedPaths = [
@@ -61,7 +68,7 @@ export async function afterPack(context) {
     throw new Error(`Desktop Main 必须是单一 bundle，不得携带运行时 node_modules: ${unpackedNodeModule}`);
   }
   const forbidden = packagedPaths.find(isRetiredRuntimePath);
-  if (forbidden) throw new Error(`发行包包含废弃 Browser/Desktop 实现: ${forbidden}`);
+  if (forbidden) throw new Error(`发行包包含废弃运行时: ${forbidden}`);
   process.stdout.write(`Electron 解包自检通过: ${context.appOutDir}\n`);
 }
 
@@ -70,7 +77,7 @@ export function isRetiredRuntimePath(path) {
   const candidate = path.replace(/[^/]+\.(svg|png|jpe?g|webp|gif|avif|bmp|ico)$/i, "");
   return /(^|\/)(tauri|cef|playwright|native-browser|browser-runtime)(\/|\.|-|$)/i.test(candidate)
     || /(^|\/)(model_bridge_loopback|mcp_bridge_loopback|mcp_manager_server)(\.exe)?$/i.test(candidate)
-    || /^daemon\/compat\/translate\//.test(candidate)
+    || /^daemon\/compat(?:\/|$)/.test(candidate)
     || /chromium embedded framework/i.test(candidate);
 }
 

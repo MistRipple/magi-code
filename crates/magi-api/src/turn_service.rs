@@ -122,16 +122,8 @@ impl TurnService {
         &self,
         request: SessionTurnRequestDto,
     ) -> Result<SessionTurnResponseDto, ApiError> {
-        submit_session_turn_internal(self.state.clone(), request, None).await
+        submit_session_turn_internal(self.state.clone(), request).await
     }
-}
-
-pub(crate) async fn submit_plugin_job(
-    state: ApiState,
-    request: SessionTurnRequestDto,
-    job: magi_app_server_protocol::generated::PluginJobContext,
-) -> Result<SessionTurnResponseDto, ApiError> {
-    submit_session_turn_internal(state, request, Some(job)).await
 }
 
 /// TurnService 的唯一业务实现。
@@ -140,7 +132,6 @@ pub(crate) async fn submit_plugin_job(
 async fn submit_session_turn_internal(
     state: ApiState,
     mut request: SessionTurnRequestDto,
-    job: Option<magi_app_server_protocol::generated::PluginJobContext>,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     request.skill_name = request
         .skill_name
@@ -374,19 +365,6 @@ async fn submit_session_turn_internal(
             "编辑上一条消息必须开始新的对话轮次".to_string(),
         ));
     }
-    if job.is_some() {
-        let session = request
-            .requested_session_id()
-            .ok_or_else(|| ApiError::InvalidInput("作业需要明确会话".into()))?;
-        if state.queued_regular_session_turn_count(&session) > 0
-            || state
-                .session_store
-                .ensure_current_turn_acceptance_available(&session)
-                .is_err()
-        {
-            return Err(ApiError::Conflict("会话繁忙，作业等待下一次调度".into()));
-        }
-    }
     if matches!(
         decision.route,
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute
@@ -483,7 +461,7 @@ async fn submit_session_turn_internal(
                 accepted_at,
                 decision,
                 creation_request_fingerprint: request_fingerprint,
-                job,
+
                 plugin_message: None,
             })
             .await
@@ -706,21 +684,34 @@ pub(crate) fn resolve_plugin_command_selection(
     }
     let selected = magi_plugin_system::ContributionRef::parse("命令", command_id)
         .map_err(ApiError::InvalidInput)?;
-    let manager = state
-        .plugin_manager
-        .lock()
-        .map_err(|_| ApiError::internal_assembly("校验插件命令失败", "插件锁已损坏"))?;
-    let command = manager
-        .command_contributions()
-        .map_err(|error| ApiError::internal_assembly("读取插件命令失败", error.to_string()))?
-        .into_iter()
-        .find(|(manifest, command)| {
-            magi_plugin_system::ContributionRef::new(manifest.id.clone(), command.id.clone())
-                == selected
+    let command = state
+        .native_plugin_platform
+        .as_ref()
+        .and_then(|platform| {
+            platform
+                .enabled_commands()
+                .into_iter()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(command_id))
         })
-        .map(|(_, command)| command)
         .ok_or_else(|| ApiError::Forbidden("所选插件命令未启用".into()))?;
-    Ok(Some(command))
+    let title = command
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or(&selected.contribution_id)
+        .trim_start_matches('/')
+        .to_owned();
+    let description = command
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(Some(
+        magi_app_server_protocol::generated::PluginNamedContribution {
+            id: selected.contribution_id,
+            title,
+            description,
+        },
+    ))
 }
 
 fn session_turn_command_decision() -> SessionTurnIntentDecision {
@@ -964,6 +955,7 @@ async fn submit_conversation_session_turn(
         workspace_id,
         crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE,
         accepted_at,
+        request.project_directories.as_ref(),
     )?;
     let request_id = request
         .request_id()
@@ -1669,7 +1661,7 @@ struct MainlineSessionTurnInput {
     accepted_at: UtcMillis,
     decision: SessionTurnIntentDecision,
     creation_request_fingerprint: String,
-    job: Option<magi_app_server_protocol::generated::PluginJobContext>,
+
     plugin_message: Option<magi_app_server_protocol::generated::PluginSessionMessageOrigin>,
 }
 
@@ -1684,7 +1676,7 @@ async fn submit_mainline_session_turn(
         accepted_at,
         decision,
         creation_request_fingerprint,
-        job,
+
         plugin_message,
     } = input;
     let trace = PerformanceTrace::new(request.request_id().as_deref(), accepted_at);
@@ -1762,12 +1754,6 @@ async fn submit_mainline_session_turn(
                     }
                     if let Some(id) = request.plugin_command_id.as_ref() {
                         metadata.insert("pluginCommandId".into(), Value::String(id.clone()));
-                    }
-                    if let Some(job) = job {
-                        metadata.insert(
-                            "pluginJob".into(),
-                            serde_json::to_value(job).expect("job serializes"),
-                        );
                     }
                     if let Some(title) = selected_skill_title(&state, &request) {
                         metadata.insert("skillTitle".into(), Value::String(title));
@@ -1956,7 +1942,7 @@ mod tests {
     use super::monotonic_accepted_at;
     use std::sync::{Arc, Mutex};
 
-    fn command_state(active: bool) -> (crate::ApiState, tempfile::TempDir) {
+    fn command_state() -> (crate::ApiState, tempfile::TempDir) {
         use magi_plugin_system::{PluginManager, PluginPackage, PluginSource};
         let dir = tempfile::tempdir().unwrap();
         let manifest = serde_json::json!({
@@ -1995,9 +1981,6 @@ mod tests {
                 },
             )
             .unwrap();
-        if !active {
-            manager.disable("acme.cmd").unwrap();
-        }
         let state = crate::ApiState::new(
             "magi-test",
             Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
@@ -2021,23 +2004,15 @@ mod tests {
     }
 
     #[test]
-    fn plugin_commands_are_accepted_only_for_active_declared_commands_and_never_mixed() {
+    fn retired_package_cannot_submit_a_plugin_command_and_inputs_never_mix() {
         use super::{resolve_plugin_command_selection, validate_session_turn_input};
-        let (state, _dir) = command_state(true);
+        let (state, _dir) = command_state();
         let request = command_request(serde_json::json!({}));
         validate_session_turn_input(&request).unwrap();
-        resolve_plugin_command_selection(&state, &request).unwrap();
         assert!(matches!(
-            super::decide_session_turn(&state, &request).unwrap().route,
-            super::SessionTurnRouteDto::Execute
+            resolve_plugin_command_selection(&state, &request),
+            Err(crate::ApiError::Forbidden(_))
         ));
-        let empty = command_request(serde_json::json!({"text": ""}));
-        let decision = super::decide_session_turn(&state, &empty).unwrap();
-        assert_eq!(decision.task_title.as_deref(), Some("/Hello"));
-        assert_eq!(
-            decision.execution_goal.as_deref(),
-            Some("执行插件命令 /Hello")
-        );
         // 未声明的命令、格式错误的身份。
         for id in ["plugin/acme.cmd/ghost", "plugin/other/hello"] {
             let bad = command_request(serde_json::json!({"pluginCommandId": id}));
@@ -2059,9 +2034,6 @@ mod tests {
                 "{extra}"
             );
         }
-        // 未启用的插件不提供命令。
-        let (inactive, _dir2) = command_state(false);
-        assert!(resolve_plugin_command_selection(&inactive, &request).is_err());
     }
 
     struct DenyForbidden;

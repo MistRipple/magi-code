@@ -1,0 +1,48 @@
+{
+  "platform": "macOS arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "1c853fe3efc221571b32afa35322e9f1c90b33d1a3d3078752917f93c9307b1f",
+  "sdkLockSha256": "7af3cb1d8834be2fd81b29aadbbab3c08c051876746b4a6a2075aa8afe286e9e",
+  "observerSha256": "15377ce1632bb9a624d9e46b9617afa31ef7c86c97e3191ea6942741a413a23c",
+  "sample": {
+    "name": "dsh-plugin-mission-control",
+    "version": "0.2.1",
+    "sha256": "d003b87356dfd2174a4d2194888ff830aa8d95e857b50b494bbd7260119ca251",
+    "integrity": "sha512-bjw79GBSvZQG/sQ41u0KgHQ3irdrA8KguLKVfNm6YUVwwI4/y8Viy/eTU+9Nx3IeUoLbjKuETxttxm+o1XFC4A=="
+  },
+  "checks": {
+    "nativeProviderResults": [
+      {
+        "status": "succeeded"
+      },
+      {
+        "status": "failed",
+        "errorCode": "file_read_not_found"
+      }
+    ],
+    "committedTools": [
+      {
+        "callId": "file-read-present",
+        "status": "completed",
+        "itemId": "turn-item-tool-ec8c34a9fae20246deb886c465136056c576bf9397b0f66554ae4d35b987e83c",
+        "modelStepId": "task-task-local-agent-1795054779626-lease-1795054779693-1-0",
+        "commitSeqs": [
+          13,
+          15
+        ]
+      },
+      {
+        "callId": "file-read-missing",
+        "status": "failed",
+        "itemId": "turn-item-tool-d2f7dc9e984d4fadb56a3ac183bdf9b59838d593d37bfdacc3b40572530a326e",
+        "modelStepId": "task-task-local-agent-1795054779626-lease-1795054779693-1-0",
+        "commitSeqs": [
+          14,
+          16
+        ]
+      }
+    ],
+    "activities": []
+  },
+  "dependencyLockSha256": "38fbc9e5a420dfc613b6a440de14a42ab22db6f8d7936abc48df33fc48f36618"
+}

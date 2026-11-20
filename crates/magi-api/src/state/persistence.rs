@@ -42,9 +42,6 @@ impl ApiState {
             .map(load_browser_authority)
             .transpose();
         if let Some(state_root) = persistence.state_root() {
-            self.plugin_jobs = Arc::new(crate::plugin_jobs::PluginJobs::open(
-                state_root.join("plugin-jobs.json"),
-            ));
             self.mcp_service = Arc::new(crate::mcp_runtime::McpServiceRuntime::load(
                 state_root.join("mcp-server.json"),
             ));
@@ -215,7 +212,7 @@ impl ApiState {
         &self,
         session_id: &SessionId,
         title: impl Into<String>,
-    ) -> Result<SessionRecord, ApiError> {
+    ) -> Result<magi_session_store::SessionTitleCommit, ApiError> {
         let persist = self.session_projection_persist.clone();
         self.session_store
             .rename_session_with_persistence(session_id, title, |durable, sidecars| {

@@ -1,0 +1,74 @@
+{
+  "platform": "macOS arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "1a53d46cf5123634273f13cdfe4b29885329ed445ab6e134a6333166020dbdfa",
+  "sdkLockSha256": "7af3cb1d8834be2fd81b29aadbbab3c08c051876746b4a6a2075aa8afe286e9e",
+  "observerSha256": "33da04b352b41936314654c0e37a2d8b072476b183e21002c08a77ecb9259358",
+  "sample": {
+    "name": "dsh-plugin-mission-control",
+    "version": "0.2.1",
+    "sha256": "d003b87356dfd2174a4d2194888ff830aa8d95e857b50b494bbd7260119ca251",
+    "integrity": "sha512-bjw79GBSvZQG/sQ41u0KgHQ3irdrA8KguLKVfNm6YUVwwI4/y8Viy/eTU+9Nx3IeUoLbjKuETxttxm+o1XFC4A=="
+  },
+  "checks": {
+    "nativeProviderResults": [
+      {
+        "status": "succeeded"
+      },
+      {
+        "status": "failed",
+        "errorCode": "file_read_not_found"
+      }
+    ],
+    "committedTools": [
+      {
+        "callId": "file-read-present",
+        "status": "completed",
+        "itemId": "turn-item-tool-38bba948562482d3b6b26ecc55953fe665d6e98f0792ff682091de6aee2e9e72",
+        "modelStepId": "task-task-local-agent-1795058459069-lease-1795058459110-1-0",
+        "commitSeqs": [
+          13,
+          15
+        ]
+      },
+      {
+        "callId": "file-read-missing",
+        "status": "failed",
+        "itemId": "turn-item-tool-e195e28c99b27ed5cb95a9614f1ff602ef1d5446ef7457928cd6675aa72b5f24",
+        "modelStepId": "task-task-local-agent-1795058459069-lease-1795058459110-1-0",
+        "commitSeqs": [
+          14,
+          16
+        ]
+      }
+    ],
+    "activities": [
+      {
+        "action": "TOOL_CALL",
+        "description": "<task>: file_read"
+      },
+      {
+        "action": "TOOL_CALL",
+        "description": "<task>: file_read"
+      },
+      {
+        "action": "TOOL_RESULT",
+        "description": "<task>: ok"
+      },
+      {
+        "action": "TOOL_RESULT",
+        "description": "<task>: error (file_read_not_found)"
+      }
+    ],
+    "pendingQuestionCancellation": {
+      "turnStatus": "cancelled",
+      "taskStatus": "ASSIGNED",
+      "callId": "waiting-question",
+      "activities": [
+        "TOOL_CALL"
+      ],
+      "committedResult": false
+    }
+  },
+  "dependencyLockSha256": "38fbc9e5a420dfc613b6a440de14a42ab22db6f8d7936abc48df33fc48f36618"
+}

@@ -97,6 +97,7 @@ export interface PluginTabPayload {
   workspaceId?: string;
   workspacePath?: string;
   sessionId?: string;
+  navigation?: { address: string; params?: unknown; revision: number };
 }
 
 export interface BrowserAuthorityTabProjection {
@@ -503,7 +504,7 @@ function tabKey(kind: RightPaneTabKind, payload: RightPaneTabPayload): string {
   }
   if (kind === 'plugin') {
     const plugin = payload as PluginTabPayload;
-    return `plugin:${plugin.pluginId}:${plugin.contributionId}`;
+    return JSON.stringify(['plugin', plugin.pluginId, plugin.contributionId, plugin.navigation?.address ?? '']);
   }
   if (kind === 'agents') {
     return AGENTS_TAB_ID;
@@ -581,6 +582,11 @@ function upsertTab(
 
   if (existing) {
     existing.label = label;
+    if (kind === 'plugin') {
+      const previous = (existing.payload as PluginTabPayload).navigation;
+      const next = (payload as PluginTabPayload).navigation;
+      if (next) next.revision = (previous?.revision ?? 0) + 1;
+    }
     const browserPayloadUnchanged = kind === 'browser'
       && existing.kind === 'browser'
       && sameBrowserTabPayload(
@@ -1004,6 +1010,8 @@ export function openPluginTab(options: {
   workspaceId?: string | null;
   workspacePath?: string;
   sessionId?: string | null;
+  address?: string;
+  params?: unknown;
 }): string | null {
   const pluginId = options.pluginId.trim();
   const contributionId = options.contributionId.trim();
@@ -1020,6 +1028,7 @@ export function openPluginTab(options: {
       workspaceId: normalizeWorkspaceId(options.workspaceId),
       workspacePath: options.workspacePath?.trim() || undefined,
       sessionId: normalizeSessionId(options.sessionId),
+      ...(options.address !== undefined ? { navigation: { address: options.address, params: options.params, revision: 1 } } : {}),
     },
     options.label.trim() || pluginId,
   );

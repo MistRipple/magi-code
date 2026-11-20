@@ -2817,12 +2817,15 @@
           "type": "string",
           "description": "显式读取上游安装元数据时提供的当前不可变安装归档绝对路径；受信 Node 宿主按 digest 校验并只读原包文件，不代表已物化或正在运行。"
         },
-        "translationRuntime": {
-          "$ref": "#/$defs/PluginTranslationRuntimeStatus"
-        },
         "disabledBy": {
           "$ref": "#/$defs/PluginDisableInfo",
           "description": "通过管理授权停用插件的来源与说明；启用、用户显式停用或包版本替换时清除。只由 daemon 写入。"
+        },
+        "reinstallRequired": {
+          "type": "boolean",
+          "default": false,
+          "x-rust-default": true,
+          "description": "旧 SDK 2 或旧翻译安装物的平台硬切换标记：不加载、不当作运行故障，提示重新安装原包。"
         }
       }
     },
@@ -2830,6 +2833,7 @@
       "type": "string",
       "enum": [
         "starting",
+        "waiting",
         "running",
         "restarting",
         "failed",
@@ -2879,6 +2883,32 @@
           "type": "string",
           "maxLength": 64,
           "description": "daemon 签发的当前扩展实例公开身份；重启或重新启用必定变化，不是授权凭据，也不从局部 generation 推导。"
+        },
+        "unmountedSlots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "x-rust-default": true,
+          "description": "激活后客户端页面观察到的范围外槽位注册列表。"
+        },
+        "mountedSlots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "x-rust-default": true,
+          "description": "激活后客户端页面观察到的已挂载槽位列表。"
+        },
+        "hasSettingsView": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "x-rust-default": true,
+          "description": "该插件是否存在可挂载的设置页槽位；false 表示该插件没有设置页面。"
         }
       }
     },
@@ -2894,6 +2924,11 @@
           "items": {
             "$ref": "#/$defs/PluginInstalled"
           }
+        },
+        "configurationError": {
+          "type": ["string", "null"],
+          "x-rust-default": true,
+          "description": "插件加载来源最近一次未接纳的诊断。已接纳配置的运行状态由各插件条目提供。"
         }
       }
     },
@@ -3141,6 +3176,12 @@
           "type": "string",
           "maxLength": 64,
           "description": "视图调用绑定的扩展实例公开身份；不授予权限，失效时拒绝。"
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "会话页面请求读取的既有会话。目录和实际读取范围由 daemon 解析。"
         }
       }
     },
@@ -6177,7 +6218,7 @@
             "null"
           ],
           "x-rust-default": true,
-          "description": "预览得到的翻译包摘要；安装只接受摘要完全一致的翻译结果。"
+          "description": "预览得到的原包归档 SHA-256 摘要；安装时由 daemon 校验。"
         },
         "github": {
           "$ref": "#/$defs/PluginGithubSource",
@@ -6197,75 +6238,6 @@
         }
       ]
     },
-    "PluginTranslationNote": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "name",
-        "status",
-        "note"
-      ],
-      "properties": {
-        "name": {
-          "type": "string"
-        },
-        "status": {
-          "type": "string"
-        },
-        "note": {
-          "type": "string"
-        }
-      }
-    },
-    "PluginTranslationSummary": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "tools",
-        "commands",
-        "modelSources",
-        "unmountedSlots",
-        "degraded",
-        "omittedFiles"
-      ],
-      "properties": {
-        "tools": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "commands": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "modelSources": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "unmountedSlots": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "上游界面注册、但 Magi 没有对应位置因而不渲染的槽位。"
-        },
-        "degraded": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PluginTranslationNote"
-          }
-        },
-        "omittedFiles": {
-          "type": "integer",
-          "minimum": 0
-        }
-      }
-    },
     "PluginUpstreamPreview": {
       "type": "object",
       "additionalProperties": false,
@@ -6275,8 +6247,7 @@
         "version",
         "integrity",
         "publisher",
-        "official",
-        "translation"
+        "official"
       ],
       "properties": {
         "candidate": {
@@ -6297,14 +6268,8 @@
         "official": {
           "type": "boolean"
         },
-        "translation": {
-          "$ref": "#/$defs/PluginTranslationSummary"
-        },
         "github": {
           "$ref": "#/$defs/PluginGithubSource"
-        },
-        "translationRuntime": {
-          "$ref": "#/$defs/PluginTranslationRuntimeStatus"
         }
       }
     },
@@ -6370,81 +6335,6 @@
           },
           "maxItems": 32,
           "x-rust-default": true
-        }
-      }
-    },
-    "PluginDshCompatibilityProjection": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "revision",
-        "runtimeVersion",
-        "runtimeId",
-        "exemptions"
-      ],
-      "properties": {
-        "revision": {
-          "type": "integer",
-          "minimum": 0,
-          "x-rust-type": "u64"
-        },
-        "runtimeVersion": {
-          "type": "string",
-          "maxLength": 64
-        },
-        "runtimeId": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{24}$"
-        },
-        "exemptions": {
-          "type": "object",
-          "maxProperties": 512,
-          "additionalProperties": {
-            "type": "array",
-            "maxItems": 32,
-            "items": {
-              "type": "string",
-              "maxLength": 64
-            }
-          },
-          "x-rust-type": "std::collections::BTreeMap<String, Vec<String>>"
-        }
-      }
-    },
-    "PluginDshVersionExemptionRequest": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "target",
-        "runtimeVersion",
-        "expectedRuntimeId",
-        "expectedRevision",
-        "enabled",
-        "acceptRisk"
-      ],
-      "properties": {
-        "target": {
-          "type": "string",
-          "maxLength": 300
-        },
-        "runtimeVersion": {
-          "type": "string",
-          "maxLength": 64
-        },
-        "expectedRuntimeId": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{24}$"
-        },
-        "expectedRevision": {
-          "type": "integer",
-          "minimum": 0,
-          "x-rust-type": "u64"
-        },
-        "enabled": {
-          "type": "boolean"
-        },
-        "acceptRisk": {
-          "type": "boolean"
         }
       }
     },
@@ -7208,37 +7098,6 @@
           "minLength": 40,
           "maxLength": 40,
           "x-rust-default": true
-        }
-      }
-    },
-    "PluginTranslationRuntimeState": {
-      "type": "string",
-      "enum": [
-        "current",
-        "updateAvailable",
-        "unavailable"
-      ]
-    },
-    "PluginTranslationRuntimeStatus": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "state"
-      ],
-      "properties": {
-        "state": {
-          "$ref": "#/$defs/PluginTranslationRuntimeState"
-        },
-        "installedId": {
-          "type": "string",
-          "pattern": "^[a-f0-9]{64}$"
-        },
-        "currentId": {
-          "type": "string",
-          "pattern": "^[a-f0-9]{64}$"
-        },
-        "reason": {
-          "type": "string"
         }
       }
     },

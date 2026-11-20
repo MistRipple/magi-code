@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 axum.workspace = true
+http-body = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
@@ -13,6 +16,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 reqwest.workspace = true
+semver = "1"
 sysinfo.workspace = true
 getrandom.workspace = true
 tower-http = { version = "0.7", features = ["fs", "set-header"] }
@@ -23,6 +27,7 @@ magi-bridge-client = { path = "../magi-bridge-client" }
 magi-browser-authority = { path = "../magi-browser-authority" }
 magi-context-runtime = { path = "../magi-context-runtime" }
 magi-core = { path = "../magi-core" }
+magi-media = { path = "../magi-media" }
 magi-conversation-runtime = { path = "../magi-conversation-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }
 magi-governance = { path = "../magi-governance" }
@@ -42,9 +47,11 @@ magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-usage-authority = { path = "../magi-usage-authority" }
 magi-workspace = { path = "../magi-workspace" }
 magi-runtime-state = { path = "../magi-runtime-state" }
+tempfile = "3"
+flate2 = "1"
 
 [dev-dependencies]
 magi-session-store = { path = "../magi-session-store", features = ["test-support"] }
+tar = "0.4"
 tower = { version = "0.5.3", features = ["util"] }
-tempfile = "3"
 zip.workspace = true

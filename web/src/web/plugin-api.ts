@@ -3,9 +3,6 @@ import { getTransport } from '../shared/transport';
 import { agentUrl } from './agent-api';
 import type {
   PluginCandidatePreview,
-  PluginCenterConfig,
-  PluginCenterEntry,
-  PluginCenterProjection,
   PluginInstalled,
   PluginList,
   PluginManifest,
@@ -110,33 +107,6 @@ export async function fetchPluginGuide(): Promise<string> {
   return await response.text();
 }
 
-export async function fetchPluginCenter(): Promise<PluginCenterProjection> {
-  const response = await pluginRequest('/api/plugins/center');
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.center'), response);
-  return await response.json() as PluginCenterProjection;
-}
-
-export async function savePluginCenterConfig(config: PluginCenterConfig): Promise<PluginCenterConfig> {
-  const response = await pluginRequest('/api/plugins/center/config', {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(config),
-  });
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.saveCenter'), response);
-  return await response.json() as PluginCenterConfig;
-}
-
-/** 从插件中心安装或升级：包内容须与目录签名绑定的摘要一致；新装即启用，升级保持原启用状态。 */
-export async function installFromPluginCenter(entry: PluginCenterEntry): Promise<void> {
-  const response = await pluginRequest('/api/plugins/center/install', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: entry.id, version: entry.version, expectedSha256: entry.sha256 }),
-  });
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.installCenter'), response);
-  window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
-}
-
 /** 在上游生态（DSH、pi）的官方 npm 发布中搜索；空查询列出该生态的常见包。 */
 export async function searchUpstreamPlugins(query: string, signal?: AbortSignal): Promise<PluginUpstreamProjection> {
   const response = await pluginRequest(`/api/plugins/upstream?q=${encodeURIComponent(query)}`, { signal });
@@ -154,7 +124,7 @@ function upstreamBody(entry: PluginUpstreamRequest, expectedDigest?: string): st
   });
 }
 
-/** 准备阶段：daemon 取包、核对完整性并翻译，返回翻译结果与权限差异，不写入任何状态。 */
+/** 准备阶段只读取并校验原包，返回确认安装所需的归档摘要。 */
 export async function previewUpstreamPlugin(entry: PluginUpstreamRequest, signal?: AbortSignal): Promise<PluginUpstreamPreview> {
   const response = await pluginRequest('/api/plugins/upstream/preview', {
     method: 'POST',
@@ -166,15 +136,26 @@ export async function previewUpstreamPlugin(entry: PluginUpstreamRequest, signal
   return await response.json() as PluginUpstreamPreview;
 }
 
-/** 确认后安装：daemon 重新翻译并只接受与预览摘要一致的结果；新装即启用，升级保持原启用状态。 */
-export async function installUpstreamPlugin(preview: PluginUpstreamPreview, ecosystem: PluginUpstreamEntry['ecosystem']): Promise<void> {
+/** 提交预览确认的原包，等待 daemon 结算。 */
+export async function installUpstreamPlugin(preview: PluginUpstreamPreview, ecosystem: PluginUpstreamEntry['ecosystem'], requestId?: string): Promise<boolean> {
   const response = await pluginRequest('/api/plugins/upstream/install', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...(requestId ? { 'x-magi-plugin-request-id': requestId } : {}) },
     body: upstreamBody({ ecosystem, package: preview.package, version: preview.version, github: preview.github }, preview.candidate.digest),
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.upstreamInstall'), response);
+  if (response.status === 204) return false;
   window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
+  return true;
+}
+
+export async function cancelPluginInstall(requestId: string): Promise<'cancelled' | 'too-late' | 'not-running'> {
+  const action = i18n.t('settings.plugins.candidate.cancelOperation');
+  const response = await pluginRequest(`/api/plugins/install/${encodeURIComponent(requestId)}/cancel`, { method: 'POST' });
+  if (!response.ok) throw await pluginFailure(action, response);
+  const { status } = await response.json() as { status: unknown };
+  if (status === 'cancelled' || status === 'too-late' || status === 'not-running') return status;
+  throw new Error(i18n.t('common.actionFailureDetail', { action, detail: i18n.t('settings.plugins.candidate.cancelUnknown') }));
 }
 
 /** 启停绑定用户看到的安装；失败也刷新已提交事实，不伪装整个操作已回滚。 */
@@ -218,118 +199,6 @@ export async function loadEnabledPluginCommands(): Promise<PluginCommandProjecti
   return Array.isArray(payload) ? payload as PluginCommandProjection[] : [];
 }
 
-export function subscribePluginResource(
-  pluginId: string,
-  resourceId: string,
-  onUpdate: (resource: { version: number; value: unknown }) => void,
-  onError?: (error: unknown) => void,
-): () => void {
-  let closed = false;
-  const connection = getTransport().connectEventStream(
-    agentUrl(
-      `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}/events`,
-    ),
-    {
-      onOpen() {},
-      onMessage(data) {
-        if (closed) return;
-        try {
-          const event = JSON.parse(data) as { reset?: unknown; closed?: unknown; version?: unknown; value?: unknown };
-          if (event.closed === true) {
-            // 插件被停用、撤权或升级：订阅已由 daemon 结束，不会再有变更。
-            onError?.(new Error(i18n.t('plugins.error.subscriptionClosed')));
-            return;
-          }
-          if (event.reset === true) {
-            void readPluginResource(pluginId, resourceId)
-              .then((resource) => {
-                if (closed) return;
-                const snapshot = resource as { version?: unknown; value?: unknown };
-                if (typeof snapshot.version !== 'number') throw new Error('invalid plugin resource snapshot');
-                onUpdate({ version: snapshot.version, value: snapshot.value });
-              })
-              .catch((error) => {
-                if (!closed) onError?.(error);
-              });
-            return;
-          }
-          if (typeof event.version !== 'number') throw new Error('invalid plugin resource event');
-          onUpdate({ version: event.version, value: event.value });
-        } catch (error) {
-          onError?.(error);
-        }
-      },
-      onError() {
-        if (!closed) onError?.(new Error(i18n.t('plugins.error.subscriptionFailed')));
-      },
-    },
-  );
-  return () => {
-    closed = true;
-    connection.close();
-  };
-}
-
-export async function readPluginResource(
-  pluginId: string,
-  resourceId: string,
-): Promise<unknown> {
-  const response = await pluginRequest(
-    `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}`,
-  );
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.readResource'), response);
-  return await response.json();
-}
-
-export async function writePluginResource(
-  pluginId: string,
-  resourceId: string,
-  expectedVersion: number,
-  value: unknown,
-): Promise<unknown> {
-  const response = await pluginRequest(
-    `/api/plugins/${encodeURIComponent(pluginId)}/resources/${encodeURIComponent(resourceId)}`,
-    {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ expectedVersion, value }),
-    },
-  );
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.writeResource'), response);
-  return await response.json();
-}
-
-export async function describePluginSettings(pluginId: string): Promise<unknown> {
-  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/settings/schema`);
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.readSettings'), response);
-  return await response.json();
-}
-
-export async function readPluginSettings(pluginId: string): Promise<unknown> {
-  const response = await pluginRequest(
-    `/api/plugins/${encodeURIComponent(pluginId)}/settings`,
-  );
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.readSettings'), response);
-  return await response.json();
-}
-
-export async function writePluginSettings(
-  pluginId: string,
-  expectedVersion: number,
-  value: unknown,
-): Promise<unknown> {
-  const response = await pluginRequest(
-    `/api/plugins/${encodeURIComponent(pluginId)}/settings`,
-    {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ expectedVersion, value }),
-    },
-  );
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.writeSettings'), response);
-  return await response.json();
-}
-
 /** 视图后端路由：请求经 daemon 转交给该插件的扩展宿主。返回路由处理器给出的状态码与内容。 */
 export async function callPluginRoute(
   pluginId: string,
@@ -346,16 +215,26 @@ export async function callPluginRoute(
   return await response.json();
 }
 
-export async function admitPluginComposer(pluginId: string, request: import('../shared/app-server-protocol.generated').PluginComposerAdmissionRequest, signal?: AbortSignal): Promise<void> {
-  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/composer/admit`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request), signal,
-  });
-  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.callRoute'), response);
+export interface PluginClientSlotsReport {
+  instanceId?: string;
+  mountedSlots: string[];
+  unmountedSlots: string[];
+  hasSettingsView: boolean;
+  mainKeys: string[];
+  rightPaneTabs?: { key: string; title: string; launcherOrder?: number }[];
 }
 
-export async function admitPluginView(pluginId: string, request: import('../shared/app-server-protocol.generated').PluginViewAdmissionRequest, signal?: AbortSignal): Promise<void> {
-  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/views/admit`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request), signal,
+export async function reportPluginClientSlots(pluginId: string, report: PluginClientSlotsReport): Promise<void> {
+  const response = await pluginRequest(`/api/plugins/${encodeURIComponent(pluginId)}/slots`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(report),
   });
   if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.load'), response);
+}
+
+export async function restartPluginHost(): Promise<void> {
+  const response = await pluginRequest('/api/plugins/host/restart', { method: 'POST' });
+  if (!response.ok) throw await pluginFailure(i18n.t('plugins.error.restartHost'), response);
+  window.dispatchEvent(new CustomEvent(PLUGIN_REGISTRY_CHANGED_EVENT));
 }

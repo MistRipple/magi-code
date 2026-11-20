@@ -370,7 +370,6 @@ pub(crate) async fn drain_next_queued_regular_session_turn(
                                 accepted_at: admission_at,
                                 decision,
                                 creation_request_fingerprint,
-                                job: None,
                                 plugin_message,
                             })
                             .await

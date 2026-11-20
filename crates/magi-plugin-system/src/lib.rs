@@ -3,20 +3,18 @@
 //! 插件的可执行部分只有受信 Node 扩展，由 `magi-extension-host` 承载；这里只拥有包校验、
 //! 授权、启用/激活/升级状态与插件资源存储。SDK 1（QuickJS 后台）已移除，其包在校验阶段被拒绝。
 
-pub mod catalog;
-pub mod jobs;
 mod lifecycle;
+pub mod loading_runtime;
 pub mod npm;
 mod package;
 pub mod resource;
 
-pub use catalog::{
-    CatalogEntry, CatalogError, MAX_CATALOG_BYTES, ParsedCatalog, PluginCatalog, RevokedEntry,
-    TrustedKey,
-};
 pub use lifecycle::{
-    EnabledPlugin, InstalledPlugin, PluginChangeScope, PluginDrainGuard, PluginManager,
-    PluginManagerState, PluginSource, PreparedToolCall, RetiredBuiltin,
+    EnabledPlugin, InstalledPlugin, LoadingActivation, LoadingApplication, LoadingApplicationToken,
+    LoadingCandidate, LoadingConfiguration, LoadingEditProposal, LoadingExecutable,
+    LoadingHostCrashSummary, LoadingInstanceStatus, LoadingPlan, LoadingSource, LoadingSourceEdit,
+    PluginChangeScope, PluginDrainGuard, PluginManager, PluginManagerState, PluginSource,
+    PreparedToolCall, RetiredBuiltin,
 };
 pub use magi_app_server_protocol::{PluginManifest, PluginPermission, PluginPermissionKind};
 pub use package::{

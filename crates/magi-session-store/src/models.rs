@@ -5,6 +5,7 @@ use magi_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +29,9 @@ pub struct SessionRecord {
     pub message_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// 创建时选定的本机目录。工作树和之后的目录授权由各自的执行事实持有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_working_directory_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_completed_at: Option<UtcMillis>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +100,10 @@ pub const CANONICAL_TURN_SCHEMA_VERSION: &str = "canonical-turn.v1";
 /// 命令轮次只用于展示和审计；从 canonical Turn 重建模型历史的路径都通过
 /// [`CanonicalTurn::is_session_command`] 排除该轮，命令文本不进入模型上下文。
 pub const SESSION_COMMAND_METADATA_KEY: &str = "sessionCommand";
+/// 工具执行器已提交本条工具结果。回合终态收口和工具进度均不设置该事实。
+pub const TOOL_RESULT_COMMITTED_METADATA_KEY: &str = "toolResultCommitted";
+pub(crate) const TURN_INTERRUPTION_SOURCE_METADATA_KEY: &str = "interruptionSource";
+pub(crate) const TURN_INTERRUPTION_SOURCE_USER: &str = "user";
 
 /// `source_thread_id` 的可见性判定结果：
 /// - `Main`：对应 session 的 orchestrator thread，item 归属主线时间线
@@ -384,6 +392,17 @@ pub enum CanonicalTurnEventKind {
     TurnUpdated,
     TurnCompleted,
     TurnSuperseded,
+    /// 会话标题变更：会话级事实，不属于任何 Turn（`turn_id` 为空、`turn_seq` 为 0）。
+    /// 标题以日志中最后一条此类事件为准，会话记录是它的投影。
+    SessionTitleChanged,
+    /// 一次模型调用尝试的紧凑流记录（见 `ModelAttemptStream`）。只进事件日志，不进内存投影：
+    /// 观察、`page`、`follow` 从日志派生它。
+    ModelAttemptStreamRecorded,
+    /// 一个模型步骤首次提交时的请求快照（系统提示与请求头，正文按摘要去重）。
+    /// 只保留最新一条的摘要与正文在检查点投影里，历史正文留在事件日志与封存范围里。
+    ModelRequestRecorded,
+    /// 会话级命令生命周期事件（`command/run`、`command/done`），不属于任何 Turn（`turn_id` 为空、`turn_seq` 为 0）。
+    CommandEventRecorded,
 }
 
 /// 单个 session 内可持久化、可重放的 canonical 对话事件。
@@ -409,6 +428,167 @@ pub struct CanonicalTurnEvent {
     pub input: Option<SessionInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_step: Option<crate::ModelStep>,
+    /// 仅 `SessionTitleChanged` 携带：变更后的完整标题。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 仅 `ModelAttemptStreamRecorded` 携带。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_stream: Option<ModelAttemptStream>,
+    /// 仅 `ModelRequestRecorded` 携带。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_request: Option<ModelRequestRecord>,
+    /// 仅 `CommandEventRecorded` 携带：命令生命周期事件（`command/run` / `command/done`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_event: Option<SessionCommandEvent>,
+}
+
+/// 命令结算结果类型，与 DSH `command/done` 的 `kind` 对齐。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionCommandOutcome {
+    Success,
+    Error,
+}
+
+/// 会话级命令生命周期事件载荷，直接对应 DSH `command/run` 与 `command/done`。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum SessionCommandEvent {
+    Run {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<String>,
+    },
+    Done {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        outcome: SessionCommandOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(
+            rename = "sourceEventSeq",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        source_event_seq: Option<u64>,
+    },
+}
+
+/// 一次尝试的紧凑流记录：DSH 的 `AssistantStreamRecord` 列表，原样保存的 JSON。
+/// 仅用于历史回放与流式重放（HTTP 协议原始块或外部执行器完整回传内容），单条超上限时放弃写入。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelAttemptStream {
+    pub step_id: String,
+    pub attempt_id: String,
+    pub stream: Vec<Value>,
+}
+
+/// 非持久化实时助手流帧，仅用于推进共享宿主的 `follow({ assistantStream: true })`，不写入日志。
+#[derive(Clone, Debug, PartialEq)]
+pub enum LiveAssistantStreamEvent {
+    Start,
+    Chunk { time: u64, chunk: Value },
+    Abandon,
+}
+
+/// 单次尝试流记录序列化后的上限；超限不记录（不截断，DSH 要求流精确）。
+pub const MAX_ATTEMPT_STREAM_BYTES: usize = 8 * 1024 * 1024;
+
+/// 单次模型请求记录（去重后落盘事件载荷）的上限；超限放弃记录并告警，不截断。
+pub const MAX_MODEL_REQUEST_RECORD_BYTES: usize = 4 * 1024 * 1024;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// 与 DSH `LlmCallConfig` 逐字段对齐的请求调用配置。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelRequestCallConfig {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+}
+
+/// 与 DSH `ToolSchema` 逐字段对齐的规范工具定义。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelRequestToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+/// 与 DSH `EpochHeader` 逐字段对齐的模型请求头（不含 `system`，空 `tools` 序列化时省略）。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelRequestHeader {
+    pub config: ModelRequestCallConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ModelRequestToolSchema>,
+}
+
+impl ModelRequestHeader {
+    /// 规范化请求头内容的 SHA-256 十六进制摘要，供会话内去重与校验。
+    pub fn sha256_hex(&self) -> String {
+        let bytes = serde_json::to_vec(self).expect("ModelRequestHeader must serialize");
+        sha256_hex_bytes(&bytes)
+    }
+}
+
+/// 提交给会话日志写入器的完整模型请求快照（写入器按会话上一条记录的摘要决定去重）。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelRequestSnapshot {
+    pub step_id: String,
+    pub system_prompt: String,
+    pub header: ModelRequestHeader,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redacted: bool,
+}
+
+impl ModelRequestSnapshot {
+    pub fn system_prompt_sha256(&self) -> String {
+        sha256_hex_bytes(self.system_prompt.as_bytes())
+    }
+
+    pub fn header_sha256(&self) -> String {
+        self.header.sha256_hex()
+    }
+}
+
+/// 落盘在 `ModelRequestRecorded` 事件里的模型请求记录；与上一条摘要相同的正文被省略以去重。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelRequestRecord {
+    pub step_id: String,
+    pub system_prompt_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    pub header_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<ModelRequestHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redacted: bool,
+}
+
+pub fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    magi_core::hex_lower(digest)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -736,6 +916,17 @@ impl CanonicalTurn {
             item.kind == CanonicalTurnItemKind::UserMessage
                 && item.metadata.contains_key(SESSION_COMMAND_METADATA_KEY)
         })
+    }
+
+    pub fn was_interrupted_by_user(&self) -> bool {
+        self.status == CanonicalTurnStatus::Cancelled
+            && self
+                .items
+                .iter()
+                .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)
+                .and_then(|item| item.metadata.get(TURN_INTERRUPTION_SOURCE_METADATA_KEY))
+                .and_then(Value::as_str)
+                == Some(TURN_INTERRUPTION_SOURCE_USER)
     }
 
     pub fn normalize(&mut self) {

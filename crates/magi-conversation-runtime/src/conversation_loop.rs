@@ -588,18 +588,37 @@ fn run_conversation_loop_inner(
             workspace_rules
         ),
     ));
-    // [CACHE: STATIC] 扩展 `prompt.contribute`（阶段 Start）：任务开始时征询一次，稳定片段随后冻结进
-    // 前缀，之后的每个 Step 不再变化，因此不会破坏缓存；易变片段只在每轮尾部出现。
+    // [CACHE: STATIC] 扩展 `prompt.contribute`（阶段 Start）与 DSH `system-prompt/assemble`：
+    // 任务开始时征询一次，稳定片段随后冻结进前缀，之后的每个 Step 不再变化，因此不会破坏缓存；
+    // 易变片段只在每轮尾部出现。
     if let Some(hooks) = extension_hooks {
+        let start_scope = crate::extension_hooks::ToolHookScope {
+            session_id: session_id.as_str(),
+            task_id: task_id.as_str(),
+            workspace_id: workspace_id.as_ref().map(|id| id.as_str()),
+            worker_id: worker_id.map(|id| id.as_str()),
+            round: 0,
+        };
+        let base_role_prompt = static_context_messages
+            .first()
+            .and_then(|msg| msg.content.as_deref())
+            .unwrap_or_default();
+        if let Some(assembled) = hooks.system_prompt_assemble(&start_scope, base_role_prompt)
+            && !assembled.text.trim().is_empty()
+        {
+            if assembled.complete && !static_context_messages.is_empty() {
+                static_context_messages[0] =
+                    system_prompt_fragment_message(PromptFragmentKind::Role, assembled.text);
+            } else {
+                static_context_messages.push(system_prompt_fragment_message(
+                    PromptFragmentKind::Role,
+                    assembled.text,
+                ));
+            }
+        }
         static_context_messages.extend(crate::extension_hooks::contribute_prompt(
             hooks,
-            &crate::extension_hooks::ToolHookScope {
-                session_id: session_id.as_str(),
-                task_id: task_id.as_str(),
-                workspace_id: workspace_id.as_ref().map(|id| id.as_str()),
-                worker_id: worker_id.map(|id| id.as_str()),
-                round: 0,
-            },
+            &start_scope,
             crate::extension_hooks::ContributePhase::Start,
         ));
     }
@@ -1345,6 +1364,24 @@ fn run_conversation_loop_inner(
             refresh_mcp_instructions(&mut messages, mcp_instructions.borrow().as_deref());
         }
         active_tools = constrain_task_tool_definitions(active_tools, task.policy_snapshot.as_ref());
+        if let Some(hooks) = extension_hooks {
+            let restrict_scope = crate::extension_hooks::ToolHookScope {
+                session_id: session_id.as_str(),
+                task_id: task_id.as_str(),
+                workspace_id: workspace_id.as_ref().map(|id| id.as_str()),
+                worker_id: turn_visibility.worker_id().map(|id| id.as_str()),
+                round,
+            };
+            let current_names: Vec<String> = active_tools
+                .iter()
+                .map(|definition| definition.function.name.clone())
+                .collect();
+            let allowed: std::collections::HashSet<String> = hooks
+                .filter_visible_tools(&restrict_scope, current_names)
+                .into_iter()
+                .collect();
+            active_tools.retain(|definition| allowed.contains(&definition.function.name));
+        }
         if task.is_goal_mode() {
             if session_store.current_unfinished_goal(session_id).is_some()
                 || completed_required_tool_names
@@ -1767,6 +1804,13 @@ fn run_conversation_loop_inner(
                 }
                 let mut accumulated_content = delta_content.borrow_mut();
                 let mut accumulated_thinking = delta_thinking.borrow_mut();
+                if delta.replace {
+                    last_content_len.set(0);
+                    last_thinking_len.set(0);
+                    streamed_content.borrow_mut().clear();
+                    streamed_visible_content.borrow_mut().clear();
+                    streamed_thinking.borrow_mut().clear();
+                }
                 delta.accumulate_into(&mut accumulated_content, &mut accumulated_thinking);
                 if let Some(tracker) = context_usage_tracker.as_ref() {
                     tracker.observe_accumulated_output(&accumulated_content, &accumulated_thinking);

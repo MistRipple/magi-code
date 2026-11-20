@@ -459,6 +459,7 @@ mod tests {
                     updated_at: now,
                     message_count: None,
                     workspace_id: None,
+                    initial_working_directory_ref: None,
                     last_completed_at: None,
                     last_viewed_at: None,
                     kind: Default::default(),

@@ -20,6 +20,7 @@ use crate::scope_binding::{
     SessionScope, parse_session_id, require_session_record_in_scope,
     resolve_existing_session_scope, resolve_explicit_session_scope, resolve_session_scope,
 };
+use crate::session_lifecycle::publish_session_directory_event;
 use crate::{
     dto::{
         BootstrapDto, ContinueSessionRequest, ContinueSessionResponseDto, NotificationsResponseDto,
@@ -215,53 +216,20 @@ async fn materialize_session(
     State(state): State<ApiState>,
     Json(request): Json<MaterializeSessionRequest>,
 ) -> Result<Json<MaterializeSessionResponse>, ApiError> {
-    let _navigation_guard = state.lock_session_navigation().await;
+    let navigation_guard = state.lock_session_navigation().await;
     let scope = resolve_explicit_session_scope(
         &state,
         request.scope,
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
     )?;
-    let workspace_id = scope.workspace_id();
-    let previous_current_session_id = state.session_store.current_session_id();
-    let session_id = crate::scope_binding::new_session_id();
-    state
-        .session_store
-        .create_session_for_workspace(
-            session_id.clone(),
-            crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE,
-            workspace_id.as_ref().map(ToString::to_string),
-        )
-        .map_err(|error| ApiError::internal_assembly("创建浏览器会话所属会话失败", error))?;
-    // 新建会话会同时写入 session 记录和 current 指针；这里用完整 projection
-    // 提交这次实体创建，确保旧 projection、sidecar 和 current 在同一个持久化事务中
-    // 收口。导航专用写入只适合已有实体，不能把新实体的回滚留在旧文件之外。
-    if let Err(error) =
-        state.persist_session_projection_for_sessions_for_api(std::slice::from_ref(&session_id))
-    {
-        let original_message = error.message().to_string();
-        return Err(
-            match state
-                .rollback_created_session_after_navigation_lock(
-                    &session_id,
-                    previous_current_session_id,
-                )
-                .await
-            {
-                Ok(()) => error,
-                Err(rollback_error) => ApiError::internal_assembly(
-                    "创建浏览器会话失败且回滚失败",
-                    format!("{original_message}；回滚失败: {rollback_error:?}"),
-                ),
-            },
-        );
-    }
-    publish_session_directory_event(
+    let (session_id, workspace_id) = crate::session_lifecycle::create_session(
         &state,
-        "session.created",
-        &session_id,
-        workspace_id.as_ref(),
-    );
+        &navigation_guard,
+        &scope,
+        crate::session_lifecycle::CreationSelection::SelectAsCurrent,
+    )
+    .await?;
     Ok(Json(MaterializeSessionResponse {
         session_id,
         workspace_id,
@@ -618,19 +586,12 @@ async fn rename_session(
         request.requested_workspace_path(),
     )?;
     let workspace_id = scope.workspace_id();
-    let current = state
-        .session_store
-        .session(&session_id)
-        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
-    let renamed = state.rename_session_with_persistence_for_api(&session_id, &request.name)?;
-    if current.title != renamed.title {
-        crate::session_title::publish_session_title_updated(
-            &state,
-            &session_id,
-            workspace_id.clone(),
-            &renamed.title,
-        );
-    }
+    crate::session_lifecycle::rename_session(
+        &state,
+        &session_id,
+        workspace_id.clone(),
+        &request.name,
+    )?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         workspace_id.as_ref().map(WorkspaceId::as_str),
         None,
@@ -746,29 +707,6 @@ async fn close_session(
         workspace_id.as_ref().map(WorkspaceId::as_str),
         None,
     )?))
-}
-
-fn publish_session_directory_event(
-    state: &ApiState,
-    event_type: &str,
-    session_id: &SessionId,
-    workspace_id: Option<&WorkspaceId>,
-) {
-    state.event_bus.publish(
-        EventEnvelope::domain(
-            EventId::unique(format!("event-{event_type}-{session_id}")),
-            event_type,
-            json!({
-                "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.map(WorkspaceId::to_string),
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(session_id.clone()),
-            workspace_id: workspace_id.cloned(),
-            ..EventContext::default()
-        }),
-    );
 }
 
 #[derive(Debug, Deserialize)]

@@ -2953,7 +2953,7 @@ export class BrowserSurfaceManager {
     // 会话由 daemon 持久化，应用重启后未激活的 Tab 仍然拥有同一磁盘上下文，
     // 清理数据必须覆盖这些会话，否则“清理成功”会变成空操作。
     // 应用级持久分区必须无条件纳入清理：它可能还没有 guest 挂载，
-    // 也可能因为注册表尚未落盘而不在已知集合里（设计基线 §5.13）。
+    // 也可能因为注册表尚未落盘而不在已知集合里。
     const partitions = new Set([
       ...this.#knownPartitions,
       ...this.#configuredPartitions,

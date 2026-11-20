@@ -1,0 +1,145 @@
+{
+  "environment": "macOS Electron development, current debug daemon, official npm registry",
+  "result": "recovery-passed",
+  "testScope": "Previously installed original packages. Verify shared-host crash limit and Settings restart; normal business and in-flight operations are outside this rerun.",
+  "crashes": [
+    {
+      "index": 1,
+      "generation": 4
+    },
+    {
+      "index": 2,
+      "generation": 5
+    },
+    {
+      "index": 3,
+      "generation": 5
+    }
+  ],
+  "before": [
+    {
+      "id": "dsh-connect-workbuddy",
+      "version": "5.21.2",
+      "enabled": true,
+      "state": "running",
+      "generation": 3,
+      "crashes": 0
+    },
+    {
+      "id": "dsh-free-search",
+      "version": "0.9.41",
+      "enabled": true,
+      "state": "running",
+      "generation": 3,
+      "crashes": 0
+    },
+    {
+      "id": "dsh-plugin-mgr",
+      "version": "0.2.13",
+      "enabled": true,
+      "state": "running",
+      "generation": 3,
+      "crashes": 0
+    },
+    {
+      "id": "dsh-plugin-ops-bundle",
+      "version": "0.20.8",
+      "enabled": true,
+      "state": "running",
+      "generation": 3,
+      "crashes": 0
+    },
+    {
+      "id": "dsh-rea",
+      "version": "1.2.0",
+      "enabled": true,
+      "state": "running",
+      "generation": 3,
+      "crashes": 0
+    }
+  ],
+  "stopped": [
+    {
+      "id": "dsh-connect-workbuddy",
+      "version": "5.21.2",
+      "enabled": true,
+      "state": "stopped",
+      "generation": 0,
+      "crashes": 3
+    },
+    {
+      "id": "dsh-free-search",
+      "version": "0.9.41",
+      "enabled": true,
+      "state": "stopped",
+      "generation": 0,
+      "crashes": 3
+    },
+    {
+      "id": "dsh-plugin-mgr",
+      "version": "0.2.13",
+      "enabled": true,
+      "state": "stopped",
+      "generation": 0,
+      "crashes": 3
+    },
+    {
+      "id": "dsh-plugin-ops-bundle",
+      "version": "0.20.8",
+      "enabled": true,
+      "state": "stopped",
+      "generation": 0,
+      "crashes": 3
+    },
+    {
+      "id": "dsh-rea",
+      "version": "1.2.0",
+      "enabled": true,
+      "state": "stopped",
+      "generation": 0,
+      "crashes": 3
+    }
+  ],
+  "after": [
+    {
+      "id": "dsh-connect-workbuddy",
+      "version": "5.21.2",
+      "enabled": true,
+      "state": "running",
+      "generation": 6,
+      "crashes": 0
+    },
+    {
+      "id": "dsh-free-search",
+      "version": "0.9.41",
+      "enabled": true,
+      "state": "running",
+      "generation": 6,
+      "crashes": 0
+    },
+    {
+      "id": "dsh-plugin-mgr",
+      "version": "0.2.13",
+      "enabled": true,
+      "state": "running",
+      "generation": 6,
+      "crashes": 0
+    },
+    {
+      "id": "dsh-plugin-ops-bundle",
+      "version": "0.20.8",
+      "enabled": true,
+      "state": "running",
+      "generation": 6,
+      "crashes": 0
+    },
+    {
+      "id": "dsh-rea",
+      "version": "1.2.0",
+      "enabled": true,
+      "state": "running",
+      "generation": 6,
+      "crashes": 0
+    }
+  ]
+}

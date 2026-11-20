@@ -18,24 +18,30 @@
     busyLabel?: string;
     previewing?: boolean;
     onCancelPreview?: () => void;
+    canCancelInstall: boolean;
+    cancellingInstall: boolean;
+    onCancelInstall: () => void;
     onInstall: () => void;
-    onUpdateFromCenter: () => void;
+    onUpdateFromUpstream: () => void;
+    onReinstall?: () => void;
+    onRestartHost?: () => void;
     onUninstall: () => void;
     onEnable: () => void;
     onDisable: () => void;
     onOpenSettings: (tab: string) => void;
   }
   let {
-    item, busy, busyLabel = '', previewing = false, onCancelPreview, onInstall, onUpdateFromCenter,
-    onUninstall, onEnable, onDisable, onOpenSettings,
+    item, busy, busyLabel = '', previewing = false, onCancelPreview, onInstall, onUpdateFromUpstream,
+    onReinstall, onRestartHost, onUninstall, onEnable, onDisable, onOpenSettings,
+    canCancelInstall, cancellingInstall, onCancelInstall,
   }: Props = $props();
 
   const plugin = $derived(item.installed);
   const manifest = $derived<PluginManifest | null>(plugin?.manifest ?? null);
-  const settingsTab = $derived(plugin && plugin.enabled ? pluginSettingsTab(plugin.manifest) : null);
-  const translationRuntime = $derived(plugin?.translationRuntime);
-  const runtimeUpdate = $derived(translationRuntime?.state === 'updateAvailable' && item.upstream?.state !== 'updatable');
-  const versionUpdate = $derived(item.catalog?.state === 'updatable' ? item.catalog.version : item.upstream?.state === 'updatable' ? item.upstream.version : null);
+  const reinstallRequired = $derived(Boolean(plugin?.reinstallRequired));
+  const canReinstallFromUpstream = $derived(Boolean(plugin && reinstallRequired && installedUpstreamRequest(plugin)));
+  const settingsTab = $derived(plugin && plugin.enabled && !reinstallRequired ? pluginSettingsTab(plugin.manifest) : null);
+  const versionUpdate = $derived(item.upstream?.state === 'updatable' ? item.upstream.version : null);
 
   /**
    * 上游徽标：生态来自已安装记录，立即可用；发布者与“官方/第三方”来自上游搜索结果，
@@ -58,7 +64,10 @@
   /** 受信扩展的宿主运行状态；只有声明了 extension 的插件才有这一行。 */
   const runtime = $derived(plugin?.runtime ?? null);
   const isExtension = $derived(Boolean(manifest?.extension));
-  const runtimeProblem = $derived(runtime !== null && (runtime.state === 'failed' || runtime.state === 'restarting'));
+  const hostStoppedByCrash = $derived(Boolean(plugin?.enabled && runtime?.state === 'stopped' && runtime.crashes > 0));
+  const runtimeProblem = $derived(runtime !== null && (runtime.state === 'failed' || runtime.state === 'restarting' || hostStoppedByCrash));
+  const unmountedSlots = $derived(runtime?.unmountedSlots ?? []);
+  const hasNoSettingsPage = $derived(Boolean(plugin && plugin.enabled && !reinstallRequired && runtime?.hasSettingsView === false));
 
   function runtimeText(status: PluginRuntimeStatus | null): string {
     if (!status) return i18n.t('settings.plugins.runtime.state.notRunning');
@@ -74,10 +83,11 @@
       <span class="pane-icon" aria-hidden="true"><PluginIcon pluginId={item.id} icon={item.installed?.manifest.icon} upstream={item.installed ? null : item.upstream} revision={item.installed?.digest ?? ''} size={28} /></span>
       <h3>{item.name}</h3>
       <span class="settings-chip">v{item.version}</span>
-      {#if item.status === 'enabled'}<span class="settings-chip settings-chip--ok">{i18n.t('settings.plugins.status.enabled')}</span>
+      {#if reinstallRequired}<span class="settings-chip settings-chip--warn" data-testid="plugin-status-reinstall">{i18n.t('settings.plugins.status.reinstallRequired')}</span>
+      {:else if item.status === 'enabled'}<span class="settings-chip settings-chip--ok">{i18n.t('settings.plugins.status.enabled')}</span>
 {:else if item.status === 'disabled'}<span class="settings-chip">{i18n.t('settings.plugins.status.disabled')}</span>
       {:else}<span class="settings-chip">{i18n.t('settings.plugins.status.notInstalled')}</span>{/if}
-      {#if item.updatable}<span class="settings-chip settings-chip--accent">{i18n.t('settings.plugins.status.updatable')}</span>{/if}
+      {#if item.updatable && !reinstallRequired}<span class="settings-chip settings-chip--accent">{i18n.t('settings.plugins.status.updatable')}</span>{/if}
     </div>
     <div class="pane-id settings-mono">{item.upstream && !plugin ? item.upstream.package : item.id}</div>
     {#if upstreamBadges}
@@ -120,23 +130,13 @@
       </div>
     {/if}
     <div><dt>{i18n.t('settings.plugins.detail.version')}</dt><dd>v{item.version}{#if versionUpdate} → v{versionUpdate}{/if}</dd></div>
-    {#if translationRuntime}
-      <div data-testid="plugin-translation-runtime" data-state={translationRuntime.state}>
-        <dt>{i18n.t('settings.plugins.translationRuntime.label')}</dt>
-        <dd>{i18n.t(`settings.plugins.translationRuntime.${translationRuntime.state}`)}</dd>
-      </div>
-    {/if}
       <div data-testid="plugin-source" class:pane-warn={plugin?.source.kind === 'address' || plugin?.source.kind === 'local'}>
         <dt>{i18n.t('settings.plugins.detail.source')}</dt>
-        <dd>{#if plugin}{@const location = plugin.source.github ? `github:${plugin.source.github.repository}#${plugin.source.github.commit}` : plugin.source.location}{sourceLabel(plugin)} <span class="settings-mono" title={location} dir="ltr">{location}</span>{:else}{i18n.t(item.catalog ? 'settings.plugins.source.center' : item.upstream ? 'settings.plugins.source.upstream' : 'common.notProvided')}{/if}</dd>
+        <dd>{#if plugin}{@const location = plugin.source.github ? `github:${plugin.source.github.repository}#${plugin.source.github.commit}` : plugin.source.location}{sourceLabel(plugin)} <span class="settings-mono" title={location} dir="ltr">{location}</span>{:else}{i18n.t(item.upstream ? 'settings.plugins.source.upstream' : 'common.notProvided')}{/if}</dd>
       </div>
       <div><dt>{i18n.t('settings.plugins.detail.digest')}</dt><dd class="settings-mono" title={plugin?.digest}>{plugin?.digest.slice(0, 16) || i18n.t('common.notProvided')}</dd></div>
-      <div><dt>{i18n.t('settings.plugins.detail.size')}</dt><dd>{!plugin && item.catalog ? `${Math.round(item.catalog.size / 1024)} KB` : i18n.t('common.notProvided')}</dd></div>
-  </dl>
 
-  {#if translationRuntime?.reason}
-    <p class="settings-notice settings-notice--warn" role="status">{translationRuntime.reason}</p>
-  {/if}
+  </dl>
 
   {#if plugin?.disabledBy}
     <p class="settings-notice settings-notice--warn" role="status" data-testid="plugin-disabled-by">
@@ -144,9 +144,31 @@
     </p>
   {/if}
 
-  {#if runtime?.reason}
-    <p class="settings-notice settings-notice--{runtimeProblem ? 'error' : 'warn'}" role="status" data-testid="plugin-runtime-reason">
+  {#if reinstallRequired}
+    <p class="settings-notice settings-notice--warn" role="status" data-testid="plugin-reinstall-notice">
+      <Icon name="warning" size={13} /><span>{i18n.t('settings.plugins.reinstallNotice')}</span>
+    </p>
+  {:else if runtime?.reason}
+    <div class="settings-notice settings-notice--{runtimeProblem ? 'error' : 'warn'} pane-runtime-notice" role="status" data-testid="plugin-runtime-reason">
       <Icon name="warning" size={13} /><span>{runtime.reason}</span>
+      {#if hostStoppedByCrash && onRestartHost}
+        <button class="btn btn--sm btn--secondary" data-testid="plugin-restart-host" onclick={onRestartHost} disabled={busy}>
+          <Icon name="refresh" size={13} />
+          <span>{i18n.t('settings.plugins.runtime.restartHost')}</span>
+        </button>
+      {/if}
+    </div>
+  {/if}
+  {#if unmountedSlots.length > 0}
+    <p class="settings-notice settings-notice--warn" role="status" data-testid="plugin-unmounted-slots">
+      <Icon name="info" size={13} />
+      <span>{i18n.t('settings.plugins.unmountedSlotsNotice', { count: unmountedSlots.length, slots: unmountedSlots.join('、') })}</span>
+    </p>
+  {/if}
+  {#if hasNoSettingsPage}
+    <p class="settings-notice" role="status" data-testid="plugin-no-settings">
+      <Icon name="info" size={13} />
+      <span>{i18n.t('settings.plugins.noSettingsView')}</span>
     </p>
   {/if}
   {#if runtime && runtime.blocking.length > 0}
@@ -156,11 +178,11 @@
     </p>
   {/if}
 
-  {#if manifest}
+  {#if manifest && !reinstallRequired}
     <PluginImpactNotices {manifest} />
   {/if}
 
-  {#if plugin}
+  {#if plugin && !reinstallRequired}
     <section class="pane-section">
       <h4>{i18n.t('settings.plugins.stateHeading')}</h4>
       <div class="pane-state">
@@ -184,11 +206,23 @@
   </div>
   <div class="settings-card-foot pane-actions" data-testid="plugin-detail-actions">
     {#if previewing}<button class="btn btn--sm btn--secondary" data-testid="plugin-cancel-preview" onclick={onCancelPreview}>{i18n.t('common.cancel')}</button>{/if}
+    {#if canCancelInstall}
+      <button class="btn btn--sm btn--secondary" data-testid="plugin-cancel-install" disabled={cancellingInstall} onclick={onCancelInstall}>
+        {cancellingInstall ? i18n.t('settings.plugins.candidate.cancelling') : i18n.t('settings.plugins.candidate.cancelOperation')}
+      </button>
+    {/if}
     {#if plugin}
-      {#if runtimeUpdate && installedUpstreamRequest(plugin) || plugin.source.github || item.updatable && (item.catalog || item.upstream)}
-        <button class="btn btn--lg btn--primary" data-testid="plugin-detail-update" onclick={onUpdateFromCenter} disabled={busy}>
+      {#if reinstallRequired}
+        {#if canReinstallFromUpstream && onReinstall}
+          <button class="btn btn--lg btn--primary" data-testid="plugin-reinstall-action" onclick={onReinstall} disabled={busy}>
+            <Icon name={busy ? 'loader' : 'download'} class={busy ? 'spinning' : ''} size={13} />
+            <span>{busy ? busyLabel || i18n.t('common.loading') : i18n.t('settings.plugins.reinstallAction')}</span>
+          </button>
+        {/if}
+      {:else if item.updatable && item.upstream}
+        <button class="btn btn--lg btn--primary" data-testid="plugin-detail-update" onclick={onUpdateFromUpstream} disabled={busy}>
           <Icon name={busy ? 'loader' : 'download'} class={busy ? 'spinning' : ''} size={13} />
-          <span>{busy ? busyLabel || i18n.t('common.loading') : runtimeUpdate ? i18n.t('settings.plugins.translationRuntime.update') : plugin.source.github ? i18n.t('settings.plugins.github.checkUpdate') : i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
+          <span>{busy ? busyLabel || i18n.t('common.loading') : i18n.t('settings.plugins.center.update', { from: plugin.manifest.version })}</span>
         </button>
       {/if}
       {#if settingsTab}
@@ -228,4 +262,6 @@
   .pane-section h4 { margin: 0 0 var(--space-2); font-size: var(--text-sm); font-weight: var(--font-bold); color: var(--foreground); }
   .pane-state { border: var(--magi-hairline) solid var(--border); border-radius: 10px; padding: 0 12px; }
   .pane-state-row { display: flex; align-items: center; gap: var(--space-3); min-height: 46px; padding: var(--space-2) 0; }
+  .pane-runtime-notice { align-items: center; flex-wrap: wrap; }
+  .pane-runtime-notice > span { flex: 1 1 200px; min-width: 0; }
 </style>

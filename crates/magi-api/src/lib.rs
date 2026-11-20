@@ -27,10 +27,11 @@ mod mcp_service;
 mod mcp_sessions;
 mod mcp_tunnel;
 mod model_config;
+pub mod native_plugins;
 mod performance;
-mod plugin_installations;
-mod plugin_jobs;
 mod plugin_messages;
+pub mod plugin_session_control;
+pub mod plugin_session_facts;
 pub use plugin_messages::plugin_session_message_admitter;
 mod public_canonical;
 mod request_guard;
@@ -39,6 +40,7 @@ mod safeguard_audit;
 mod scope_binding;
 mod session_activity;
 pub(crate) mod session_continue;
+mod session_lifecycle;
 pub mod session_title;
 pub mod skill_loader;
 mod snapshot_lifecycle;
@@ -56,15 +58,14 @@ mod turn_service;
 pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
 pub use dto::DaemonIdentity;
 pub use errors::{ApiError, ErrorResponseDto};
+pub use native_plugins::{NativePlatformFuture, NativePluginPlatform, PluginClientSlotsReport};
 pub use routes::build_router;
-pub use routes::{
-    PluginOperations, write_plugin_resource_with_event, write_plugin_settings_with_event,
-};
+pub use routes::{NpmArchive, fetch_npm_archive, fetch_npm_packument, fetch_npm_release_archive};
 pub use state::{
     ApiState, BrowserHostConnectionConfig, BrowserHostStatusSnapshot,
-    ExecutionResourceCancellationReport, ExecutionResourceCoordinator, ExtensionStatusSource,
-    PluginRouteExecutor, PluginToolchain, RunnerManager, RunnerStartError, RunnerStopError,
-    RuntimeStatePersistence, SessionProjectionPersistMode, TaskCheckpointPersist,
-    build_runtime_capability_dependency_provider, recover_role_delete_transaction,
+    ExecutionResourceCancellationReport, ExecutionResourceCoordinator, RunnerManager,
+    RunnerStartError, RunnerStopError, RuntimeStatePersistence, SessionProjectionPersistMode,
+    TaskCheckpointPersist, build_runtime_capability_dependency_provider,
+    recover_role_delete_transaction,
 };
 pub use task_dispatch::{schedule_restored_session_task_dispatches, workspace_execution_preparer};

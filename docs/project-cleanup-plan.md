@@ -52,7 +52,7 @@
 | `magi-knowledge-store`、`magi-memory-store`、`magi-project-memory`、`magi-governance` | 已清理并核对 | 知识图谱/检索索引、会话抽取、项目 Markdown 记忆用途不同，均有正式消费者；删无调用索引接口及未接线偏好/压缩状态，保留 apply_extraction 与项目 memory_write。记忆/上下文/编排回归通过；废弃治理 trace 连专属测试删除 |
 | `magi-workspace`、`magi-git`、`magi-snapshot`、`magi-session-isolation` | 已核对并保留正式能力 | 项目及源目录身份、隔离映射、Git/worktree 和文件快照沿各自 registry；多目录的简化读取拒绝歧义，不选第一项。源目录旧数据只作单向迁移；快照旧压缩格式和内容哈希仍有读取合同。派发隔离、目录投影、恢复清理回归通过 |
 | `magi-core`、`magi-media`、`magi-agent-role`、`magi-skill-runtime`、`magi-settings-store`、`magi-appearance` | 已清理并核对 | 清退角色旧提示词组合/能力包装、无调用 Core getter；媒体共用原始字节准入，角色/Skill/设置/外观由 daemon 装配并被正式请求消费。未把辅助模型、图片处理或主题运行库误判成重复内核 |
-| `magi-plugin-system`、`magi-extension-host`、`scripts/compat`、`plugin-center` | 已核对与定向验证 | HTTP/宿主共用 PluginOperations，安装/版本/授权归 PluginManager，执行经 ExtensionBus；翻译器保留原业务并映射公共宿主能力。移除无调用排序 setter；插件/宿主 Rust 137 项、compat 169 项与中心生成检查通过 |
+| `magi-plugin-system`、`magi-extension-host`、插件平台 | 已按 [DSH 对齐设计](dsh-seam-alignment.md) 重构 | `scripts/compat` 翻译层、`plugin-center`、SDK 2 单实例宿主与旧安装期扫描已删除；DSH 原包经共享 Cordis 宿主直接安装运行，安装、启停、配置由 daemon 的加载配置唯一所有；残留清理与验收见该设计第 10 节 |
 | `apps/desktop`、`magi-browser-authority`、`browser-automation-worker` | 已清理并验证 | 物理 guest/Main、页面算法/Worker、逻辑状态/Authority 的控制链保留；撤下 Authority 旧恢复、旧 snapshot 校验及无调用 lease 释放入口，测试改走当前恢复/验证/撤销接口。Authority 68、Desktop 154、Worker 76 项与 browser-core 通过 |
 | `contracts`、`magi-app-server-protocol` | 已核对一致性 | App Server、Browser 工具与网络规则仍以 schema/目录为源；生成检查、Desktop contracts 类型检查通过。本轮没有手改生成协议来配合 UI |
 | 根 manifests、`scripts`、`.github`、`docs`、README、`examples`、agent 配置 | 已清理并核对 | 无调用直接依赖已撤下；235 个维护脚本语法通过；本地 Markdown 文件链接无断链；Gemini 均只导入 AGENTS。发布门禁允许明确的旧更新器签名工具安装，撤下字符串规避及重复扫描规则；保留仍被发行流程使用的升级迁移包生成脚本 |

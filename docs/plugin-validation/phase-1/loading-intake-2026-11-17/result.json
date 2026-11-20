@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "scope": "source-notification-intake",
+  "capturedAt": "2026-11-17T15:50:32.881642+00:00",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "sourceSha256": {
+    "Cargo.lock": "20837eb6759c9f037cce09335cb0cc3055bb123f5b18a16776f723b6c4fc0af4",
+    "crates/magi-extension-host/runtime/dsh/committed-tree.mjs": "37df6d255e364d2c218ad6e3e0cd587679695de3280b706768647aeeabf9995a",
+    "crates/magi-extension-host/runtime/dsh/configuration.mjs": "c2140eba6447ddf805eb26f99c0624eaea4d53e1001fc1f73e86106a1c07e90b",
+    "crates/magi-extension-host/runtime/dsh/entry.mjs": "6e93a92aa9068daa5a008a4184336e84e89fdd43d91adaa4d68a949f7e746333",
+    "crates/magi-extension-host/runtime/dsh/lifecycle.mjs": "828c59d0837dddf424c23168eea4aa06eb2c5760b301f999e8ae9d1ecd41ae01",
+    "crates/magi-extension-host/runtime/dsh/packages.mjs": "ac10dcd3a6f67fee94caf1abcafc28637ab3eac0c059453eb2be8c8c60f4572d",
+    "crates/magi-extension-host/src/shared.rs": "7761ed1b602b362c6e38eccd18277ab6436311c652681f6c4bfdac4e6174ab8c",
+    "crates/magi-plugin-system/Cargo.toml": "b394823f13c7dfe0109d3495900c26903906df16230c267fd2df7359deb9ea2d",
+    "crates/magi-plugin-system/src/lifecycle/loading.rs": "75c670fb7ab762c84c3509d712c4bbf5278eda143f14958b591bc496e3b4b480",
+    "crates/magi-plugin-system/src/loading_runtime.rs": "d7faf8ea04b0a7cea79969d28d3f09308c4dc6841704d1554f59d6a42b6281b2",
+    "crates/magi-plugin-system/src/loading_runtime/source_monitor.rs": "6cdc0803b42ed6094315ce630b313c1a9de9d4a86269d16e1c6d0a3f37bd81a9",
+    "crates/magi-plugin-system/tests/loading_host.rs": "6cbac745ccdeb1dc6d67e4646382480b869b77e8a0f36edfdf7f3b820c03b8fa",
+    "crates/magi-plugin-system/tests/loading_runtime.rs": "43efd688cbdc4eebe33dcacd0da416111e6caa9d9982a2d7a07cef7ddd5abf31"
+  },
+  "dependencyLock": {
+    "path": "target/dsh-phase-1/projects/mgr-execution-2026-11-17/package-lock.json",
+    "sha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+  },
+  "original": {
+    "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+    "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+    "name": "dsh-plugin-mgr",
+    "version": "0.2.13"
+  },
+  "originalFilesVerifiedAgainstArchive": 9,
+  "test": [
+    "cargo",
+    "test",
+    "-p",
+    "magi-plugin-system",
+    "--test",
+    "loading_host",
+    "original_mgr_file_changes_are_admitted_by_real_notifications_and_the_shared_owner",
+    "--locked",
+    "--",
+    "--ignored",
+    "--nocapture"
+  ],
+  "result": {
+    "acceptedRevisions": [
+      1,
+      2,
+      3
+    ],
+    "activationGenerations": [
+      1,
+      2
+    ],
+    "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+    "business": "not-run",
+    "finalStatus": {
+      "activationGeneration": 2,
+      "hostGeneration": 1,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader",
+        "webServer"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.13"
+    },
+    "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+    "originalBundleUnchanged": true,
+    "package": "dsh-plugin-mgr@0.2.13",
+    "scope": "source-notification-intake",
+    "states": [
+      "waiting",
+      "removed",
+      "waiting"
+    ]
+  },
+  "checks": [
+    {
+      "command": "cargo test -p magi-plugin-system -p magi-extension-host --all-targets --locked --quiet",
+      "exitCode": 0,
+      "originalSpecials": "3 ignored in default suite; this record covers the explicitly executed notification special only"
+    },
+    {
+      "command": "cargo clippy -p magi-plugin-system -p magi-extension-host --all-targets --locked -- -D warnings",
+      "exitCode": 0
+    }
+  ],
+  "unverified": [
+    "Complete public Loader/Include editing and flush contract",
+    "Daemon product coordinator and native settings integration",
+    "Dynamic source discovery and installation transactions",
+    "Mgr own HTTP/page actions and list/install/update/uninstall/self-update business tasks",
+    "Windows and Linux filesystem behavior",
+    "Electron UI, provider execution and full product restart recovery"
+  ],
+  "stateNote": "The test edits the candidate source directly and observes real OS notifications, domain revisions and Cordis instances. It does not invoke the Mgr page or its routes. State is temporary and removed at teardown."
+}

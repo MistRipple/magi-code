@@ -41,6 +41,46 @@ pub fn public_runtime_excerpt(value: &str, max_chars: usize) -> String {
     truncate_chars(&public_runtime_text(value), max_chars)
 }
 
+/// 对会话内容（系统提示、工具表等）执行与错误详情同一套凭据脱敏规则，不抹掉正常绝对路径。
+/// 返回 `(脱敏后文本, 是否命中凭据)`。
+pub fn redact_credentials_text(value: &str) -> (String, bool) {
+    let redacted = redact_credentials_only(value);
+    let changed = redacted != value;
+    (redacted, changed)
+}
+
+/// 递归对 JSON 中所有字符串叶子执行凭据脱敏（不改写 JSON Schema 对象键结构），返回是否命中凭据。
+pub fn redact_credentials_json_strings(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let mut changed = false;
+            for entry in map.values_mut() {
+                if redact_credentials_json_strings(entry) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                if redact_credentials_json_strings(item) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        Value::String(text) => {
+            let (redacted, changed) = redact_credentials_text(text);
+            if changed {
+                *text = redacted;
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
 fn redact_json_value(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -106,11 +146,15 @@ fn is_sensitive_key(key: &str) -> bool {
     )
 }
 
-fn redact_sensitive_text(value: &str) -> String {
+fn redact_credentials_only(value: &str) -> String {
     let value = redact_bearer_tokens(value);
     let value = redact_prefixed_tokens(&value);
     let value = redact_named_credentials(&value);
-    let value = redact_url_userinfo(&value);
+    redact_url_userinfo(&value)
+}
+
+fn redact_sensitive_text(value: &str) -> String {
+    let value = redact_credentials_only(value);
     redact_absolute_paths(&value)
 }
 
@@ -458,5 +502,40 @@ mod tests {
         assert!(public.ends_with("..."));
         assert!(!public.contains("/Users/xie"));
         assert!(!public.contains("sk-secret-value"));
+    }
+
+    #[test]
+    fn redact_credentials_text_redacts_secrets_while_preserving_workspace_paths() {
+        let input = "Workspace is /Users/xie/code/magi; Bearer secret-tok; sk-live-12345; api_key=abc; https://user:pw@example.com/v1";
+        let (out, redacted) = redact_credentials_text(input);
+        assert!(redacted);
+        assert!(out.contains("/Users/xie/code/magi"));
+        for secret in ["secret-tok", "sk-live-12345", "abc", "user:pw"] {
+            assert!(!out.contains(secret), "leaked {secret}: {out}");
+        }
+        let clean = "Workspace is /Users/xie/code/magi";
+        let (unchanged, hit) = redact_credentials_text(clean);
+        assert!(!hit);
+        assert_eq!(unchanged, clean);
+    }
+
+    #[test]
+    fn redact_credentials_json_strings_preserves_schema_keys_and_redacts_secret_values() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "Pass Bearer secret-123 or sk-live-999"
+                }
+            }
+        });
+        assert!(redact_credentials_json_strings(&mut schema));
+        assert!(schema["properties"]["token"].is_object());
+        let desc = schema["properties"]["token"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(!desc.contains("secret-123"));
+        assert!(!desc.contains("sk-live-999"));
     }
 }

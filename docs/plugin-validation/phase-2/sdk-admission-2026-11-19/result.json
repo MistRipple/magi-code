@@ -1,0 +1,100 @@
+{
+  "platform": "macOS arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "866ee7f286467075dd39ec73653d7e9de584593bce182dec68bf4ffc6237b94a",
+  "sdkLockSha256": "7af3cb1d8834be2fd81b29aadbbab3c08c051876746b4a6a2075aa8afe286e9e",
+  "samples": [
+    {
+      "name": "@idoall/dsh-notify",
+      "version": "0.4.9",
+      "archiveSha256": "434713c399be76faac104c69b89c73ae91aa750aba4552cbb01aa505b91fa713",
+      "archiveIntegrity": "sha512-6Yc70cfCwodLJboVRJIt2kFvSjSpJeusRmgVt4ivA49ivJXtNH5fyGSn6SzEdRxFQjdKhjeUwnO70OgYTINlRw==",
+      "installStatus": 200,
+      "runtimeState": "running",
+      "dependencyLock": "dsh-notify-package-lock.json",
+      "dependencyLockSha256": "6892e3364624fb34d6396b25fb72a041302c017c09c3c86c0f526fa3237636f5",
+      "restartRuntime": {
+        "state": "running",
+        "generation": 4,
+        "crashes": 0,
+        "blocking": [],
+        "instanceId": "4:4:include:dsh-notify",
+        "unmountedSlots": []
+      },
+      "originalHealthRoute": {
+        "status": 200,
+        "routeStatus": 200,
+        "result": {
+          "buffered": 0,
+          "diagnostics": {
+            "eventErrors": 0,
+            "services": {
+              "jobs": "unavailable"
+            }
+          },
+          "guiAvailable": true,
+          "storage": {
+            "preferences": "session",
+            "records": "memory"
+          }
+        }
+      },
+      "originalSettings": {
+        "persistentSetting": "soundEnabled",
+        "savedValue": true,
+        "writeFromOriginalSettingsTab": true,
+        "fullAppRestartRestore": true,
+        "originalSettingsTab": true,
+        "unmountedSlots": [
+          "shell.overlay"
+        ]
+      }
+    },
+    {
+      "name": "dsh-plugin-mission-control",
+      "version": "0.2.1",
+      "archiveSha256": "d003b87356dfd2174a4d2194888ff830aa8d95e857b50b494bbd7260119ca251",
+      "archiveIntegrity": "sha512-bjw79GBSvZQG/sQ41u0KgHQ3irdrA8KguLKVfNm6YUVwwI4/y8Viy/eTU+9Nx3IeUoLbjKuETxttxm+o1XFC4A==",
+      "installStatus": 200,
+      "runtimeState": "running",
+      "dependencyLockSha256": "38fbc9e5a420dfc613b6a440de14a42ab22db6f8d7936abc48df33fc48f36618",
+      "dependencyLock": "dsh-plugin-mission-control-package-lock.json"
+    },
+    {
+      "name": "dsh-eval-control",
+      "version": "0.5.0",
+      "archiveSha256": "3518c52bf3c34b772a3862085109f47724dadf0a04cabaa1f4c77738101b83bd",
+      "archiveIntegrity": "sha512-rDegSQDfCRwbMqDXcI7UkaEAXgp/sJtwv1QmRlBs2pPYfYJbS7qxtN4+WvPvweTCqNtsk4+znkHWXKBcM+HZtQ==",
+      "installStatus": 409,
+      "diagnostic": "解析插件依赖失败：Shared SDK dependency is missing: @deepseek-ai/dsh"
+    },
+    {
+      "name": "dsh-plugin-message-history",
+      "version": "1.0.6",
+      "archiveSha256": "515d9940416782c95c4487e77985a3eb41beb0ddd50836211aa1af072503e82b",
+      "archiveIntegrity": "sha512-QKn0vz7nap+IB2kwKs4RKkx01qG8wVhMhHmceTGaHikAmXfi8WGieUQQihL+rbw9DopJtXz4CRzCjs9gDgqSwA==",
+      "installStatus": 200,
+      "runtimeState": "running",
+      "dependencyLockSha256": "0d138218aa8fceee7fa030c7940e42acd340c270e1ed533cce4373fa706ac1a4",
+      "dependencyLock": "dsh-plugin-message-history-package-lock.json"
+    },
+    {
+      "name": "dsh-better-sidebar",
+      "version": "0.32.1",
+      "archiveSha256": "cd0a88c0da237622a83d465ed824f17c39c74e7edf2609c14cf21c813d70c517",
+      "archiveIntegrity": "sha512-UcIEAkLuZXz0SkNDwMtycCoO59yCasowG6DqhxkG+jAjQfofF0BbXIOctfjqsU8WyaP6XoSvi4LgMFhEfinBsw==",
+      "installStatus": 200,
+      "dependencyLock": "dsh-better-sidebar-package-lock.json",
+      "dependencyLockSha256": "8967da98f8fed9cd15162178c9ea2043333de0a2513078ca03a03805c6115fce",
+      "restartRuntime": {
+        "state": "starting",
+        "reason": "等待依赖服务：sessions",
+        "generation": 4,
+        "crashes": 0,
+        "blocking": [],
+        "instanceId": "4:4:include:better-sidebar",
+        "unmountedSlots": []
+      }
+    }
+  ]
+}

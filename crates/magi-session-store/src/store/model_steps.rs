@@ -31,6 +31,158 @@ impl SessionStore {
             .collect()
     }
 
+    /// 提交一次尝试的紧凑流记录：作为 `ModelAttemptStreamRecorded` 事件进会话日志，不进内存投影，
+    /// 也不改动 Step。返回事件序号；没有事件日志写入器、或序列化后超过上限（不截断，DSH 要求流精确）
+    /// 时不记录并返回 `None`。只能给仍在进行中的 Step 的最近一次尝试记录。
+    pub fn record_model_attempt_stream(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        step_id: &str,
+        stream: Vec<serde_json::Value>,
+    ) -> DomainResult<Option<u64>> {
+        let Some(writer) = self
+            .session_event_writer
+            .read()
+            .expect("session event writer lock poisoned")
+            .clone()
+        else {
+            return Ok(None);
+        };
+        let size = serde_json::to_vec(&stream)
+            .map_err(|error| DomainError::Validation {
+                message: error.to_string(),
+            })?
+            .len();
+        if size > crate::MAX_ATTEMPT_STREAM_BYTES {
+            return Ok(None);
+        }
+        let _barrier = self
+            .canonical_commit_barrier
+            .read()
+            .expect("canonical barrier poisoned");
+        let lock = self.canonical_commit_lock_for(session_id);
+        let _guard = lock.lock().expect("canonical session lock poisoned");
+        let (turn_seq, attempt_id) = {
+            let state = self.state.read().expect("session state lock poisoned");
+            let turn = state
+                .canonical_turns
+                .iter()
+                .find(|turn| &turn.session_id == session_id && turn.turn_id == turn_id)
+                .ok_or(DomainError::NotFound {
+                    entity: "canonical_turn",
+                })?;
+            let step = turn
+                .model_steps
+                .iter()
+                .find(|step| step.step_id == step_id)
+                .ok_or(DomainError::NotFound {
+                    entity: "model_step",
+                })?;
+            if step.status != crate::ModelStepStatus::Started {
+                return Err(DomainError::InvalidState {
+                    message: "已结算 Step 不能再记录尝试流".into(),
+                });
+            }
+            let attempt = step.attempts.last().ok_or(DomainError::InvalidState {
+                message: "Step 没有进行中的尝试".into(),
+            })?;
+            (turn.turn_seq, attempt.attempt_id.clone())
+        };
+        writer
+            .append_model_attempt_stream(
+                session_id,
+                turn_id,
+                turn_seq,
+                crate::ModelAttemptStream {
+                    step_id: step_id.to_string(),
+                    attempt_id,
+                    stream,
+                },
+            )
+            .map(Some)
+    }
+
+    /// 提交一个模型步骤首次发送前的请求快照（系统提示与请求头），由日志层按会话上一条记录去重。
+    /// 没有事件日志写入器或去重后超过 4 MiB 上限时返回 `Ok(None)`，不影响模型调用。
+    pub fn record_model_request(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        request: crate::ModelRequestSnapshot,
+    ) -> DomainResult<Option<u64>> {
+        let Some(writer) = self
+            .session_event_writer
+            .read()
+            .expect("session event writer lock poisoned")
+            .clone()
+        else {
+            return Ok(None);
+        };
+        let _barrier = self
+            .canonical_commit_barrier
+            .read()
+            .expect("canonical barrier poisoned");
+        let lock = self.canonical_commit_lock_for(session_id);
+        let _guard = lock.lock().expect("canonical session lock poisoned");
+        let turn_seq = {
+            let state = self.state.read().expect("session state lock poisoned");
+            let turn = state
+                .canonical_turns
+                .iter()
+                .find(|turn| &turn.session_id == session_id && turn.turn_id == turn_id)
+                .ok_or(DomainError::NotFound {
+                    entity: "canonical_turn",
+                })?;
+            let step = turn
+                .model_steps
+                .iter()
+                .find(|step| step.step_id == request.step_id)
+                .ok_or(DomainError::NotFound {
+                    entity: "model_step",
+                })?;
+            if step.status != crate::ModelStepStatus::Started {
+                return Err(DomainError::InvalidState {
+                    message: "已结算 Step 不能再记录请求快照".into(),
+                });
+            }
+            turn.turn_seq
+        };
+        writer.append_model_request(session_id, turn_id, turn_seq, request)
+    }
+
+    /// 推送当前进行中模型步骤的非持久化实时助手流帧（供共享宿主 `follow` 使用）。
+    /// 不拿写锁、不写盘、不影响推理路径。
+    pub fn publish_live_assistant_stream(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        step_id: &str,
+        event: crate::LiveAssistantStreamEvent,
+    ) {
+        let Some(writer) = self
+            .session_event_writer
+            .read()
+            .expect("session event writer lock poisoned")
+            .clone()
+        else {
+            return;
+        };
+        let attempt_id = {
+            let state = self.state.read().expect("session state lock poisoned");
+            state
+                .canonical_turns
+                .iter()
+                .find(|turn| &turn.session_id == session_id && turn.turn_id == turn_id)
+                .and_then(|turn| turn.model_steps.iter().find(|step| step.step_id == step_id))
+                .and_then(|step| step.attempts.last())
+                .map(|attempt| attempt.attempt_id.clone())
+        };
+        if let Some(attempt_id) = attempt_id {
+            writer.publish_live_assistant_stream(session_id, turn_id, step_id, &attempt_id, event);
+        }
+    }
+
     /// HTTP 只提交规范化摘要；仍使用原 canonical Step 事务和通知，不建旁路日志。
     pub fn record_model_step_transport(
         &self,

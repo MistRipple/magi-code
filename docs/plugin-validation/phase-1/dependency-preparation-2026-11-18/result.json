@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-11-18T02:32:27.780971+00:00",
+  "scope": "original-package-dependency-preparation-and-managed-cancellation",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.0",
+    "npm": "11.20.0",
+    "nodeArchiveSha256": "d38bd5e5a2ddce6bbb5ce45e46e208337da4d51fffe611e567fd32073d6439f6"
+  },
+  "sourceSha256": {
+    "crates/magi-api/src/routes/plugins/upstream/artifacts.rs": "873f8ce17f83e355947feafcb7b19712d2cf4e2f6874b0ed7ed1358d1151f664",
+    "crates/magi-daemon/src/plugin_dependencies.rs": "e3d8124e6d5cf3be4b0a46d12e25d196953d4e92a094ffdb536a8b193e4bcd26",
+    "crates/magi-daemon/tests/plugin_registry.rs": "a8c327fd7b00408f13a527f847d5ca75e71d6098836de130675432967fe4fc7d",
+    "crates/magi-extension-host/runtime/dsh/prepare-dependencies.mjs": "37f8851d5c8e8bf8eeb6b7e42eef5487f8ff3c107d2e92da1a8fa9679fb75b72"
+  },
+  "sharedSdk": {
+    "project": "target/dsh-phase-1/projects/mgr-web-admission-2026-11-18",
+    "lockSha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+  },
+  "fixedMgrProjects": {
+    "locks": [
+      {
+        "dependencyLockSha256": "de71f0457b2a209adf3eebf0d98d6b1d64bd91400c7db837da19ac85a43715ea",
+        "version": "0.2.12",
+        "path": "target/dsh-phase-1/mgr-0.2.12-resolved-package-lock.json",
+        "packages": 23
+      },
+      {
+        "dependencyLockSha256": "ce35d80479428e83460a6afa2b58b92a39790834b312a00f4dad711e68400bb4",
+        "version": "0.2.13",
+        "path": "target/dsh-phase-1/mgr-0.2.13-resolved-package-lock.json",
+        "packages": 23
+      }
+    ],
+    "receipt": {
+      "acceptedRevisions": [
+        1,
+        2
+      ],
+      "business": "not-run",
+      "cancelledDependencyPreparationPreservedRevision": true,
+      "first": {
+        "activationGeneration": 1,
+        "callEpoch": 1,
+        "configurationEpoch": 1,
+        "hostGeneration": 1,
+        "instanceId": "include:dsh-plugin-mgr",
+        "missingServices": [
+          "loader",
+          "webServer"
+        ],
+        "pluginId": "dsh-plugin-mgr",
+        "state": "waiting",
+        "version": "0.2.12"
+      },
+      "newArchive": {
+        "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+        "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+        "name": "dsh-plugin-mgr",
+        "version": "0.2.13"
+      },
+      "oldArchive": {
+        "archiveSha256": "694b301bdd9c116e8fb01b1820e13932b9ad398bda5d1e6139db0de35372be9c",
+        "integrity": "sha512-NlEUaaJ6uOekU95H0pw0sGCfluOaiOJV3FFKLzaI4NiD+F5GGqb2srrqP179vemWaF7M+QzxroZk04Wg2vnmCQ==",
+        "name": "dsh-plugin-mgr",
+        "version": "0.2.12"
+      },
+      "replacement": {
+        "activationGeneration": 2,
+        "callEpoch": 1,
+        "configurationEpoch": 1,
+        "hostGeneration": 1,
+        "instanceId": "include:dsh-plugin-mgr",
+        "missingServices": [
+          "loader",
+          "webServer"
+        ],
+        "pluginId": "dsh-plugin-mgr",
+        "state": "waiting",
+        "version": "0.2.13"
+      },
+      "scope": "online-original-archive-and-native-loading-commit"
+    }
+  },
+  "phase1CombinedProject": {
+    "lock": "target/dsh-phase-1/phase-1-dependency-project-i3i1dl71/package-lock.json",
+    "lockSha256": "bf3d25abd0024db2dbb7877b6409431ec0c35a0e76358b32111261dcd855b11d",
+    "lockedEntries": 198,
+    "originals": [
+      {
+        "name": "dsh-connect-workbuddy",
+        "version": "5.21.2",
+        "sha256": "3237011989e3d52483c1ec0e76874dd4d2f296a5b119cd25a08385cee0ab3fc0",
+        "integrity": "sha512-Yu2W+/WUCzPhP2fUi45B+L98GP7xTYQqSc0/XM7lQedaids5Kmj2LBqyJ3zI7SsrN4gtt84ZOnFqdlbKVU5NZg==",
+        "tarball": "https://registry.npmjs.org/dsh-connect-workbuddy/-/dsh-connect-workbuddy-5.21.2.tgz"
+      },
+      {
+        "name": "dsh-plugin-ops-bundle",
+        "version": "0.20.8",
+        "sha256": "14b914c803cbdec515b61d44c41fa9f0be3cfc720e9b24c696980a06e24d1794",
+        "integrity": "sha512-QV/NVtRNqVfdLN0hT1HashQdu7cUhAFmpf7CFQn8MCBpsB+gHX9Ii2ZPiLQo3bY4b9+D1CmOcaOYSmcPKmnoXw==",
+        "tarball": "https://registry.npmjs.org/dsh-plugin-ops-bundle/-/dsh-plugin-ops-bundle-0.20.8.tgz"
+      },
+      {
+        "name": "dsh-plugin-mgr",
+        "version": "0.2.13",
+        "sha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+        "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+        "tarball": "https://registry.npmjs.org/dsh-plugin-mgr/-/dsh-plugin-mgr-0.2.13.tgz"
+      },
+      {
+        "name": "dsh-free-search",
+        "version": "0.9.41",
+        "sha256": "a9440128741e4e5f2d09810873fbd057a149c1117230550a98f79cab5fa05030",
+        "integrity": "sha512-d77vythaU13nuEsJN2LxScTWqiLKbj5zA0tFgxCqHLSnid7wa2Ep9/iqzM39sgvYpcqZ9dk9n/9r2nF0oA64XQ==",
+        "tarball": "https://registry.npmjs.org/dsh-free-search/-/dsh-free-search-0.9.41.tgz"
+      },
+      {
+        "name": "dsh-rea",
+        "version": "1.2.0",
+        "sha256": "3671ae98e98d3f736cccb2d89a822d72fa2e142da5b89aa437f7082f3ee621b3",
+        "integrity": "sha512-nioBr1WqCACU9K7N6h6NLw9i03vAg/IWnJRtprTA7kdsGYRg/gptO70obW51ijtnZJw5dR5BjiV5R4KkcBfigA==",
+        "tarball": "https://registry.npmjs.org/dsh-rea/-/dsh-rea-1.2.0.tgz"
+      }
+    ],
+    "originalFilesAndEntryVerified": true,
+    "business": "not-run"
+  },
+  "unverified": [
+    "shipping dependency toolchain assembly",
+    "Magi settings update and cancellation",
+    "public loader and Electron original plugin business",
+    "Windows and Linux dependency installation"
+  ]
+}

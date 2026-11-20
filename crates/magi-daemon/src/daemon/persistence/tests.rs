@@ -1516,6 +1516,11 @@ fn detached_workspace_projection_imports_into_an_empty_event_state_root() {
         .verify_state_layout(&[("workspace-import".into(), workspace_root.clone())])
         .unwrap();
     target_repository.migrate_project_storage().unwrap();
+    assert!(
+        !target_repository
+            .session_has_no_snapshot(&durable.sessions[0], &SessionProjectionCache::default(),),
+        "附加已有项目历史时，尚未缓存的持久会话不能发布新建通知"
+    );
     let (restored, _) = target_repository
         .load_session_projections(&[("workspace-import".to_string(), workspace_root.clone())])
         .expect("detached workspace projection should import into an empty event root");
@@ -1949,6 +1954,96 @@ fn unowned_event_log_is_quarantined_instead_of_blocking_startup() {
 }
 
 #[test]
+fn a_record_that_lags_the_title_log_catches_up_on_reload() {
+    let state_root = unique_temp_dir("magi-title-log-authority");
+    let repository = StateRepository::new(state_root.clone());
+    let (session_store, _, _) = accepted_session_store("title-lag", None, 62);
+    let session_id = SessionId::new("title-lag");
+    install_test_event_authority(&repository, &session_store);
+    repository
+        .save_session_projection_state(
+            &session_store.durable_state(),
+            &session_store.execution_sidecar_store_state(),
+        )
+        .expect("initial projection should persist");
+    let old_title = session_store
+        .session(&session_id)
+        .expect("session exists")
+        .title;
+
+    // 标题事件已提交、会话记录还停在旧标题（事件之后、projection 写入之前崩溃）。
+    let seq = SessionEventWriter::append_session_title(&repository, &session_id, "日志里的标题")
+        .expect("title event should commit");
+    assert!(seq > 0);
+
+    let reloaded = StateRepository::new(state_root.clone());
+    let (restored, _) = reloaded
+        .load_session_projections(&[])
+        .expect("projection behind the title log must load");
+    let title = restored
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .map(|session| session.title.clone())
+        .expect("session restored");
+    assert_ne!(old_title, "日志里的标题");
+    assert_eq!(title, "日志里的标题");
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn a_title_event_on_a_reloaded_session_keeps_its_turns() {
+    let state_root = unique_temp_dir("magi-title-after-reload");
+    let repository = StateRepository::new(state_root.clone());
+    let (session_store, _, _) = accepted_session_store("title-reload", None, 63);
+    let session_id = SessionId::new("title-reload");
+    install_test_event_authority(&repository, &session_store);
+    repository
+        .save_session_projection_state(
+            &session_store.durable_state(),
+            &session_store.execution_sidecar_store_state(),
+        )
+        .expect("initial projection should persist");
+    let turns_before = session_store.canonical_turns_for_session(&session_id).len();
+    assert!(turns_before > 0);
+
+    // 重启后的仓库把回合释放了；标题事件必须先重放常驻，不能丢回合。
+    let reloaded = StateRepository::new(state_root.clone());
+    let (restored, _) = reloaded
+        .load_session_projections(&[])
+        .expect("projection must load");
+    SessionEventWriter::append_session_title(&reloaded, &session_id, "重启后改名")
+        .expect("title event should commit");
+    let again = StateRepository::new(state_root.clone());
+    let (after, _) = again
+        .load_session_projections(&[])
+        .expect("projection must load again");
+    assert_eq!(
+        after
+            .canonical_turns
+            .iter()
+            .filter(|turn| turn.session_id == session_id)
+            .count(),
+        restored
+            .canonical_turns
+            .iter()
+            .filter(|turn| turn.session_id == session_id)
+            .count()
+    );
+    assert_eq!(
+        after
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .map(|session| session.title.as_str()),
+        Some("重启后改名")
+    );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
 fn renaming_one_session_persists_only_that_session_and_survives_a_reload() {
     let state_root = unique_temp_dir("magi-rename-incremental");
     let repository = StateRepository::new(state_root.clone());
@@ -1976,7 +2071,7 @@ fn renaming_one_session_persists_only_that_session_and_survives_a_reload() {
             },
         )
         .expect("rename should persist");
-    assert_eq!(renamed.title, "咖啡店创意命名");
+    assert_eq!(renamed.session.title, "咖啡店创意命名");
 
     let reloaded = StateRepository::new(state_root.clone());
     let (restored, _) = reloaded
@@ -2155,11 +2250,12 @@ fn model_step_journal_replays_after_checkpoint_and_layout_upgrade() {
     }
     for entry in fs::read_dir(repository.session_event_root(&session)).unwrap() {
         let path = entry.unwrap().path();
-        if path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("checkpoint-")
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json")
+            || path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("checkpoint-")
         {
             continue;
         }
@@ -2221,9 +2317,8 @@ fn model_step_journal_replays_after_checkpoint_and_layout_upgrade() {
     let expected = store
         .canonical_turn_for_session_turn_id(&session, &turn_id)
         .unwrap();
-    let (restored, _) = StateRepository::new(state_root.clone())
-        .load_session_projections(&[])
-        .unwrap();
+    let restored_repository = StateRepository::new(state_root.clone());
+    let (restored, _) = restored_repository.load_session_projections(&[]).unwrap();
     assert_eq!(
         restored.canonical_turns[0].model_steps,
         expected.model_steps

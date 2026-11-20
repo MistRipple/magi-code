@@ -1,0 +1,94 @@
+{
+  "schemaVersion": 1,
+  "scope": "committed-graph-execution-and-lifecycle",
+  "capturedAt": "2026-11-17T15:28:57.787483+00:00",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "sourceSha256": {
+    "crates/magi-extension-host/runtime/dsh/committed-tree.mjs": "37df6d255e364d2c218ad6e3e0cd587679695de3280b706768647aeeabf9995a",
+    "crates/magi-extension-host/runtime/dsh/configuration.mjs": "c2140eba6447ddf805eb26f99c0624eaea4d53e1001fc1f73e86106a1c07e90b",
+    "crates/magi-extension-host/runtime/dsh/entry.mjs": "6e93a92aa9068daa5a008a4184336e84e89fdd43d91adaa4d68a949f7e746333",
+    "crates/magi-extension-host/runtime/dsh/lifecycle.mjs": "828c59d0837dddf424c23168eea4aa06eb2c5760b301f999e8ae9d1ecd41ae01",
+    "crates/magi-extension-host/runtime/dsh/package-lock.json": "f72f1c95ade8ed319991a06085789236ee4c4c753eaeffba185a553384c5bb92",
+    "crates/magi-extension-host/runtime/dsh/package.json": "0f6ca13703c7ea97fad03a0e764e7314e4acc59e9be4d06a188b78f4adf0accd",
+    "crates/magi-extension-host/runtime/dsh/packages.mjs": "ac10dcd3a6f67fee94caf1abcafc28637ab3eac0c059453eb2be8c8c60f4572d",
+    "crates/magi-extension-host/src/shared.rs": "7761ed1b602b362c6e38eccd18277ab6436311c652681f6c4bfdac4e6174ab8c",
+    "crates/magi-plugin-system/src/lifecycle/loading.rs": "75c670fb7ab762c84c3509d712c4bbf5278eda143f14958b591bc496e3b4b480",
+    "crates/magi-plugin-system/src/loading_runtime.rs": "d1c01a895492270632433a902713d0b004d493c96926b90c14bd205d1d057578",
+    "crates/magi-plugin-system/tests/loading_host.rs": "88101a433ecd7eee2b606efe86f3408653265ce39580d4d4c65292cbe8a4b86d",
+    "crates/magi-plugin-system/tests/loading_runtime.rs": "8e9e421fc56cd58f8722d7da6ab3f2d515be544942cdf358fc2e2050d5862afc"
+  },
+  "dependencyLock": {
+    "path": "target/dsh-phase-1/projects/mgr-execution-2026-11-17/package-lock.json",
+    "sha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+  },
+  "original": {
+    "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+    "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+    "name": "dsh-plugin-mgr",
+    "version": "0.2.13"
+  },
+  "originalFilesVerifiedAgainstArchive": 9,
+  "test": [
+    "cargo",
+    "test",
+    "-p",
+    "magi-plugin-system",
+    "--test",
+    "loading_host",
+    "original_mgr_application_waits_for_real_services_without_claiming_business_success",
+    "--locked",
+    "--",
+    "--ignored",
+    "--nocapture"
+  ],
+  "result": {
+    "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+    "business": "not-run",
+    "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+    "missingServices": [
+      "loader",
+      "webServer"
+    ],
+    "originalBundleUnchanged": true,
+    "package": "dsh-plugin-mgr@0.2.13",
+    "receipt": {
+      "instances": [
+        {
+          "activationGeneration": 1,
+          "hostGeneration": 1,
+          "instanceId": "include:dsh-plugin-mgr",
+          "missingServices": [
+            "loader",
+            "webServer"
+          ],
+          "pluginId": "dsh-plugin-mgr",
+          "state": "waiting",
+          "version": "0.2.13"
+        }
+      ],
+      "token": {
+        "hostGeneration": 1,
+        "revision": 1,
+        "sequence": 1
+      }
+    },
+    "scope": "committed-graph-execution",
+    "state": "waiting"
+  },
+  "unverified": [
+    "Complete public Loader/Include editing and flush contract",
+    "Daemon production coordinator, file notification intake and native settings integration",
+    "Dynamic configuration sources and installation transactions",
+    "Mgr list/toggle/install/update/uninstall and self-update business tasks",
+    "Electron UI, provider execution and product restart recovery"
+  ],
+  "stateNote": "The original entered dependency waiting in a real shared Node process. This is not a successful activation or passed business task. Temporary manager state was removed at test teardown."
+}

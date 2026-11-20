@@ -1,4 +1,4 @@
-//! 协议消息、错误种类与钩子目录（见 `docs/extension-protocol-v1.md`）。
+//! 共享扩展宿主的内部 JSON-RPC 控制消息、错误种类与领域钩子目录定义。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -207,7 +207,7 @@ pub fn response_err(id: &str, error: &RpcError) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": error})
 }
 
-/// 钩子目录条目：允许的模式、是否允许 `replace` 及补丁上限（协议第 6 节）。
+/// 钩子目录条目：允许的模式、是否允许 `replace` 及补丁上限。
 #[derive(Clone, Copy, Debug)]
 pub struct HookSpec {
     pub name: &'static str,

@@ -10,9 +10,7 @@ mod mcp_server;
 mod mcp_skills_repos;
 mod messages;
 mod plugins;
-pub use plugins::{
-    PluginOperations, write_plugin_resource_with_event, write_plugin_settings_with_event,
-};
+pub use plugins::{NpmArchive, fetch_npm_archive, fetch_npm_packument, fetch_npm_release_archive};
 mod session_isolation;
 #[cfg(test)]
 pub(crate) mod sessions;

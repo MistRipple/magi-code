@@ -1,0 +1,175 @@
+{
+  "schemaVersion": 1,
+  "scope": "fiber-source-save-and-execution-scope-admission",
+  "capturedAt": "2026-11-17T17:28:16.679326+00:00",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "sourceSha256": {
+    "crates/magi-extension-host/runtime/dsh/build-include-journal.mjs": "2bc5b4a44f251918c9061aeeb0178462cdddd0c008a8cfafd4462ea74c88cdcf",
+    "crates/magi-extension-host/runtime/dsh/committed-tree.mjs": "04f518a49e7587219460bda6e2f81751b8fe9ad2e98976045ef2db240479ea43",
+    "crates/magi-extension-host/runtime/dsh/configuration-edit.mjs": "c44f0e4b5bb1e4c8a8890c89235f93919fafebb0aaa50d74d1f10b484ac4aa5e",
+    "crates/magi-extension-host/runtime/dsh/configuration.mjs": "fe16417c32defc627a30d01d75d320334e16884986f1312267c53c35a5e73bc1",
+    "crates/magi-extension-host/runtime/dsh/entry.mjs": "74fb3a079b63e9ab60a5be6ee4ad879715c29a2e2e337b60a8955b109dc4a37e",
+    "crates/magi-extension-host/runtime/dsh/include-journal.entry.mjs": "b049ff555dcb1834bf912109e33ca9ee9653071facc5019b16704b250c8326be",
+    "crates/magi-extension-host/runtime/dsh/include-journal.generated.mjs": "0edb8528eaf015e8384a1918bfa353d6432777700754a3f4561cd945117f2ad8",
+    "crates/magi-extension-host/runtime/dsh/lifecycle.mjs": "e3e8c2a5e45996e3524e83f1d3c42374be0181220ae7bea990f6d74af82e1919",
+    "crates/magi-extension-host/runtime/dsh/packages.mjs": "ac10dcd3a6f67fee94caf1abcafc28637ab3eac0c059453eb2be8c8c60f4572d",
+    "crates/magi-extension-host/runtime/dsh/test/committed-tree.test.mjs": "53933eb705caea22274a6e6290a7f6fe70dd65f166e1a4e11a98c7fa89141bba",
+    "crates/magi-extension-host/runtime/dsh/test/lifecycle.test.mjs": "590b80f7b43b3755ce166ad2ebe3c1f5d08d237c99b64a7fddd212893f707df5",
+    "crates/magi-plugin-system/src/loading_runtime/host_services.rs": "ba356fb1cb7d705dbd41f6c8c057102f843aeb9ed6e04d8c63426a70c83bdd6d",
+    "crates/magi-plugin-system/src/loading_runtime/source_monitor.rs": "5147c1ca6c2fa68c2d4f2f0ad4bf9e671b74ff409c9bc19fe078cd59b639b667",
+    "crates/magi-plugin-system/src/loading_runtime.rs": "c78a30adb5a9f700d7eef1abcdc57f974c17ac734cec573a0f7055dc6b2f0d72",
+    "crates/magi-plugin-system/tests/loading_runtime.rs": "1a87d61ea592e0f3048fc7cd4821f9e565ec070a8cf11a23b12f727b59e3ce3a"
+  },
+  "hostLock": {
+    "path": "crates/magi-extension-host/runtime/dsh/package-lock.json",
+    "sha256": "9cbccb124b07ce443f6ca31bdfe3fa1f4c538aa58bf8096cfdcfffc416104e3c"
+  },
+  "preparedProject": "target/dsh-phase-1/projects/mgr-fiber-save-2026-11-18",
+  "dependencyLock": {
+    "path": "target/dsh-phase-1/projects/mgr-fiber-save-2026-11-18/package-lock.json",
+    "sha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+  },
+  "original": {
+    "name": "dsh-plugin-mgr",
+    "version": "0.2.13",
+    "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+    "verifiedOriginalFiles": 9
+  },
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "magi-plugin-system",
+    "--test",
+    "loading_host",
+    "original_mgr_",
+    "--locked",
+    "--",
+    "--ignored",
+    "--nocapture"
+  ],
+  "originalResults": [
+    {
+      "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+      "business": "not-run",
+      "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "missingServices": [
+        "loader",
+        "webServer"
+      ],
+      "originalBundleUnchanged": true,
+      "package": "dsh-plugin-mgr@0.2.13",
+      "receipt": {
+        "instances": [
+          {
+            "activationGeneration": 1,
+            "configurationEpoch": 1,
+            "hostGeneration": 1,
+            "instanceId": "include:dsh-plugin-mgr",
+            "missingServices": [
+              "loader",
+              "webServer"
+            ],
+            "pluginId": "dsh-plugin-mgr",
+            "state": "waiting",
+            "version": "0.2.13"
+          }
+        ],
+        "token": {
+          "hostGeneration": 1,
+          "revision": 1,
+          "sequence": 1
+        }
+      },
+      "scope": "committed-graph-execution",
+      "state": "waiting"
+    },
+    {
+      "acceptedRevisions": [
+        1,
+        2,
+        3
+      ],
+      "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+      "business": "not-run",
+      "finalStatus": {
+        "activationGeneration": 2,
+        "configurationEpoch": 1,
+        "hostGeneration": 1,
+        "instanceId": "include:dsh-plugin-mgr",
+        "missingServices": [
+          "loader",
+          "webServer"
+        ],
+        "pluginId": "dsh-plugin-mgr",
+        "state": "waiting",
+        "version": "0.2.13"
+      },
+      "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "originalPackageBundleUnchanged": true,
+      "owningCandidateSource": "bundle.patch.yml",
+      "package": "dsh-plugin-mgr@0.2.13",
+      "pendingEditCleared": true,
+      "scope": "source-edit-journal-and-domain-commit",
+      "unrelatedSourcesUnchanged": true
+    },
+    {
+      "acceptedRevisions": [
+        1,
+        2,
+        3
+      ],
+      "activationGenerations": [
+        1,
+        2
+      ],
+      "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+      "business": "not-run",
+      "finalStatus": {
+        "activationGeneration": 2,
+        "configurationEpoch": 1,
+        "hostGeneration": 1,
+        "instanceId": "include:dsh-plugin-mgr",
+        "missingServices": [
+          "loader",
+          "webServer"
+        ],
+        "pluginId": "dsh-plugin-mgr",
+        "state": "waiting",
+        "version": "0.2.13"
+      },
+      "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "originalBundleUnchanged": true,
+      "package": "dsh-plugin-mgr@0.2.13",
+      "scope": "source-notification-intake",
+      "states": [
+        "waiting",
+        "removed",
+        "waiting"
+      ]
+    }
+  ],
+  "business": "not-run",
+  "runtimeEvidence": {
+    "groupStartupSave": "real plugin calls ctx.fiber.update; revision 2 durably accepted before updated config executes",
+    "identityAdmission": "wrong host, plugin, instance, activation, version or scope rejects without state/source changes",
+    "scopeRecovery": "actual dependency suspension/resumption retains activation; old source-save epoch and duplicate old running notification cannot regain authority; fresh epoch commits revision 4",
+    "unsavedUpdate": "update(config,true) changes only instance runtime state; accepted source and revision stay unchanged",
+    "missingOwner": "source save fails before changing raw/effective config"
+  },
+  "notValidated": [
+    "public Loader/Entry/Group editing and Include flush",
+    "dynamic source closure",
+    "production daemon coordinator",
+    "Mgr core business and Electron",
+    "Windows/Linux"
+  ]
+}

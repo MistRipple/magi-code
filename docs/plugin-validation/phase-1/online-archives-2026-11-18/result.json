@@ -1,0 +1,94 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-11-18T02:19:01.474343+00:00",
+  "scope": "online-original-archive-and-native-loading-commit",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "sourceSha256": {
+    "crates/magi-api/src/routes/plugins/upstream.rs": "568e364a08a9fc82ac4edcbbd8a62e792221bcf7322497d9fdac210733fbffcd",
+    "crates/magi-api/src/routes/plugins/upstream/artifacts.rs": "505b070a4cfd51db8459a197c983029fe4e75c5323a3250fb7b5c7e190394e88",
+    "crates/magi-api/src/routes/plugins/upstream/icons.rs": "d86127005cbd14cea5b988297f6d53bb415697b8362e23a7f2c7f51b49ca0f03",
+    "crates/magi-plugin-system/src/npm/package.rs": "81383a2356a5b40d3ede3859e639647962daa0f6bc3a12398065d897c15cbf66",
+    "crates/magi-daemon/tests/plugin_registry.rs": "5fccaffa4d8db20071587e575d1276eefa05e4a24feacfda190fdc36500b0559"
+  },
+  "registry": "https://registry.npmjs.org",
+  "hostLock": {
+    "path": "crates/magi-extension-host/runtime/dsh/package-lock.json",
+    "sha256": "bd07ad02d666df160691105ca8bf86f6abd6f3c0ed87d020c6b7d8e1245db164"
+  },
+  "preparedSharedProject": {
+    "path": "target/dsh-phase-1/projects/mgr-web-admission-2026-11-18",
+    "dependencyLockSha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e",
+    "scope": "The native test provides the physical SDK and js-yaml from this lock; both plugin archives were fetched online."
+  },
+  "result": {
+    "acceptedRevisions": [
+      1,
+      2
+    ],
+    "business": "not-run",
+    "first": {
+      "activationGeneration": 1,
+      "callEpoch": 1,
+      "configurationEpoch": 1,
+      "hostGeneration": 1,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader",
+        "webServer"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.12"
+    },
+    "newArchive": {
+      "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+      "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.13",
+      "tarball": "https://registry.npmjs.org/dsh-plugin-mgr/-/dsh-plugin-mgr-0.2.13.tgz"
+    },
+    "oldArchive": {
+      "archiveSha256": "694b301bdd9c116e8fb01b1820e13932b9ad398bda5d1e6139db0de35372be9c",
+      "integrity": "sha512-NlEUaaJ6uOekU95H0pw0sGCfluOaiOJV3FFKLzaI4NiD+F5GGqb2srrqP179vemWaF7M+QzxroZk04Wg2vnmCQ==",
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.12",
+      "tarball": "https://registry.npmjs.org/dsh-plugin-mgr/-/dsh-plugin-mgr-0.2.12.tgz"
+    },
+    "replacement": {
+      "activationGeneration": 2,
+      "callEpoch": 1,
+      "configurationEpoch": 1,
+      "hostGeneration": 1,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader",
+        "webServer"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.13"
+    },
+    "scope": "online-original-archive-and-native-loading-commit"
+  },
+  "verification": {
+    "upstreamApiTestsPassed": 11,
+    "onlineNativeRegressionPassed": 1,
+    "pluginSystemAndExtensionHostTestsPassed": 185,
+    "apiClippy": "passed",
+    "daemonRegistryTestClippy": "passed"
+  },
+  "unverified": [
+    "shipping settings and daemon install coordination",
+    "full dependency resolution and installation",
+    "online install cancellation",
+    "public Loader and Electron plugin tasks"
+  ]
+}

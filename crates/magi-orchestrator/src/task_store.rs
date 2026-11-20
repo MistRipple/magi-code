@@ -126,7 +126,7 @@ pub struct TaskStore {
     /// a checkpoint).
     on_status_change: Mutex<Option<SharedStatusChangeCallback>>,
     /// Optional callback fired on every successful status change for checkpoint
-    /// persistence (design 6.8).
+    /// persistence.
     on_checkpoint: Mutex<Option<CheckpointCallback>>,
     /// Serializes every mutation and every checkpoint snapshot. The three maps
     /// are kept as separate locks for focused read paths, but no committed
@@ -1035,7 +1035,7 @@ impl TaskStore {
     }
 
     // ------------------------------------------------------------------
-    // G8: Graph structural validation (design 3.2 / 4.x)
+    // Graph structural validation
     // ------------------------------------------------------------------
 }
 

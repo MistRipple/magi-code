@@ -797,11 +797,11 @@ export interface PluginInstalled {
   enabled: boolean;
   upstreamManifest?: Record<string, unknown>;
   upstreamArchivePath?: string;
-  translationRuntime?: PluginTranslationRuntimeStatus;
   disabledBy?: PluginDisableInfo;
+  reinstallRequired?: boolean;
 }
 
-export type PluginRuntimeState = "starting" | "running" | "restarting" | "failed" | "stopped";
+export type PluginRuntimeState = "starting" | "waiting" | "running" | "restarting" | "failed" | "stopped";
 
 export interface PluginRuntimeStatus {
   state: PluginRuntimeState;
@@ -810,10 +810,14 @@ export interface PluginRuntimeStatus {
   crashes: number;
   blocking: Array<string>;
   instanceId?: string;
+  unmountedSlots?: Array<string>;
+  mountedSlots?: Array<string>;
+  hasSettingsView?: boolean | null;
 }
 
 export interface PluginList {
   plugins: Array<PluginInstalled>;
+  configurationError?: string | null;
 }
 
 export interface PluginCenterKey {
@@ -873,6 +877,7 @@ export interface PluginRouteCallRequest {
   bodyBase64?: string;
   expectedDigest?: string;
   expectedInstanceId?: string;
+  sessionId?: string;
 }
 
 export interface PluginRouteCallResult {
@@ -1540,21 +1545,6 @@ export interface PluginUpstreamRequest {
   github?: PluginGithubSource;
 }
 
-export interface PluginTranslationNote {
-  name: string;
-  status: string;
-  note: string;
-}
-
-export interface PluginTranslationSummary {
-  tools: Array<string>;
-  commands: Array<string>;
-  modelSources: Array<string>;
-  unmountedSlots: Array<string>;
-  degraded: Array<PluginTranslationNote>;
-  omittedFiles: number;
-}
-
 export interface PluginUpstreamPreview {
   candidate: PluginCandidatePreview;
   package: string;
@@ -1562,9 +1552,7 @@ export interface PluginUpstreamPreview {
   integrity: string;
   publisher: string;
   official: boolean;
-  translation: PluginTranslationSummary;
   github?: PluginGithubSource;
-  translationRuntime?: PluginTranslationRuntimeStatus;
 }
 
 export type PluginEcosystem = "dsh" | "pi";
@@ -1577,22 +1565,6 @@ export interface PluginRuntimeCatalog {
   modelSources?: Array<PluginNamedContribution>;
   settingsSchema?: Record<string, unknown> | null;
   skills?: Array<PluginSkillContribution>;
-}
-
-export interface PluginDshCompatibilityProjection {
-  revision: number;
-  runtimeVersion: string;
-  runtimeId: string;
-  exemptions: Record<string, unknown>;
-}
-
-export interface PluginDshVersionExemptionRequest {
-  target: string;
-  runtimeVersion: string;
-  expectedRuntimeId: string;
-  expectedRevision: number;
-  enabled: boolean;
-  acceptRisk: boolean;
 }
 
 export interface PluginListRequest {
@@ -1768,15 +1740,6 @@ export interface PluginGithubSource {
   repository: string;
   reference?: string | null;
   commit?: string | null;
-}
-
-export type PluginTranslationRuntimeState = "current" | "updateAvailable" | "unavailable";
-
-export interface PluginTranslationRuntimeStatus {
-  state: PluginTranslationRuntimeState;
-  installedId?: string;
-  currentId?: string;
-  reason?: string;
 }
 
 export interface PluginDisableInfo {

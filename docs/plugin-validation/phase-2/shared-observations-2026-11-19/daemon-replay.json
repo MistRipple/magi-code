@@ -1,0 +1,50 @@
+{
+  "daemonSha256": "1a53d46cf5123634273f13cdfe4b29885329ed445ab6e134a6333166020dbdfa",
+  "history": {
+    "newUserCanonicalSequence": 172,
+    "observations": 33,
+    "through": 187,
+    "userInputs": 11
+  },
+  "mission": {
+    "observationCount": 11,
+    "through": 47,
+    "toolObservations": [
+      {
+        "callId": "file-read-present",
+        "canonicalSeq": 13,
+        "errorCode": null,
+        "kind": "toolCall",
+        "seq": 2
+      },
+      {
+        "callId": "file-read-missing",
+        "canonicalSeq": 14,
+        "errorCode": null,
+        "kind": "toolCall",
+        "seq": 3
+      },
+      {
+        "callId": "file-read-present",
+        "canonicalSeq": 15,
+        "errorCode": null,
+        "kind": "toolResult",
+        "seq": 4
+      },
+      {
+        "callId": "file-read-missing",
+        "canonicalSeq": 16,
+        "errorCode": "file_read_not_found",
+        "kind": "toolResult",
+        "seq": 5
+      },
+      {
+        "callId": "waiting-question",
+        "canonicalSeq": 40,
+        "errorCode": null,
+        "kind": "toolCall",
+        "seq": 9
+      }
+    ]
+  }
+}

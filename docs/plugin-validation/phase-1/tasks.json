@@ -1,0 +1,393 @@
+{
+  "schemaVersion": 1,
+  "phase": 1,
+  "status": "fixed-sample-business-passed",
+  "developmentEvidence": "closeout-2026-11-18/README.md",
+  "packages": [
+    {
+      "name": "dsh-connect-workbuddy",
+      "versions": [
+        "5.21.2"
+      ],
+      "tasks": [
+        {
+          "id": "installation",
+          "expected": "在线安装原包并根据真实依赖状态激活",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/workbuddy/result.json"
+          ]
+        },
+        {
+          "id": "settings",
+          "expected": "原设置页面保存后重新打开，值与 daemon 已提交配置一致",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/workbuddy/result.json"
+          ]
+        },
+        {
+          "id": "lifecycle",
+          "expected": "停用后贡献与旧调用失效，重新启用恢复可用能力",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/workbuddy/result.json"
+          ]
+        },
+        {
+          "id": "restart",
+          "expected": "应用重启后配置与启停事实保持，已发生操作不自动重放",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/workbuddy/result.json"
+          ]
+        },
+        {
+          "id": "cancellation",
+          "expected": "取消进行中的业务后没有迟到提交",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/workbuddy/result.json"
+          ]
+        },
+        {
+          "id": "host-crash",
+          "expected": "宿主崩溃后按调用状态结算，重新激活不复活旧租约",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/workbuddy/result.json"
+          ]
+        },
+        {
+          "id": "model",
+          "expected": "登录并发现真实在线模型，完成原生会话回复",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/workbuddy/result.json"
+          ]
+        },
+        {
+          "id": "usage",
+          "expected": "流式输出、用量与输出速度根据上游真实观测更新",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/workbuddy/result.json"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dsh-plugin-ops-bundle",
+      "versions": [
+        "0.20.8"
+      ],
+      "tasks": [
+        {
+          "id": "installation",
+          "expected": "在线安装原包并根据真实依赖状态激活",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/ops/result.json"
+          ]
+        },
+        {
+          "id": "settings",
+          "expected": "原设置页面保存后重新打开，值与 daemon 已提交配置一致",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/ops/result.json"
+          ]
+        },
+        {
+          "id": "lifecycle",
+          "expected": "停用后贡献与旧调用失效，重新启用恢复可用能力",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/ops/result.json"
+          ]
+        },
+        {
+          "id": "restart",
+          "expected": "应用重启后配置与启停事实保持，已发生操作不自动重放",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/ops/result.json"
+          ]
+        },
+        {
+          "id": "cancellation",
+          "expected": "原包诊断依赖 DSH CLI profile，阶段 1 不提供该业务，因此不结算诊断取消",
+          "status": "unsupported",
+          "evidence": [
+            "ops-2026-11-18/result.json"
+          ]
+        },
+        {
+          "id": "host-crash",
+          "expected": "原包诊断依赖 DSH CLI profile，阶段 1 不提供该业务，因此不结算诊断宿主崩溃",
+          "status": "unsupported",
+          "evidence": [
+            "ops-2026-11-18/result.json"
+          ]
+        },
+        {
+          "id": "diagnosis",
+          "expected": "已确认范围外：原包诊断在调用模型前直接读取 DSH CLI profile 清单。保留真机失败回执。",
+          "status": "unsupported",
+          "evidence": [
+            "ops-2026-11-18/result.json"
+          ]
+        },
+        {
+          "id": "knowledge",
+          "expected": "保存诊断知识，应用重启后重新读取",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/ops/result.json"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dsh-plugin-mgr",
+      "versions": [
+        "0.2.12",
+        "0.2.13"
+      ],
+      "tasks": [
+        {
+          "id": "installation",
+          "expected": "在线安装原包并根据真实依赖状态激活",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/mgr/result.json"
+          ]
+        },
+        {
+          "id": "settings",
+          "expected": "原设置页面保存后重新打开，值与 daemon 已提交配置一致",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/mgr/result.json"
+          ]
+        },
+        {
+          "id": "lifecycle",
+          "expected": "停用后贡献与旧调用失效，重新启用恢复可用能力",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/mgr/result.json"
+          ]
+        },
+        {
+          "id": "restart",
+          "expected": "应用重启后配置与启停事实保持，已发生操作不自动重放",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/mgr/result.json"
+          ]
+        },
+        {
+          "id": "cancellation",
+          "expected": "在线升级进入依赖准备后可取消，保留旧版本与运行实例",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/mgr/result.json"
+          ]
+        },
+        {
+          "id": "host-crash",
+          "expected": "宿主崩溃后按调用状态结算，重新激活不复活旧租约",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/mgr/result.json"
+          ]
+        },
+        {
+          "id": "management",
+          "expected": "原页面列出目标插件并完成启停、更新和卸载，回执对应 daemon 事实。目标首次安装从 Magi 设置页发起。",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/mgr/result.json"
+          ]
+        },
+        {
+          "id": "magi-settings-update",
+          "expected": "从 Magi 设置页将 0.2.12 在线升级到固定 0.2.13，验证取消与重新激活",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/mgr/result.json"
+          ]
+        },
+        {
+          "id": "original-0.2.12-page-self-update",
+          "expected": "0.2.12 原页面调用 DSH CLI 的自更新属于已确认的产品缺口",
+          "status": "unsupported",
+          "evidence": [
+            "../../dsh-seam-alignment.md#37-配置组合与正式加载决策-1314"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dsh-free-search",
+      "versions": [
+        "0.9.41"
+      ],
+      "tasks": [
+        {
+          "id": "installation",
+          "expected": "在线安装原包并根据真实依赖状态激活",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/free-search/result.json"
+          ]
+        },
+        {
+          "id": "settings",
+          "expected": "原设置页面保存后重新打开，值与 daemon 已提交配置一致",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/free-search/result.json"
+          ]
+        },
+        {
+          "id": "lifecycle",
+          "expected": "停用后贡献与旧调用失效，重新启用恢复可用能力",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/free-search/result.json"
+          ]
+        },
+        {
+          "id": "restart",
+          "expected": "应用重启后配置与启停事实保持，已发生操作不自动重放",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/free-search/result.json"
+          ]
+        },
+        {
+          "id": "cancellation",
+          "expected": "取消进行中的业务后没有迟到提交",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/free-search/result.json",
+            "closeout-2026-11-19/free-search/in-flight.json"
+          ]
+        },
+        {
+          "id": "host-crash",
+          "expected": "宿主崩溃后按调用状态结算，重新激活不复活旧租约",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/free-search/result.json",
+            "closeout-2026-11-19/free-search/in-flight.json"
+          ]
+        },
+        {
+          "id": "search",
+          "expected": "原页面保存搜索引擎后完成一次真实搜索",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/free-search/result.json"
+          ]
+        },
+        {
+          "id": "fetch",
+          "expected": "会话通过选定联网提供方读取真实网页并获得结果",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/free-search/result.json"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dsh-rea",
+      "versions": [
+        "1.2.0"
+      ],
+      "tasks": [
+        {
+          "id": "installation",
+          "expected": "在线安装原包并根据真实依赖状态激活",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/rea/result.json"
+          ]
+        },
+        {
+          "id": "settings",
+          "expected": "原设置页面保存后重新打开，值与 daemon 已提交配置一致",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/rea/result.json"
+          ]
+        },
+        {
+          "id": "lifecycle",
+          "expected": "停用后贡献与旧调用失效，重新启用恢复可用能力",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/rea/result.json"
+          ]
+        },
+        {
+          "id": "restart",
+          "expected": "应用重启后配置与启停事实保持，已发生操作不自动重放",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/rea/result.json"
+          ]
+        },
+        {
+          "id": "cancellation",
+          "expected": "取消进行中的业务后没有迟到提交",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/rea/result.json",
+            "closeout-2026-11-19/rea/in-flight.json"
+          ]
+        },
+        {
+          "id": "host-crash",
+          "expected": "宿主崩溃后按调用状态结算，重新激活不复活旧租约",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/rea/result.json",
+            "closeout-2026-11-19/rea/in-flight.json"
+          ]
+        },
+        {
+          "id": "analysis",
+          "expected": "通过模型发现工具并分析固定本地应用，读取保留证据验证真实分析内容",
+          "status": "passed",
+          "evidence": [
+            "closeout-2026-11-19/rea/result.json"
+          ]
+        }
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "id": "mgr-loader-required",
+      "status": "passed",
+      "package": "dsh-plugin-mgr@0.2.13",
+      "evidence": "Original tarball package/dist/index.js:19 exports inject = [\"webServer\", \"loader\"]. package/dist/http-q4G0rVPe.js reads ctx.loader.entries() and cordis.yml.",
+      "conflict": "Mgr 原包要求公开 loader；此前不提供 loader 的设计已被决策 13 取代。",
+      "decision": "用户确认建设正式配置组合与加载能力，维持 Mgr 原包必过任务；按设计第 3.7 节实施。",
+      "implementationEvidence": "closeout-2026-11-19/mgr/result.json"
+    },
+    {
+      "id": "shared-host-cancellable-services",
+      "status": "passed",
+      "scope": "host.tools.execute, host.commands.execute, host.web.search, host.web.fetch",
+      "evidence": "closeout-2026-11-19/free-search/in-flight.json",
+      "contract": "request.cancel is reserved and forwarded to the active provider AbortSignal; host generation and canonical turn state settle once without replay"
+    }
+  ],
+  "directoryEvidence": "management-closeout-2026-11-18/README.md",
+  "closureEvidence": "closeout-2026-11-19/README.md"
+}

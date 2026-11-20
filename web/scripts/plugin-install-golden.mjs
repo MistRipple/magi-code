@@ -18,7 +18,7 @@ await withGoldenViteServer(async (server) => {
   const permissions = [{ kind: 'storage' }];
   const plugin = (over = {}) => ({
     manifest: { id: 'p.demo', version: '1.0.0', name: 'demo', description: '', permissions, contributions: {} },
-    digest: 'digest-new', source: { kind: 'local', location: '/x.zip' }, enabled: true, ...over,
+    digest: 'digest-new', source: { kind: 'local', location: '/x.tgz' }, enabled: true, ...over,
   });
 
   let installed = [];
@@ -31,7 +31,7 @@ await withGoldenViteServer(async (server) => {
     const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
     if (path === '/api/plugins' && (init.method ?? 'GET') === 'GET') return json({ plugins: installed });
     // 安装完成即启用；升级保持原启用状态。
-    if (/\/(install|center\/install|upstream\/install)$/.test(path)) { installed = [plugin()]; return json({}); }
+    if (/\/(install|upstream\/install)$/.test(path)) { installed = [plugin()]; return json({}); }
     if (path.endsWith('/upgrade')) { installed = installed.map((item) => ({ ...item, digest: 'digest-new' })); return json({}); }
     if (/\/(enable|disable)$/.test(path)) {
       if (failLifecycle) return json({ message: 'runtime unavailable' }, 409);
@@ -57,13 +57,11 @@ await withGoldenViteServer(async (server) => {
   assert.deepEqual(lifecycle(), ['upgrade']);
   assert.equal(installed[0].enabled, false);
 
-  // 上游与插件中心安装同样只有一次安装请求。
+  // npm 原包安装沿同一个确认摘要请求。
   installed = []; calls.length = 0;
   await api.installUpstreamPlugin({ package: 'dsh-x', version: '1.0.0', candidate: preview }, 'dsh');
   assert.deepEqual(lifecycle(), ['install']);
-  installed = []; calls.length = 0;
-  await api.installFromPluginCenter({ id: 'p.demo', version: '1.0.0', sha256: 'x' });
-  assert.deepEqual(lifecycle(), ['install']);
+  assert.equal(calls[0].body.expectedDigest, preview.digest);
 
   // 启停是单次请求并绑定用户看到的摘要。
   calls.length = 0;

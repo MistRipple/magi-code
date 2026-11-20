@@ -1,9 +1,8 @@
 /**
- * 插件商店的列表模型：把已安装插件和插件中心目录合并成一份按 ID 去重的列表。
+ * 插件商店的列表模型：按已安装插件与 npm 包身份合并搜索结果。
  * 只做展示投影，安装与生命周期事实仍在 daemon。
  */
 import type {
-  PluginCenterEntry,
   PluginInstalled,
   PluginManifest,
   PluginUpstreamEntry,
@@ -35,11 +34,10 @@ export interface StoreItem {
   /** 已安装时是已安装版本，否则是可安装版本。 */
   version: string;
   installed: PluginInstalled | null;
-  catalog: PluginCenterEntry | null;
-  /** 上游生态（DSH、pi）的 npm 发布包；安装时由 daemon 翻译。 */
+  /** 上游 npm 发布包。 */
   upstream: PluginUpstreamEntry | null;
   status: StoreStatus;
-  /** daemon 检测到运行组件更新，或在线来源有新版本。 */
+  /** 在线来源有新版本。 */
   updatable: boolean;
   /** registry 返回的相关度顺序；只用于当前搜索投影。 */
   searchOrder?: number;
@@ -64,7 +62,6 @@ function statusOf(installed: PluginInstalled | null): StoreStatus {
 
 export function buildStoreItems(
   installedPlugins: PluginInstalled[],
-  catalog: PluginCenterEntry[],
   upstream: PluginUpstreamEntry[],
   text: Text,
 ): StoreItem[] {
@@ -76,41 +73,17 @@ export function buildStoreItems(
       description: text(installed.manifest, 'description'),
       version: installed.manifest.version,
       installed,
-      catalog: null,
       upstream: null,
       status: statusOf(installed),
-      updatable: installed.translationRuntime?.state === 'updateAvailable' && installed.source.kind === 'upstream',
-    });
-  }
-  for (const entry of catalog) {
-    const existing = items.get(entry.id);
-    if (existing) {
-      existing.catalog = entry;
-      existing.updatable ||= entry.state === 'updatable';
-      continue;
-    }
-    items.set(entry.id, {
-      id: entry.id,
-      name: entry.name,
-      description: entry.description,
-      version: entry.version,
-      installed: null,
-      catalog: entry,
-      upstream: null,
-      status: 'available',
       updatable: false,
     });
   }
-  // 已安装插件的来源就是 `生态:包名@版本`，据此归并，不依赖上游搜索结果是否已刷新：
-  // 刚安装完时搜索结果还是旧的，若只看 installedPluginId 会短暂出现重复条目。
   const installedByUpstream = new Map<string, string>();
   for (const installed of installedPlugins) {
-    if (installed.source.kind !== 'upstream') continue;
     const source = installedUpstreamRequest(installed);
     if (source) installedByUpstream.set(`${source.ecosystem}:${source.package}`, installed.manifest.id);
   }
   for (const [searchOrder, entry] of upstream.entries()) {
-    // 已安装的上游包并入对应的已安装条目，其余用 生态+包名 作为临时身份（安装翻译后才有 Magi 插件 ID）。
     const installedId = entry.installedPluginId ?? installedByUpstream.get(`${entry.ecosystem}:${entry.package}`);
     const existing = installedId ? items.get(installedId) : undefined;
     if (existing) {
@@ -128,7 +101,6 @@ export function buildStoreItems(
       description: entry.description,
       version: entry.version,
       installed: null,
-      catalog: null,
       upstream: entry,
       searchOrder,
       status: 'available',
@@ -142,17 +114,16 @@ export function buildStoreItems(
   );
 }
 
-/** 组件更新固定当前原包，沿原来源在线重新准备；GitHub 不被同名 npm 包替换。 */
+/** 读取已安装 DSH 包的精确 npm 来源。 */
 export function installedUpstreamRequest(installed: PluginInstalled): PluginUpstreamRequest | null {
-  if (installed.source.kind !== 'upstream') return null;
+  if (installed.source.kind !== 'upstream' || installed.source.github) return null;
   const location = installed.source.location;
   const colon = location.indexOf(':'), at = location.lastIndexOf('@');
   const ecosystem = location.slice(0, colon);
-  if (colon < 1 || at <= colon + 1 || !['dsh', 'pi'].includes(ecosystem)) return null;
+  if (colon < 1 || at <= colon + 1 || ecosystem !== 'dsh') return null;
   return {
     ecosystem: ecosystem as PluginUpstreamRequest['ecosystem'],
     package: location.slice(colon + 1, at), version: location.slice(at + 1),
-    ...(installed.source.github ? { github: installed.source.github } : {}),
   };
 }
 

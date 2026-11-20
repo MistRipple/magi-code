@@ -10219,7 +10219,7 @@ fn image_generate_normalizes_extension_and_avoids_overwriting_existing_image() {
     let _ = fs::remove_dir_all(root);
 }
 
-// ── 内置工具失败合同：见 docs/builtin-tool-failure-contract.md ──
+// ── 内置工具失败载荷回归 ──
 
 fn payload_of(output: &ToolExecutionOutput) -> Value {
     serde_json::from_str(&output.payload).expect("tool payload is json")

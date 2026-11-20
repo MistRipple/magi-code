@@ -365,6 +365,37 @@ async fn user_question_route_restores_without_waiter_and_accepts_only_one_client
 async fn user_question_route_does_not_acknowledge_or_wake_on_failed_commit() {
     struct FailAnswer(std::sync::atomic::AtomicBool);
     impl magi_session_store::SessionEventWriter for FailAnswer {
+        fn append_model_attempt_stream(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelAttemptStream,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "attempt streams are not part of this test".into(),
+            })
+        }
+        fn append_model_request(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelRequestSnapshot,
+        ) -> magi_core::DomainResult<Option<u64>> {
+            Err(magi_core::DomainError::Persistence {
+                message: "model requests are not part of this test".into(),
+            })
+        }
+        fn append_session_title(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "title events are not part of this test".into(),
+            })
+        }
         fn append_session_transaction(
             &self,
             _: &SessionId,
@@ -547,6 +578,37 @@ async fn durable_approval_route_restores_and_competing_decisions_commit_only_onc
 async fn durable_approval_route_failed_commit_keeps_waiter_pending() {
     struct FailDecision;
     impl magi_session_store::SessionEventWriter for FailDecision {
+        fn append_model_attempt_stream(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelAttemptStream,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "attempt streams are not part of this test".into(),
+            })
+        }
+        fn append_model_request(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: magi_session_store::ModelRequestSnapshot,
+        ) -> magi_core::DomainResult<Option<u64>> {
+            Err(magi_core::DomainError::Persistence {
+                message: "model requests are not part of this test".into(),
+            })
+        }
+        fn append_session_title(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "title events are not part of this test".into(),
+            })
+        }
         fn append_session_transaction(
             &self,
             _: &SessionId,

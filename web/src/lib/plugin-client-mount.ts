@@ -3,6 +3,7 @@ export interface PluginClientOutlet {
   node: HTMLElement;
   entry: string;
   placement: 'settings' | 'page';
+  sessionId?: string;
   frameTestId: string;
 }
 interface ClientHost { select(outlet: PluginClientOutlet | null): void; dispose(): void }
@@ -33,5 +34,16 @@ export function movePluginClient(node: HTMLElement, parent: HTMLElement): void {
   // appendChild 会重载 iframe；原子移动保留文档、React 状态与 SSE。
   if (typeof parent.moveBefore !== 'function') throw new Error('当前浏览器不支持保留插件客户端状态的页面切换');
   parent.moveBefore(node, null);
+}
+
+export interface PluginPaneTab {
+  id: string;
+  viewId: string;
+  sessionId: string;
+  title: string;
+  visible: boolean;
+  expanded: boolean;
+  overlay: boolean;
+  navigation: { address: string; params?: unknown; revision: number };
 }
 

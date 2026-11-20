@@ -40,6 +40,10 @@ TurnService 提交、队列和幂等，不新增 App Server method。`PluginComp
 原生资源 GET／HEAD 入口 `/api/plugins/{id}/assets/{digest}/{instanceId}/{path}` 使用同一
 执行端口和响应容量，不新增存储或业务写入口；匿名 CORS 仅用于该资源响应，无凭据。
 
+`PluginRuntimeState.waiting` 是运行状态的增量枚举值，表示 Cordis 已发现未满足的必需服务。
+daemon 继续通过 `reason` 提供缺少的服务，工作台在插件列表和详情显示等待状态。
+服务就绪后同一个加载实例沿正常激活链路进入 `running`，启用意愿与安装版本均独立于这项运行状态。
+
 `PluginRouteCallResult.bodyBase64` 的响应上限增至解码后 16 MiB，请求仍为 2 MiB。
 公开返回形状与方法不变；扩展宿主以 `route.payload` 协商大响应传输，保持 4 MiB RPC
 单帧上限。短期载荷绑定实例代次、字节数和 SHA-256，按 64 KiB 块读取，成功、失败、

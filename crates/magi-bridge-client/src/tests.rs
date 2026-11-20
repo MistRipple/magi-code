@@ -213,7 +213,7 @@ fn dispatch_runtime_enforces_declared_executor_response_contract() {
 }
 
 // ============================================================================
-// Phase 4: Tool Concurrency Tests
+// Tool Concurrency Tests
 // ============================================================================
 
 #[test]
@@ -381,7 +381,7 @@ fn tool_concurrency_keeps_agent_spawn_serial() {
 }
 
 // ============================================================================
-// Phase 4: LLM Types Tests
+// LLM Types Tests
 // ============================================================================
 
 #[test]

@@ -1,0 +1,18 @@
+{
+  "platform": "macOS arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "e93a86361dbf336b1696f21f0b0f9730725ab449a342deee7ac91895fce0b96e",
+  "sdkLockSha256": "7af3cb1d8834be2fd81b29aadbbab3c08c051876746b4a6a2075aa8afe286e9e",
+  "sample": {
+    "name": "dsh-eval-control",
+    "version": "0.5.0",
+    "sha256": "3518c52bf3c34b772a3862085109f47724dadf0a04cabaa1f4c77738101b83bd",
+    "integrity": "sha512-rDegSQDfCRwbMqDXcI7UkaEAXgp/sJtwv1QmRlBs2pPYfYJbS7qxtN4+WvPvweTCqNtsk4+znkHWXKBcM+HZtQ=="
+  },
+  "checks": {
+    "onlinePreview": 200,
+    "install": 409,
+    "settingsShowsReason": "安装上游插件失败：解析插件依赖失败：Shared SDK dependency is missing: @deepseek-ai/dsh",
+    "installedSetUnchanged": true
+  }
+}

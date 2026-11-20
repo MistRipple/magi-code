@@ -4,8 +4,8 @@ use super::{
     events::publish_ledger_status_event,
     maintenance::{RuntimeMaintenance, RuntimeMaintenanceConfig},
     persistence::{RuntimeSidecarPersistence, StateRepository},
-    plugin_bridge::PluginServices,
 };
+use crate::native_plugin_platform::NativePluginCoordinator;
 use magi_api::{
     ApiError, ApiState, DaemonIdentity, RunnerManager, RuntimeStatePersistence,
     SessionProjectionPersistMode, TaskCheckpointPersist, build_router,
@@ -837,7 +837,7 @@ pub(crate) struct DaemonRuntime {
     managed_process_group: ManagedProcessGroup,
     browser_host_controller_lifecycle: BrowserHostControllerLifecycle,
     /// 插件安装、授权和生命周期的唯一 daemon 所有者；UI 只通过 API 投影访问。
-    plugins: PluginServices,
+    plugins: NativePluginCoordinator,
 }
 
 impl DaemonRuntime {
@@ -928,7 +928,59 @@ impl DaemonRuntime {
         runtime_maintenance.publish_runtime_status_event("system-runtime-maintenance-ready");
 
         let managed_process_group = ManagedProcessGroup::new();
-        let plugins = PluginServices::open(&config.state_root, managed_process_group.clone())?;
+        let plugins = NativePluginCoordinator::open(
+            &config.state_root,
+            managed_process_group.clone(),
+            &config.host,
+            config.port,
+        )
+        .map_err(DaemonError::internal)?;
+        state_repository.install_plugin_session_observer(plugins.session_observer());
+        plugins.bind_session_facts(session_store.clone());
+        let history_repository = state_repository.clone();
+        let history_sessions = session_store.clone();
+        plugins.bind_session_history(Arc::new(move |request| {
+            use magi_extension_host::protocol::{ErrorKind, RpcError};
+
+            let read_session = || {
+                history_sessions
+                    .session(&request.session_id)
+                    .filter(|session| session.kind.is_user())
+                    .ok_or_else(|| RpcError::new(ErrorKind::Conflict, "会话不可用"))
+            };
+            let session = read_session()?;
+            let mut page = history_repository
+                .read_session_observation_page(
+                    &request.session_id,
+                    request.after,
+                    request.through,
+                    request.limit,
+                    request.subagent_task_id.as_deref(),
+                )
+                .map_err(|error| RpcError::new(ErrorKind::Conflict, error.to_string()))?;
+            let current = read_session()?;
+            if current.created_at != session.created_at
+                || current.initial_working_directory_ref != session.initial_working_directory_ref
+            {
+                return Err(RpcError::new(
+                    ErrorKind::Conflict,
+                    "会话身份在读取期间已变化",
+                ));
+            }
+            let cwd = session
+                .initial_working_directory_ref
+                .as_deref()
+                .and_then(|reference| magi_core::HostPath::from_path_ref(reference).ok());
+            let mut identity = serde_json::json!({
+                "id": session.session_id,
+                "createdAt": session.created_at.0,
+            });
+            if let Some(path) = cwd.as_ref().and_then(|path| path.as_path().to_str()) {
+                identity["cwd"] = serde_json::json!(path);
+            }
+            page["session"] = identity;
+            Ok(page)
+        }));
         Ok(Self {
             state_root: config.state_root.clone(),
             state_repository,
@@ -1649,9 +1701,7 @@ impl DaemonRuntime {
         .with_tunnel_port(self.local_port)
         .with_bind_host(self.bind_host.clone())
         .with_plugin_manager(self.plugins.manager())
-        .with_extension_status(self.plugins.extension_status())
-        .with_plugin_route_executor(self.plugins.route_executor())
-        .with_optional_plugin_toolchain(self.plugins.toolchain())
+        .with_native_plugin_platform(self.plugins.as_api_platform())
         .with_runtime_persistence(runtime_persistence)
         .with_workspace_history_restore({
             let repository = self.state_repository.clone();
@@ -1740,6 +1790,9 @@ impl DaemonRuntime {
         if magi_api::task_turn_finalize::reconcile_terminal_session_task_turns(&state) > 0 {
             let _ = state.persist_session_projection();
         }
+        self.plugins.bind_session_control(
+            magi_api::plugin_session_control::plugin_session_control(&state),
+        );
         let state_for_task_workers = state.clone();
         let state_for_knowledge_persist = state.clone();
         let knowledge_persist_callback = Arc::new(move || {
@@ -1765,13 +1818,6 @@ impl DaemonRuntime {
             self.state_root.clone(),
         );
 
-        let extension_hooks_adapter = Arc::new(super::extension_bridge::ExtensionBusHooks::new(
-            self.plugins.extension_bus(),
-            tokio::runtime::Handle::current(),
-        ));
-        let extension_bus_hooks: Arc<
-            dyn magi_conversation_runtime::extension_hooks::ExtensionHooks,
-        > = extension_hooks_adapter.clone();
         let llm_task_dispatcher = Arc::new(
             llm_task_dispatcher
                 .with_plugin_session_message_admitter(magi_api::plugin_session_message_admitter(
@@ -1780,6 +1826,10 @@ impl DaemonRuntime {
                 .with_plugin_command_executor(
                     self.plugins
                         .command_executor(tokio::runtime::Handle::current()),
+                )
+                .with_extension_hooks(
+                    self.plugins
+                        .extension_hooks(tokio::runtime::Handle::current()),
                 )
                 .with_model_bridge_client(business_model_client.clone())
                 .with_completion_notifier(completion_notifier.clone())
@@ -1798,15 +1848,11 @@ impl DaemonRuntime {
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime)
                 .with_snapshot_manager(state.snapshot_manager.clone())
-                .with_workspace_execution_preparer(magi_api::workspace_execution_preparer(&state))
-                .with_extension_hooks(extension_bus_hooks),
+                .with_workspace_execution_preparer(magi_api::workspace_execution_preparer(&state)),
         );
-        self.plugins.bind_native(&llm_task_dispatcher);
-        self.plugins.bind_operations(&state);
-        self.plugins.start_extensions(self.event_bus.clone());
+        self.plugins.start(self.event_bus.clone());
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         state = state
-            .with_input_guard(extension_hooks_adapter)
             .with_session_turn_dispatcher(session_turn_dispatcher)
             .with_model_bridge_client(business_model_client);
         // Runner 只负责调度与资源循环。任务终态由 TaskStore durable status
@@ -1823,7 +1869,6 @@ impl DaemonRuntime {
         .with_checkpoint_persist(task_checkpoint_persist);
         let runner_manager = Arc::new(runner_manager);
         state = state.with_shared_runner_manager(runner_manager.clone());
-        state.start_plugin_jobs();
         // 回调在 mutation guard 外的普通线程等待原 restart 锁；整个投影/释放
         // 过程结束前不能重开该 scope，也不会持有 TaskStore mutation 锁执行 IO。
         task_store.set_status_change_callback_async(true);

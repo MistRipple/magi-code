@@ -922,9 +922,9 @@ fn run_session_turn_execution_inner(
             configured_context_window,
         )
     };
-    // 扩展 `prompt.contribute`（start 阶段）：本 Turn 只征询一次，稳定片段随后冻结进前缀；
-    // 压缩重建与后续请求都复用这一份，不会因再次征询而改变前缀。
-    let stable_contributions: Vec<ChatMessage> = extension_hooks
+    // 扩展 `prompt.contribute`（start 阶段）与 DSH `system-prompt/assemble`：本 Turn 只征询一次，
+    // 稳定片段随后冻结进前缀；压缩重建与后续请求都复用这一份，不会因再次征询而改变前缀。
+    let mut stable_contributions: Vec<ChatMessage> = extension_hooks
         .map(|hooks| {
             crate::extension_hooks::contribute_prompt(
                 hooks,
@@ -933,6 +933,15 @@ fn run_session_turn_execution_inner(
             )
         })
         .unwrap_or_default();
+    if let Some(hooks) = extension_hooks
+        && let Some(assembled) = hooks.system_prompt_assemble(&hook_scope(&request), "")
+        && !assembled.text.trim().is_empty()
+    {
+        stable_contributions.insert(
+            0,
+            crate::prompt_utils::developer_instructions_message(assembled.text),
+        );
+    }
     let fixed_messages =
         build_session_turn_messages_with_runtime(BuildSessionTurnMessagesWithRuntimeInput {
             session_store,

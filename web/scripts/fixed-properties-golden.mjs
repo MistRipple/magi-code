@@ -12,7 +12,7 @@ for (const [file, className, allowed] of [
   ['KnowledgePanel.svelte', 'kp-stats-row', ["currentTab === 'overview'"]],
   ['PluginDetailPane.svelte', 'pane-facts', []],
   ['SettingsPanel.svelte', 'skill-library-meta', null],
-  ['SettingsToolsTab.svelte', 'mcp-tools-count', null],
+  ['SettingsMcpToolsSection.svelte', 'mcp-meta mcp-tool-count', null],
 ]) {
   const source = await readFile(new URL(`../src/components/${file}`, import.meta.url), 'utf8');
   const sections = [];
@@ -66,9 +66,13 @@ await withGoldenViteServer(async server => {
     assert.ok(model.includes(i18n.t('settings.status.notConfigured')));
     assert.ok(!model.includes(i18n.t('settings.model.reasoning.loading')), 'no model is unconfigured, not perpetually loading');
 
-    const item = { id: 'fixture', name: 'Fixture', description: '', version: '1.0', installed: null, catalog: null, upstream: null, status: 'available', updatable: false };
-    const plugin = text(render(Plugin, { props: { item, busy: false, onInstall: noop, onUpdateFromCenter: noop, onUninstall: noop, onActivate: noop, onDeactivate: noop, onDisable: noop, onOpenSettings: noop } }).body);
-    for (const key of ['type', 'version', 'source', 'digest', 'size']) assert.ok(plugin.includes(i18n.t(`settings.plugins.detail.${key}`)));
+    const item = { id: 'fixture', name: 'Fixture', description: '', version: '1.0', installed: null, upstream: null, status: 'available', updatable: false };
+    const plugin = text(render(Plugin, { props: {
+      item, busy: false, canCancelInstall: false, cancellingInstall: false, onCancelInstall: noop,
+      onInstall: noop, onUpdateFromUpstream: noop, onUninstall: noop, onEnable: noop, onDisable: noop,
+      onOpenSettings: noop,
+    } }).body);
+    for (const key of ['type', 'version', 'source', 'digest']) assert.ok(plugin.includes(i18n.t(`settings.plugins.detail.${key}`)));
     assert.ok(plugin.includes(missing()));
 
     const agent = text(render(Agent, { props: { agentRunId: 'missing-snapshot' } }).body);

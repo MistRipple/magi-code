@@ -950,6 +950,7 @@ async fn workspace_sessions_excludes_sidecar_only_workspace_binding() {
             updated_at: now,
             message_count: None,
             workspace_id: Some(workspace_a_id.to_string()),
+            initial_working_directory_ref: None,
             last_completed_at: None,
             last_viewed_at: None,
             kind: Default::default(),

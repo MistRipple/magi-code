@@ -1,60 +1,15 @@
-//! 受信 Node 扩展宿主：协议传输、宿主进程监管与 ExtensionBus。
-//!
-//! 规范见 `docs/extension-protocol-v1.md`。daemon 通过该宿主承载钩子、工具、命令和公开服务，
-//! 会话、审批与持久化事实仍由 Magi 原生服务拥有。
+//! 共享 Cordis Node 宿主的进程边界和内部控制传输。
 
-pub mod breaker;
-
-/// 允许提案改写已装配历史的钩子；缓存归因与保护规则见 `docs/prompt-cache-lineage-architecture.md`。
+/// 允许提案改写已装配历史的钩子名清单；提交改写时须重新绑定缓存谱系。
 pub const EXTENSION_REWRITE_HOOKS: [&str; 2] = ["context.assemble", "compaction.before"];
-pub mod bus;
 pub mod frame;
-pub mod instance;
 pub mod peer;
 pub mod protocol;
-mod route_payload;
-pub mod supervisor;
+pub mod shared;
 pub mod transport;
 
-use crate::peer::BoxFuture;
 use crate::protocol::RpcError;
 use serde_json::Value;
 
 /// 当前调用的临时进度；持久结果仍由业务服务提交。发送失败必须停止交付。
 pub type ServiceProgress = std::sync::Arc<dyn Fn(Value) -> Result<(), RpcError> + Send + Sync>;
-
-/// daemon 暴露给受信扩展的业务服务端口。实现必须在 Magi 原生事实源上执行准入，
-/// 不得让 Node 直接写 canonical 日志或复制会话/任务状态。
-pub trait HostService: Send + Sync + 'static {
-    /// 代次租约由 daemon 签发，覆盖初始化、运行和失败回收；不能由扩展自报。
-    fn instance_started(&self, _plugin_id: &str, _lease: &str) -> Result<(), RpcError> {
-        Ok(())
-    }
-    fn instance_ready(&self, _plugin_id: &str, _lease: &str) -> Result<(), RpcError> {
-        Ok(())
-    }
-    fn instance_ended(&self, _plugin_id: &str, _lease: &str) {}
-    /// 每次宿主启动（含崩溃后重启）从原生设置事实读取配置。
-    fn configuration(&self, _plugin_id: String) -> BoxFuture<Result<Option<Value>, RpcError>> {
-        Box::pin(async { Ok(None) })
-    }
-    fn request_scoped(
-        &self,
-        plugin_id: String,
-        method: String,
-        params: Value,
-        _cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        _progress: Option<ServiceProgress>,
-    ) -> BoxFuture<Result<Value, RpcError>> {
-        self.request_with_identity(plugin_id, method, params)
-    }
-    fn request_with_identity(
-        &self,
-        plugin_id: String,
-        method: String,
-        params: Value,
-    ) -> BoxFuture<Result<Value, RpcError>>;
-}
-
-/// Node 侧宿主运行时（`runtime/host.mjs`）。daemon 在状态目录里按内容摘要落盘后交给 Node 执行。
-pub const HOST_RUNTIME_SOURCE: &str = include_str!("../runtime/host.mjs");

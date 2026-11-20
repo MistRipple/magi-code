@@ -435,6 +435,7 @@ pub(crate) fn resolve_turn_session(
     requested_workspace_id: Option<WorkspaceId>,
     placeholder_title: &str,
     accepted_at: UtcMillis,
+    project_directories: Option<&magi_core::ProjectDirectoryBinding>,
 ) -> Result<(SessionId, bool, Option<WorkspaceId>), ApiError> {
     if let Some(session_id) = requested_session_id {
         let session = state
@@ -447,14 +448,80 @@ pub(crate) fn resolve_turn_session(
     }
 
     let session_id = new_session_id();
+    create_session_in_scope(
+        state,
+        &session_id,
+        placeholder_title,
+        requested_workspace_id.as_ref(),
+        accepted_at,
+        project_directories,
+    )?;
+    Ok((session_id, true, requested_workspace_id))
+}
+
+/// 新会话的创建目录：项目会话取项目根或已绑定的来源目录，个人会话取其执行根。
+fn creation_directory(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: Option<&WorkspaceId>,
+    project_directories: Option<&magi_core::ProjectDirectoryBinding>,
+) -> Result<std::path::PathBuf, ApiError> {
+    Ok(match (workspace_id, project_directories) {
+        (Some(workspace_id), Some(binding)) if &binding.workspace_id == workspace_id => state
+            .workspace_registry
+            .resolve_bound_source_directory(binding, None)
+            .map_err(|err| ApiError::Conflict(format!("会话创建目录已失效：{err}")))?,
+        (Some(workspace_id), None) => state
+            .workspace_registry
+            .project(workspace_id)
+            .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?
+            .native_root_path(),
+        (None, None) => state.personal_session_execution_root_path(session_id),
+        _ => return Err(ApiError::Conflict("会话创建目录与会话作用域不匹配".into())),
+    })
+}
+
+/// 创建会话并把它设为用户当前选中的会话（用户界面的新建与首条消息）。
+pub(crate) fn create_session_in_scope(
+    state: &ApiState,
+    session_id: &SessionId,
+    title: &str,
+    workspace_id: Option<&WorkspaceId>,
+    created_at: UtcMillis,
+    project_directories: Option<&magi_core::ProjectDirectoryBinding>,
+) -> Result<(), ApiError> {
+    let directory = creation_directory(state, session_id, workspace_id, project_directories)?;
     state
         .session_store
-        .create_session_for_workspace_at(
+        .create_session_with_working_directory_at(
             session_id.clone(),
-            placeholder_title.to_string(),
-            requested_workspace_id.as_ref().map(ToString::to_string),
-            accepted_at,
+            title,
+            workspace_id.map(ToString::to_string),
+            created_at,
+            Some(directory),
         )
-        .map_err(|err| ApiError::internal_assembly("创建会话失败", err))?;
-    Ok((session_id, true, requested_workspace_id))
+        .map_err(|error| ApiError::internal_assembly("创建会话失败", error))?;
+    Ok(())
+}
+
+/// 创建会话但不改写用户当前选中的会话（用户界面之外的发起方，例如插件网关）。
+pub(crate) fn create_unselected_session_in_scope(
+    state: &ApiState,
+    session_id: &SessionId,
+    title: &str,
+    workspace_id: Option<&WorkspaceId>,
+    created_at: UtcMillis,
+) -> Result<(), ApiError> {
+    let directory = creation_directory(state, session_id, workspace_id, None)?;
+    state
+        .session_store
+        .create_unselected_session_with_working_directory_at(
+            session_id.clone(),
+            title,
+            workspace_id.map(ToString::to_string),
+            created_at,
+            Some(directory),
+        )
+        .map_err(|error| ApiError::internal_assembly("创建会话失败", error))?;
+    Ok(())
 }

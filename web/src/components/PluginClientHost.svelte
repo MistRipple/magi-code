@@ -20,6 +20,7 @@
     <PluginFrame {pluginId} {entry} {label}
       viewEntry={outlet?.entry ?? null}
       placement={outlet?.placement ?? 'background'}
+      sessionId={outlet?.sessionId}
       frameTestId={outlet?.frameTestId ?? 'plugin-client-background'} />
   </div>
 </div>

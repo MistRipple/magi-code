@@ -23,9 +23,44 @@ struct RejectingCanonicalWriter;
 struct RecordingCanonicalWriter {
     transactions: std::sync::Mutex<Vec<Vec<crate::CanonicalTurnMutation>>>,
     accepted_tasks: std::sync::Mutex<Vec<TaskId>>,
+    titles: std::sync::Mutex<Vec<(SessionId, String)>>,
 }
 
 impl crate::SessionEventWriter for RecordingCanonicalWriter {
+    fn append_model_attempt_stream(
+        &self,
+
+        _: &magi_core::SessionId,
+
+        _: &str,
+
+        _: u64,
+
+        _: crate::ModelAttemptStream,
+    ) -> magi_core::DomainResult<u64> {
+        Err(magi_core::DomainError::Persistence {
+            message: "attempt streams are not part of this test".into(),
+        })
+    }
+    fn append_model_request(
+        &self,
+        _: &magi_core::SessionId,
+        _: &str,
+        _: u64,
+        _: crate::ModelRequestSnapshot,
+    ) -> magi_core::DomainResult<Option<u64>> {
+        Ok(None)
+    }
+    fn append_session_title(
+        &self,
+        session_id: &SessionId,
+        title: &str,
+    ) -> magi_core::DomainResult<u64> {
+        let mut titles = self.titles.lock().unwrap();
+        titles.push((session_id.clone(), title.to_string()));
+        Ok(titles.len() as u64)
+    }
+
     fn append_session_transaction(
         &self,
         _: &SessionId,
@@ -45,6 +80,36 @@ impl crate::SessionEventWriter for RecordingCanonicalWriter {
 }
 
 impl crate::SessionEventWriter for RejectingCanonicalWriter {
+    fn append_model_attempt_stream(
+        &self,
+
+        _: &magi_core::SessionId,
+
+        _: &str,
+
+        _: u64,
+
+        _: crate::ModelAttemptStream,
+    ) -> magi_core::DomainResult<u64> {
+        Err(magi_core::DomainError::Persistence {
+            message: "attempt streams are not part of this test".into(),
+        })
+    }
+    fn append_model_request(
+        &self,
+        _: &magi_core::SessionId,
+        _: &str,
+        _: u64,
+        _: crate::ModelRequestSnapshot,
+    ) -> magi_core::DomainResult<Option<u64>> {
+        Ok(None)
+    }
+    fn append_session_title(&self, _: &SessionId, _: &str) -> magi_core::DomainResult<u64> {
+        Err(DomainError::Persistence {
+            message: "title events are not part of this test".into(),
+        })
+    }
+
     fn append_session_transaction(
         &self,
         _: &SessionId,
@@ -64,6 +129,36 @@ struct BlockingCanonicalWriter {
 }
 
 impl crate::SessionEventWriter for BlockingCanonicalWriter {
+    fn append_model_attempt_stream(
+        &self,
+
+        _: &magi_core::SessionId,
+
+        _: &str,
+
+        _: u64,
+
+        _: crate::ModelAttemptStream,
+    ) -> magi_core::DomainResult<u64> {
+        Err(magi_core::DomainError::Persistence {
+            message: "attempt streams are not part of this test".into(),
+        })
+    }
+    fn append_model_request(
+        &self,
+        _: &magi_core::SessionId,
+        _: &str,
+        _: u64,
+        _: crate::ModelRequestSnapshot,
+    ) -> magi_core::DomainResult<Option<u64>> {
+        Ok(None)
+    }
+    fn append_session_title(&self, _: &SessionId, _: &str) -> magi_core::DomainResult<u64> {
+        Err(DomainError::Persistence {
+            message: "title events are not part of this test".into(),
+        })
+    }
+
     fn append_session_transaction(
         &self,
         _: &SessionId,
@@ -490,6 +585,92 @@ fn rename_session_validates_title_and_skips_noop_history() {
         "新名称"
     );
     assert!(created.updated_at.0 <= renamed.updated_at.0);
+}
+
+#[test]
+fn rename_commits_the_title_event_first_and_returns_its_sequence() {
+    let store = SessionStore::new();
+    let writer = Arc::new(RecordingCanonicalWriter::default());
+    store.install_session_event_writer(writer.clone());
+    let session_id = SessionId::new("session-rename-event");
+    store
+        .create_session(session_id.clone(), "旧标题")
+        .expect("session should create");
+
+    let first = store
+        .rename_session_with_persistence(&session_id, "  新标题 ", |_, _| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .expect("rename should commit");
+    assert_eq!(first.event_seq, Some(1));
+    assert_eq!(first.session.title, "新标题");
+    // 同一标题再次提交也是被接受的请求：新增事件，调用方拿到各自的序号。
+    let again = store
+        .rename_session_with_persistence(&session_id, "新标题", |_, _| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .expect("same title should still be accepted");
+    assert_eq!(again.event_seq, Some(2));
+    assert_eq!(
+        *writer.titles.lock().unwrap(),
+        vec![
+            (session_id.clone(), "新标题".to_string()),
+            (session_id, "新标题".to_string())
+        ]
+    );
+}
+
+#[test]
+fn rename_rejected_by_the_event_log_changes_nothing() {
+    let store = SessionStore::new();
+    store.install_session_event_writer(Arc::new(RejectingCanonicalWriter));
+    let session_id = SessionId::new("session-rename-log-rejected");
+    store
+        .create_session(session_id.clone(), "旧标题")
+        .expect("session should create");
+    let before = serde_json::to_value(store.durable_state()).expect("state should serialize");
+    let persisted = std::cell::Cell::new(false);
+
+    let result = store.rename_session_with_persistence(&session_id, "新标题", |_, _| {
+        persisted.set(true);
+        Ok::<(), std::convert::Infallible>(())
+    });
+
+    assert!(matches!(
+        result,
+        Err(SessionMutationTransactionError::Domain(_))
+    ));
+    assert!(!persisted.get(), "日志未接受时不得写 projection");
+    assert_eq!(
+        serde_json::to_value(store.durable_state()).expect("state should serialize"),
+        before
+    );
+}
+
+#[test]
+fn projection_failure_after_the_title_event_keeps_the_committed_title() {
+    let store = SessionStore::new();
+    store.install_session_event_writer(Arc::new(RecordingCanonicalWriter::default()));
+    let session_id = SessionId::new("session-rename-projection-lag");
+    store
+        .create_session(session_id.clone(), "旧标题")
+        .expect("session should create");
+
+    let result = store.rename_session_with_persistence(&session_id, "新标题", |_, _| {
+        Err::<(), _>("projection write failed")
+    });
+
+    assert!(matches!(
+        result,
+        Err(SessionMutationTransactionError::Persistence(
+            "projection write failed"
+        ))
+    ));
+    // 事件已是事实：内存记录不回滚，否则落后于日志。
+    assert_eq!(
+        store.session(&session_id).expect("session exists").title,
+        "新标题"
+    );
 }
 
 #[test]
@@ -10931,4 +11112,74 @@ fn mainline_resume_candidate_exists_for_failed_and_user_stopped_turns_only() {
     if let Some(exported) = export {
         assert_eq!(exported, Some(candidate));
     }
+}
+
+#[test]
+fn an_unselected_session_is_created_without_taking_the_current_selection() {
+    let store = SessionStore::new();
+    store
+        .create_session(SessionId::new("shown"), "用户正在看")
+        .unwrap();
+    assert_eq!(store.current_session_id(), Some(SessionId::new("shown")));
+
+    let created = store
+        .create_unselected_session_with_working_directory_at(
+            SessionId::new("by-plugin"),
+            "插件创建",
+            None,
+            UtcMillis(5),
+            None,
+        )
+        .unwrap();
+    assert!(created.kind.is_user(), "仍是用户会话，进入目录与时间线");
+    assert_eq!(
+        store.current_session_id(),
+        Some(SessionId::new("shown")),
+        "用户当前选中的会话不被改写"
+    );
+    assert!(store.session(&SessionId::new("by-plugin")).is_some());
+    assert!(
+        store
+            .timeline()
+            .iter()
+            .any(|entry| entry.session_id == SessionId::new("by-plugin")
+                && matches!(entry.kind, TimelineEntryKind::SessionCreated))
+    );
+
+    // 没有任何当前会话时也不会因为新建而选中它。
+    let empty = SessionStore::new();
+    empty
+        .create_unselected_session_with_working_directory_at(
+            SessionId::new("only"),
+            "唯一",
+            None,
+            UtcMillis(1),
+            None,
+        )
+        .unwrap();
+    assert_eq!(empty.current_session_id(), None);
+
+    // 它同样拒绝重复身份与相对路径。
+    assert!(
+        store
+            .create_unselected_session_with_working_directory_at(
+                SessionId::new("by-plugin"),
+                "重复",
+                None,
+                UtcMillis(6),
+                None,
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .create_unselected_session_with_working_directory_at(
+                SessionId::new("relative"),
+                "相对",
+                None,
+                UtcMillis(7),
+                Some("relative/path".into()),
+            )
+            .is_err()
+    );
 }

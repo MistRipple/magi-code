@@ -1,6 +1,6 @@
 //! 目标工具（get_goal / create_goal / update_goal）的失败载荷。
 //!
-//! 约定见 `docs/builtin-tool-failure-contract.md`：稳定的 `error_code`（`{tool}_{类别}`）、
+//! 失败载荷使用稳定的 `error_code`（`{tool}_{类别}`）、面向模型的类别说明与下一步指引；
 //! 面向模型的类别说明、下一步指引；失败取决于当前目标或计划时，附带它们的当前状态，
 //! 让模型据此重新提交（版本号、未完成的计划项），而不是凭过期记忆反复试。
 

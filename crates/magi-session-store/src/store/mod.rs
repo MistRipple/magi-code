@@ -109,6 +109,58 @@ pub trait SessionEventWriter: Send + Sync {
         inputs: &[SessionInputMutation],
         acceptance: Option<(&SessionAcceptanceRecord, Option<&Task>)>,
     ) -> DomainResult<()>;
+
+    /// 把会话标题变更作为会话级事件提交到日志，返回它的会话内事件序号。
+    /// 提交成功即标题事实成立，会话记录只是它的投影。
+    fn append_session_title(&self, session_id: &SessionId, title: &str) -> DomainResult<u64>;
+
+    /// 把一次模型调用尝试的流记录作为日志事件提交，返回会话内事件序号。
+    fn append_model_attempt_stream(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        turn_seq: u64,
+        stream: crate::ModelAttemptStream,
+    ) -> DomainResult<u64>;
+
+    /// 把一个模型步骤首次提交时的请求快照按摘要去重后写入会话日志；超过体积上限时放弃并返回 `Ok(None)`。
+    fn append_model_request(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        turn_seq: u64,
+        request: crate::ModelRequestSnapshot,
+    ) -> DomainResult<Option<u64>>;
+
+    /// 把会话级命令生命周期事件（`command/run`、`command/done`）写入日志，返回会话内事件序号。
+    fn append_session_command_event(
+        &self,
+        _session_id: &SessionId,
+        _event: crate::SessionCommandEvent,
+    ) -> DomainResult<u64> {
+        Err(DomainError::Persistence {
+            message: "session event writer does not support command events".into(),
+        })
+    }
+
+    /// 推送进行中的非持久化实时助手流帧（不写盘、不阻塞推理）。
+    fn publish_live_assistant_stream(
+        &self,
+        _session_id: &SessionId,
+        _turn_id: &str,
+        _step_id: &str,
+        _attempt_id: &str,
+        _event: crate::LiveAssistantStreamEvent,
+    ) {
+    }
+}
+
+/// 一次标题变更提交的结果。`event_seq` 是标题事件在会话日志里的序号；
+/// 没有安装日志写入器的存储（单元测试）没有序号。
+#[derive(Clone, Debug)]
+pub struct SessionTitleCommit {
+    pub session: SessionRecord,
+    pub event_seq: Option<u64>,
 }
 
 /// orchestrator 主线 thread 的稳定 role 标识。
@@ -630,6 +682,14 @@ impl SessionStore {
     }
 
     /// 安装 canonical 权威事件 writer。daemon 恢复完成后、接受任何新 mutation 前安装。
+    /// 是否装配了会话事件日志写入器（标题序号依赖它）。
+    pub fn has_session_event_writer(&self) -> bool {
+        self.session_event_writer
+            .read()
+            .expect("session event writer lock poisoned")
+            .is_some()
+    }
+
     pub fn install_session_event_writer(&self, writer: Arc<dyn SessionEventWriter>) {
         *self
             .session_event_writer
@@ -834,6 +894,79 @@ impl SessionStore {
         workspace_id: Option<String>,
         created_at: UtcMillis,
     ) -> DomainResult<SessionRecord> {
+        self.create_session_with_working_directory_at(
+            session_id,
+            title,
+            workspace_id,
+            created_at,
+            None,
+        )
+    }
+
+    pub fn create_session_with_working_directory_at(
+        &self,
+        session_id: SessionId,
+        title: impl Into<String>,
+        workspace_id: Option<String>,
+        created_at: UtcMillis,
+        working_directory: Option<std::path::PathBuf>,
+    ) -> DomainResult<SessionRecord> {
+        self.create_user_session(
+            session_id,
+            title,
+            workspace_id,
+            created_at,
+            working_directory,
+            true,
+        )
+    }
+
+    /// 创建用户会话但不改写用户当前选中的会话（`current_session_id` 保持原样）。
+    ///
+    /// 由用户界面之外的发起方使用（例如插件网关）：它们创建会话，是否打开由用户决定，
+    /// 与外部工具会话“不抢占用户当前选中的会话”同一规则；其余行为与
+    /// [`Self::create_session_with_working_directory_at`] 相同。
+    pub fn create_unselected_session_with_working_directory_at(
+        &self,
+        session_id: SessionId,
+        title: impl Into<String>,
+        workspace_id: Option<String>,
+        created_at: UtcMillis,
+        working_directory: Option<std::path::PathBuf>,
+    ) -> DomainResult<SessionRecord> {
+        self.create_user_session(
+            session_id,
+            title,
+            workspace_id,
+            created_at,
+            working_directory,
+            false,
+        )
+    }
+
+    fn create_user_session(
+        &self,
+        session_id: SessionId,
+        title: impl Into<String>,
+        workspace_id: Option<String>,
+        created_at: UtcMillis,
+        working_directory: Option<std::path::PathBuf>,
+        select_as_current: bool,
+    ) -> DomainResult<SessionRecord> {
+        if working_directory
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(DomainError::Validation {
+                message: "会话创建目录必须是绝对路径".into(),
+            });
+        }
+        let initial_working_directory_ref = working_directory.map(|path| {
+            magi_core::HostPath::from_path(path)
+                .to_path_ref()
+                .as_str()
+                .to_owned()
+        });
         let mut state = self
             .state
             .write()
@@ -855,12 +988,15 @@ impl SessionStore {
             updated_at: created_at,
             message_count: None,
             workspace_id: workspace_id.clone(),
+            initial_working_directory_ref,
             last_completed_at: None,
             last_viewed_at: None,
             kind: Default::default(),
         };
         state.sessions.push(session.clone());
-        state.current_session_id = Some(session_id.clone());
+        if select_as_current {
+            state.current_session_id = Some(session_id.clone());
+        }
         state.timeline.push(TimelineEntry {
             entry_id: format!("timeline-session-created-{}", session_id),
             session_id: session_id.clone(),
@@ -905,6 +1041,7 @@ impl SessionStore {
             updated_at: created_at,
             message_count: None,
             workspace_id: Some(workspace_id.clone()),
+            initial_working_directory_ref: None,
             last_completed_at: None,
             last_viewed_at: None,
             kind: SessionKind::ExternalTool,
@@ -1004,22 +1141,27 @@ impl SessionStore {
         self.rename_session_with_persistence(session_id, new_title, |_, _| {
             Ok::<(), std::convert::Infallible>(())
         })
+        .map(|commit| commit.session)
         .map_err(|error| match error {
             SessionMutationTransactionError::Domain(error) => error,
             SessionMutationTransactionError::Persistence(error) => match error {},
         })
     }
 
-    /// 在 durable projection 成功后提交 session 标题和重命名 timeline 事件。
+    /// 提交 session 标题变更：标题事件先进日志（提交点），再更新会话记录与 timeline，
+    /// 最后写 durable projection。
     ///
-    /// 候选状态在 state 写锁覆盖期间生成、持久化并提交，避免重命名后刷新时出现旧标题
-    /// 覆盖新标题，或事件已经发布但 durable projection 仍是旧版本。
+    /// 安装了日志写入器时，事件提交成功即标题事实成立：之后 projection 写入失败只把错误
+    /// 返回给调用方，不回滚内存里的标题——回滚会让记录落后于日志，下次重放又改回来。
+    /// 该会话的下一次 projection 写入或重启重放都会让落盘记录追上日志。标题没有变化的
+    /// 重命名同样提交事件：调用方得到的序号对应它被接受的那一刻。
+    /// 没有写入器（单元测试）时没有日志，按原语义在 projection 写入失败时回滚。
     pub fn rename_session_with_persistence<E>(
         &self,
         session_id: &SessionId,
         title: impl Into<String>,
         persist: impl FnOnce(&SessionDurableState, &SessionExecutionSidecarStoreState) -> Result<(), E>,
-    ) -> Result<SessionRecord, SessionMutationTransactionError<E>> {
+    ) -> Result<SessionTitleCommit, SessionMutationTransactionError<E>> {
         let new_title = normalize_session_title(title.into())
             .map_err(SessionMutationTransactionError::Domain)?;
         let _persistence_guard = self
@@ -1044,27 +1186,48 @@ impl SessionStore {
             .ok_or(SessionMutationTransactionError::Domain(
                 DomainError::NotFound { entity: "session" },
             ))?;
-        let timeline_len = state.timeline.len();
-        let Some(updated) = prepare_session_rename(&mut state, session_id, &new_title)
-            .map_err(SessionMutationTransactionError::Domain)?
-        else {
-            return Ok(previous);
+        let writer = self
+            .session_event_writer
+            .read()
+            .expect("session event writer lock poisoned")
+            .clone();
+        let event_seq = match &writer {
+            Some(writer) => Some(
+                writer
+                    .append_session_title(session_id, &new_title)
+                    .map_err(SessionMutationTransactionError::Domain)?,
+            ),
+            None => None,
         };
+        let timeline_len = state.timeline.len();
+        let updated = prepare_session_rename(&mut state, session_id, &new_title)
+            .map_err(SessionMutationTransactionError::Domain)?;
+        if updated.is_none() && event_seq.is_none() {
+            return Ok(SessionTitleCommit {
+                session: previous,
+                event_seq,
+            });
+        }
         let session_ids = std::slice::from_ref(session_id);
         let durable = durable_slice_for_sessions(&state, session_ids);
         let sidecars = sidecars_for_sessions(&state, session_ids);
         if let Err(error) = persist(&durable, &sidecars) {
-            if let Some(session) = state
-                .sessions
-                .iter_mut()
-                .find(|session| &session.session_id == session_id)
-            {
-                *session = previous;
+            if event_seq.is_none() {
+                if let Some(session) = state
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.session_id == session_id)
+                {
+                    *session = previous;
+                }
+                state.timeline.truncate(timeline_len);
             }
-            state.timeline.truncate(timeline_len);
             return Err(SessionMutationTransactionError::Persistence(error));
         }
-        Ok(updated)
+        Ok(SessionTitleCommit {
+            session: updated.unwrap_or(previous),
+            event_seq,
+        })
     }
 
     pub fn archive_session(&self, session_id: &SessionId) -> DomainResult<SessionRecord> {
@@ -1100,6 +1263,45 @@ impl SessionStore {
             observer.on_session_archived(session_id);
         }
         Ok(archived)
+    }
+
+    /// 把会话级命令生命周期事件（`command/run`、`command/done`）写入事件日志，返回会话内事件序号。
+    /// 没有安装事件日志写入器（如无日志单元测试）时返回 `Ok(None)`。
+    pub fn record_session_command_event(
+        &self,
+        session_id: &SessionId,
+        event: crate::SessionCommandEvent,
+    ) -> DomainResult<Option<u64>> {
+        let Some(writer) = self
+            .session_event_writer
+            .read()
+            .expect("session event writer lock poisoned")
+            .clone()
+        else {
+            return Ok(None);
+        };
+        let _barrier = self
+            .canonical_commit_barrier
+            .read()
+            .expect("canonical barrier poisoned");
+        let lock = self.canonical_commit_lock_for(session_id);
+        let _guard = lock.lock().expect("canonical session lock poisoned");
+        {
+            let state = self.state.read().expect("session state lock poisoned");
+            let session = state
+                .sessions
+                .iter()
+                .find(|session| &session.session_id == session_id)
+                .ok_or(DomainError::NotFound { entity: "session" })?;
+            if !session.kind.is_user() {
+                return Err(DomainError::Validation {
+                    message: "外部工具会话不支持命令生命周期事件".into(),
+                });
+            }
+        }
+        writer
+            .append_session_command_event(session_id, event)
+            .map(Some)
     }
 
     /// 删除 session 的唯一状态提交入口。

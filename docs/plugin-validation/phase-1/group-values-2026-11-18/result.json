@@ -1,0 +1,267 @@
+{
+  "schemaVersion": 1,
+  "scope": "loading-source-values-and-regrouping",
+  "capturedAt": "2026-11-17T23:43:31.136203+00:00",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "sourceSha256": {
+    "crates/magi-extension-host/runtime/dsh/build-include-journal.mjs": "2bc5b4a44f251918c9061aeeb0178462cdddd0c008a8cfafd4462ea74c88cdcf",
+    "crates/magi-extension-host/runtime/dsh/committed-tree.mjs": "558f46628bdc2ed39cd202b3cc34725064865c80a1c9630348a7590966fe3cc9",
+    "crates/magi-extension-host/runtime/dsh/configuration-edit.mjs": "277998c443b4f038e92bcf32707b5b9dd8f52030b85dadcfee95dc04f0b2bb35",
+    "crates/magi-extension-host/runtime/dsh/configuration-group.mjs": "de5b930deec19d418076d269b9145a4bb19778c2594ae39d0677e6bafc27feb0",
+    "crates/magi-extension-host/runtime/dsh/configuration-order.mjs": "39d8107d22d104cd1430f0f97be2a8ac72421f46adb7412f6188e64db7b14010",
+    "crates/magi-extension-host/runtime/dsh/configuration.mjs": "fe16417c32defc627a30d01d75d320334e16884986f1312267c53c35a5e73bc1",
+    "crates/magi-extension-host/runtime/dsh/entry.mjs": "74fb3a079b63e9ab60a5be6ee4ad879715c29a2e2e337b60a8955b109dc4a37e",
+    "crates/magi-extension-host/runtime/dsh/include-journal.entry.mjs": "71bcb5073022ad0476505cb2915c17bf69f0d34ce44bc8bf022ca916493a4bbd",
+    "crates/magi-extension-host/runtime/dsh/include-journal.generated.mjs": "d6adf43ccd07df6c60709b06dee0f0e180a7cf5f6a6fef88ffe565b5f2e11c32",
+    "crates/magi-extension-host/runtime/dsh/lifecycle.mjs": "e3e8c2a5e45996e3524e83f1d3c42374be0181220ae7bea990f6d74af82e1919",
+    "crates/magi-extension-host/runtime/dsh/packages.mjs": "ac10dcd3a6f67fee94caf1abcafc28637ab3eac0c059453eb2be8c8c60f4572d",
+    "crates/magi-extension-host/runtime/dsh/test/configuration-edit.test.mjs": "e3b792ac64e2ffb5bc2e008c3d0128e15704f471cc2c47c2dc18c2359f225e33",
+    "crates/magi-plugin-system/src/lifecycle/loading/edit.rs": "2f748e36d65e82fe03411608a1743f48f97b4734627ddf5f6e30b4c2902df334",
+    "crates/magi-plugin-system/src/lifecycle/loading.rs": "f5a22621558d32dce682339e6bae0170c4e58187458942d5d3f262ae81452614",
+    "crates/magi-plugin-system/src/loading_runtime.rs": "c78a30adb5a9f700d7eef1abcdc57f974c17ac734cec573a0f7055dc6b2f0d72",
+    "crates/magi-plugin-system/tests/loading_host.rs": "4b0798144d34a6f90088b2ed7272f26fcfbb7e57c693f3c2b49eff5c4e4e0d08",
+    "crates/magi-plugin-system/tests/loading_runtime.rs": "c58f06787318084135be4e369b6d31288f806f358ad3e2975316f2bf824ae206"
+  },
+  "hostLock": {
+    "path": "crates/magi-extension-host/runtime/dsh/package-lock.json",
+    "sha256": "9cbccb124b07ce443f6ca31bdfe3fa1f4c538aa58bf8096cfdcfffc416104e3c"
+  },
+  "preparedProject": "target/dsh-phase-1/projects/mgr-group-values-2026-11-18",
+  "dependencyLock": {
+    "path": "target/dsh-phase-1/projects/mgr-group-values-2026-11-18/package-lock.json",
+    "sha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+  },
+  "original": {
+    "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+    "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+    "name": "dsh-plugin-mgr",
+    "version": "0.2.13",
+    "verifiedOriginalFiles": {
+      "LICENSE": "d650e965595d51ade8795344e77785c82bfa3bb3c1f41f3d5f57c4ca19d5966e",
+      "dist/client.js": "fe305e14c80b6fcf95e54a96c341dbf14d289531b5eefb3205d4f007bd9bec1c",
+      "dist/http-q4G0rVPe.js": "9a2b24830ea79ea2793de04cb49034fccc4fb78ed2a3d175d972dc96ba24e9eb",
+      "dist/index.js": "5c81bd2b0c5e54292294bc5ab70a62b31c48b65b73576539b95889efb084fd0d",
+      "dist/internal.js": "6dce13d22cfce594bed2feee96ee8d100f81321a2919fd77d965cebcd0e90464",
+      "package.json": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "README.md": "69b9eee2f9c249e66800aa0eaa247c3041423532d5a542ec769bbbe38fffe2e3",
+      "icon.svg": "6307668063214a63967fed558e1a73194a3394911288cf833dbea0892f49df74",
+      "cordis.patch.yml": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9"
+    }
+  },
+  "validation": {
+    "node": {
+      "command": "npm --prefix crates/magi-extension-host/runtime/dsh test",
+      "passed": 44,
+      "failed": 0
+    },
+    "rust": {
+      "command": "cargo test -p magi-plugin-system -p magi-extension-host --all-targets --locked --quiet",
+      "passed": 176,
+      "defaultIgnored": 5,
+      "failed": 0
+    },
+    "originalRuntime": {
+      "command": "MAGI_LOADING_PREPARED_PROJECT=\"$PWD/target/dsh-phase-1/projects/mgr-group-values-2026-11-18\" cargo test -p magi-plugin-system --test loading_host original_mgr_ --locked -- --ignored --nocapture",
+      "passed": 4,
+      "failed": 0,
+      "results": [
+        {
+          "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+          "business": "not-run",
+          "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+          "missingServices": [
+            "loader",
+            "webServer"
+          ],
+          "originalBundleUnchanged": true,
+          "package": "dsh-plugin-mgr@0.2.13",
+          "receipt": {
+            "instances": [
+              {
+                "activationGeneration": 1,
+                "configurationEpoch": 1,
+                "hostGeneration": 1,
+                "instanceId": "include:dsh-plugin-mgr",
+                "missingServices": [
+                  "loader",
+                  "webServer"
+                ],
+                "pluginId": "dsh-plugin-mgr",
+                "state": "waiting",
+                "version": "0.2.13"
+              }
+            ],
+            "token": {
+              "hostGeneration": 1,
+              "revision": 1,
+              "sequence": 1
+            }
+          },
+          "scope": "committed-graph-execution",
+          "state": "waiting"
+        },
+        {
+          "acceptedRevisions": [
+            1,
+            2,
+            3
+          ],
+          "activationGenerations": [
+            1,
+            2
+          ],
+          "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+          "business": "not-run",
+          "finalStatus": {
+            "activationGeneration": 2,
+            "configurationEpoch": 1,
+            "hostGeneration": 1,
+            "instanceId": "include:dsh-plugin-mgr",
+            "missingServices": [
+              "loader",
+              "webServer"
+            ],
+            "pluginId": "dsh-plugin-mgr",
+            "state": "waiting",
+            "version": "0.2.13"
+          },
+          "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+          "originalBundleUnchanged": true,
+          "package": "dsh-plugin-mgr@0.2.13",
+          "scope": "source-notification-intake",
+          "states": [
+            "waiting",
+            "removed",
+            "waiting"
+          ]
+        },
+        {
+          "acceptedRevisions": [
+            1,
+            2,
+            3
+          ],
+          "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+          "business": "not-run",
+          "finalStatus": {
+            "activationGeneration": 2,
+            "configurationEpoch": 1,
+            "hostGeneration": 1,
+            "instanceId": "include:dsh-plugin-mgr",
+            "missingServices": [
+              "loader",
+              "webServer"
+            ],
+            "pluginId": "dsh-plugin-mgr",
+            "state": "waiting",
+            "version": "0.2.13"
+          },
+          "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+          "originalPackageBundleUnchanged": true,
+          "owningCandidateSource": "bundle.patch.yml",
+          "package": "dsh-plugin-mgr@0.2.13",
+          "pendingEditCleared": true,
+          "scope": "source-edit-journal-and-domain-commit",
+          "unrelatedSourcesUnchanged": true
+        },
+        {
+          "acceptedRevisions": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "business": "not-run",
+          "lastLiveStatus": {
+            "activationGeneration": 4,
+            "configurationEpoch": 1,
+            "hostGeneration": 1,
+            "instanceId": "include:dsh-plugin-mgr",
+            "missingServices": [
+              "loader",
+              "webServer"
+            ],
+            "pluginId": "dsh-plugin-mgr",
+            "state": "waiting",
+            "version": "0.2.13"
+          },
+          "originalPackageUnchanged": true,
+          "package": "dsh-plugin-mgr@0.2.13",
+          "pendingEditCleared": true,
+          "scope": "atomic-group-source-replacement",
+          "states": [
+            "waiting",
+            "removed",
+            "waiting",
+            "waiting-in-new-group",
+            "waiting-at-source-root",
+            "removed"
+          ],
+          "unchangedEditDoesNotApply": true
+        }
+      ]
+    },
+    "clippy": {
+      "command": "cargo clippy -p magi-plugin-system -p magi-extension-host --all-targets --locked -- -D warnings",
+      "status": "passed"
+    },
+    "format": {
+      "command": "rustfmt --check --edition 2024 crates/magi-plugin-system/tests/loading_runtime.rs crates/magi-plugin-system/tests/loading_host.rs",
+      "status": "passed"
+    },
+    "diffWhitespace": {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  },
+  "runtimeEvidence": {
+    "test": "regrouping_existing_members_preserves_source_values_and_retires_obsolete_overrides",
+    "acceptedRevisions": [
+      1,
+      2,
+      3
+    ],
+    "businessRecords": [
+      {
+        "revision": 1,
+        "value": "override"
+      },
+      {
+        "revision": 2,
+        "value": "grouped",
+        "explicit": null
+      },
+      {
+        "revision": 3,
+        "value": "ungrouped",
+        "explicit": null
+      }
+    ],
+    "rejectedCandidateDoesNotWriteState": true,
+    "oldInstanceFenced": true,
+    "repeatDoesNotApply": true,
+    "emptyOverlaySaved": true,
+    "reopenedManagerRestoresConfigurationOnly": true
+  },
+  "unverified": [
+    "public Loader/Entry/Group contracts",
+    "memory-root admission and recovery",
+    "Include flush and dynamic sources",
+    "installation transactions and production daemon coordinator",
+    "Electron and original Mgr page/business tasks",
+    "full application restart",
+    "Windows/Linux",
+    "default-ignored static preparation case",
+    "performance"
+  ]
+}

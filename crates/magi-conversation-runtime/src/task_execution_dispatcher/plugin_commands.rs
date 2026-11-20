@@ -127,4 +127,104 @@ impl LlmTaskDispatcher {
         };
         Some(run().unwrap_or_else(|error| TaskOutcome::Failed { error }))
     }
+
+    /// 当 `ctx.agentLoop` 显式选中非 `magi-native` 执行循环时接管主线 Turn。
+    /// 选中外部循环不可用或执行失败时直接返回 `TaskOutcome::Failed`，绝不静默回退到原生循环。
+    pub(super) fn execute_plugin_agent_loop(
+        &self,
+        input: &TaskInvocationInput<'_>,
+    ) -> Option<TaskOutcome> {
+        if input.is_sidechain || input.task.parent_task_id.is_some() {
+            return None;
+        }
+        let hooks = self.extension_hooks.as_ref()?;
+        if !hooks.has_selected_plugin_agent_loop() {
+            return None;
+        }
+        let turn_id = self.execution_registry.turn_id(&input.task.task_id)?;
+        let turn = self
+            .session_store
+            .canonical_turn_for_session_turn_id(input.session_id, &turn_id)?;
+        let prompt = turn
+            .items
+            .iter()
+            .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)
+            .and_then(|item| item.content.clone())
+            .unwrap_or_else(|| input.task.goal.clone());
+        let guard = TaskExecutionGuard::new(
+            self.pipeline.task_store.as_ref(),
+            &self.session_store,
+            &self.execution_registry,
+            input.session_id,
+            &input.task.task_id,
+            input.lease_id,
+        );
+        if !guard.is_active() {
+            return Some(TaskOutcome::Cancelled);
+        }
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancellation);
+        let hooks = Arc::clone(hooks);
+        let session_id_str = input.session_id.as_str().to_string();
+        let turn_id_str = turn_id.clone();
+        let task_id_str = input.task.task_id.as_str().to_string();
+        let worker = std::thread::spawn(move || {
+            let req = crate::extension_hooks::PluginAgentLoopRequest {
+                session_id: &session_id_str,
+                turn_id: &turn_id_str,
+                task_id: &task_id_str,
+                prompt: &prompt,
+            };
+            hooks.dispatch_agent_loop(&req, &worker_cancel)
+        });
+        while !worker.is_finished() {
+            if !guard.is_active() {
+                cancellation.store(true, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let outcome = match worker.join() {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                return Some(TaskOutcome::Failed {
+                    error: "插件执行循环线程异常退出".to_string(),
+                });
+            }
+        };
+        if !guard.is_active() {
+            return Some(TaskOutcome::Cancelled);
+        }
+        match outcome {
+            crate::extension_hooks::PluginAgentLoopOutcome::Native => None,
+            crate::extension_hooks::PluginAgentLoopOutcome::Failed { error } => {
+                Some(TaskOutcome::Failed { error })
+            }
+            crate::extension_hooks::PluginAgentLoopOutcome::Completed { output } => {
+                let visibility = crate::task_turn_visibility(
+                    input.task,
+                    false,
+                    input.worker_id,
+                    input.thread_id,
+                    &self.agent_role_registry,
+                );
+                Some(
+                    conversation_loop::complete_task_command(
+                        conversation_loop::TaskCommandCompletion {
+                            event_bus: &self.event_bus,
+                            session_store: &self.session_store,
+                            task_store: self.pipeline.task_store.as_ref(),
+                            task: input.task,
+                            session_id: input.session_id,
+                            workspace_id: input.workspace_id,
+                            visibility: &visibility,
+                            turn_id: &turn_id,
+                            persist: self.session_state_persist_callback.as_deref(),
+                            content: &output,
+                        },
+                    )
+                    .unwrap_or_else(|error| TaskOutcome::Failed { error }),
+                )
+            }
+        }
+    }
 }

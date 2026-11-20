@@ -65,8 +65,8 @@ Rust 摘要、压缩或语言解析依赖升级时，运行 `cargo test -p magi-
 | `npm run test:daemon-continuation` | 构建 Web 后，通过 `scripts/dev-daemon.sh` 启动独立 daemon、状态目录和本地 Provider；Chromium 验收用户主动停止、模型拒绝、工具不可用、已有部分输出后流式中断、自动重试中止及正常完成：核对 `continuation`、继续按钮、`resume=true`、错误卡片单一呈现、诊断默认折叠、复制失败就地反馈、两种显示模式下已有输出保留、重试等待可见、草稿和焦点保留、停止后无迟到重试、宽窄布局不溢出、普通主线不显示代理管理或阻塞弹窗；另覆盖停止后重载、重复点击、连续停止、被新输入取代的取消、多会话切换和 daemon 强杀重启。不接管用户进程、不使用真实模型，不是打包 Desktop 验收 |
 | `npm run test:daemon-input-queue` | 构建 Web 后，通过 `scripts/dev-daemon.sh` 启动独立 daemon、状态目录和本地 Provider；Chromium 访问 daemon 主入口，验收 task 补充、页面重载、下一轮队列消费、无重复用户消息，以及缺失 usage 时继续执行、实际用量统计和无预算的目标完成；同时覆盖 Web 显式转交原代理、停止父轮、下一轮主线、SIGKILL 重启后点击继续原代理及独立完成和详情展示，不接管用户进程、不使用真实模型。不是打包 Desktop 验收 |
 | `npm run test:electron-conversation-dom` | 已打包 Electron 与脚本提供的本地 HTTP Provider；验证 DOM、首轮接纳期间草稿保留、排队与会话归属、停止和继续、后台 Job 事件等待/持久终态/真实文件结果、重启恢复及时序。脚本按当前平台解析目录包、Shell 写入和进程树；应用路径、端口及场景通过 MAGI_ELECTRON_DOM_* 设置，见脚本头部。CI Windows 门禁会构建 `win-unpacked` 目录包并上传 JSON/日志证据 |
-| `npm run test:electron-plugins` | 已打包 Electron、独立状态根与本地 Provider；覆盖工作区侧栏导航；MCP 覆盖服务生命周期、完整工具目录、询问/开放模式、外部会话排序与审批、拒绝写入、变更账本、审计与内容留存、实际生成的 stdio 配置握手与文件读写、越界及错误令牌拒绝、HTTP 吊销。通过 MAGI_ELECTRON_PLUGINS_* 设置应用路径与端口 |
-| `cargo test -p magi-plugin-system --test catalog_tool` | 用 `scripts/plugin-center.mjs` 发布工具签名目录，再由 daemon 的 `PluginCatalog::verify` 校验；需要 Node.js，缺失时跳过 |
+| `npm run test:electron-plugins` | 已打包 Electron、独立状态根与本地 Provider；验收工作区侧栏展开、会话导航与草稿保留。通过 `MAGI_ELECTRON_PLUGINS_*` 设置应用路径与端口 |
+| `npm run test:electron-mcp-server` | 已打包 Electron、独立状态根与本地 Provider；验收原生 MCP 的客户端、网络访问与活动页，覆盖服务启停、HTTP/stdio 工具与取消、外部会话、审批、变更账本、审计、内容留存、令牌吊销和网络直连。需要本机非回环 IPv4。可用 `MAGI_ELECTRON_MCP_APP_EXECUTABLE`、`MAGI_ELECTRON_MCP_CDP_PORT`、`MAGI_ELECTRON_MCP_DAEMON_PORT` 与 `MAGI_ELECTRON_MCP_DIAGNOSTICS_DIR` 指定应用路径、端口和结果目录 |
 | `npm run test:electron-browser-permission-matrix` | 打包 macOS Apple Silicon Electron 的 Browser 权限代表场景；需本机图形环境及空闲 daemon/CDP 端口 |
 | `npm run test:electron-right-pane-links` | 已打包 Electron、全新状态根与本地 Provider；从右栏未挂载开始，验证链接点击展开、真实页面加载、同 URL 复用、会话绑定 激活时切换、关闭 Tab 和关闭会话后 Browser 资源结算 |
 
@@ -273,75 +273,32 @@ Job 的 read/wait/list 不触发工作区扫描、写锁或 worktree；等待不
 
 会话删除还要清除进程内提问等待注册表：`cargo test -p magi-api --lib delete_session` 包含真实持久提问夹具的删除回归，不能只核对 SessionStore 主记录已删除；`cargo test -p magi-conversation-runtime --lib user_question` 核对有 Task/无 Task 的等待方均断开、其他会话仍可正常答复。
 
-### 受信扩展宿主（部分实现）
+### DSH 原包插件
 
-宿主内核已有定向入口：`cargo test -p magi-extension-host`，包含帧、对端、熔断、重启退避的单元测试，以及与真实 Node 进程的端到端测试（握手令牌与版本拒绝、未声明钩子拒绝、guard 阻止/改写/超时取消/崩溃、advise 失败保留原生行为、observe 顺序与序号、监管重启与停机）。宿主内核之外，`cargo test -p magi-conversation-runtime --lib tool_hooks` 与 `extension_tool_call_hooks` 在真实对话循环里验证 `tool.call` 阻止/改写与 `tool.result` 投影，`cargo test -p magi-daemon --lib extension_bridge` 验证真实 Node 扩展经 ExtensionBus 与适配器到工具管线端口的完整链路。`cargo test -p magi-daemon --lib extension_runtime` 用真实 Node 包验证“激活 → 拉起 → 钩子生效 → 停用回收”、注册表事件驱动收敛、缺少 Node 时 guard fail-closed；`cargo test -p magi-plugin-system --test package` 覆盖 Node 扩展包的清单规则。纯会话 profile：`conversation_profile_applies_contributions_and_notifies_model_observers`（稳定贡献在前缀、易变贡献在当前输入之后的 RoundContext、模型观察钩子在 Step 提交后依次通知且不带提示词）与 `conversation_assembly_rewrites_history_records_it_and_keeps_the_tail`（历史改写、记录、尾部）。
+插件阶段、固定样本与验收口径见 [DSH 对齐设计](dsh-seam-alignment.md#10-推进阶段与退出条件)。开发版、目录包和跨进程机制的验证分别记录。
 
-提示贡献：`cargo test -p magi-conversation-runtime --lib extension_hooks`（接纳规则、全序与预算、身份随内容/包摘要变化）、`prompt_contributions_enter_the_prefix_once_and_the_tail_each_round_as_reference_data`（真实循环里稳定片段在前缀、易变片段在尾部 RoundContext、阶段不符/伪造标签/超大片段被丢弃）与 `cargo test -p magi-daemon --lib prompt_contributions`（真实 Node 扩展，片段带包摘要）。
+| 范围 | 入口 |
+| --- | --- |
+| 包完整性、来源接纳、共享宿主 IPC | `cargo test -p magi-plugin-system -p magi-extension-host --all-targets --locked` |
+| Cordis 加载、依赖、管理服务和调用生命周期 | `npm --prefix crates/magi-extension-host/runtime/dsh test` |
+| Mgr 原包跨进程管理与宿主监管 | `cargo test -p magi-daemon --locked --test plugin_management --test plugin_supervision --test plugin_web_gateway` |
+| HTTP 下载、原包图标和页面资源网关 | `cargo test -p magi-api --lib --locked routes::plugins` |
+| 列表结果、原包安装提交和设置交互 | `npm --prefix web run test:plugin-store` |
+| 本机 Electron 目录包 | `npm --prefix apps/desktop run package -- --dir` |
+| Mgr 固定原包安装、升级取消、原页面管理、配置冲突及崩溃和重启恢复 | `node scripts/verify-electron-dsh-management.mjs` |
+| Free Search 固定原包设置、配置冲突、联网、在途取消及崩溃和重启恢复 | `node scripts/verify-electron-free-search.mjs` |
+| WorkBuddy 固定原包在线模型、原设置、输出速度、在途取消与宿主恢复 | `MAGI_WORKBUDDY_STATS=1 node scripts/verify-electron-workbuddy.mjs` |
+| Ops 固定原包设置和知识保存 | `node scripts/verify-electron-dsh-ops.mjs` |
+| Message History 固定原包实时文本入库、停用隔离与重启恢复 | `node scripts/verify-electron-dsh-message-history.mjs` |
+| REA 固定原包设置、真实分析、在途取消及崩溃和重启恢复 | `MAGI_REA_BUSINESS=1 node scripts/verify-electron-dsh-rea.mjs` |
+| Better Sidebar 固定原包：右栏文件树与编辑、折叠保留、会话路由、重启读回 | `node scripts/verify-electron-dsh-better-sidebar.mjs` |
+| Notify 固定原包完成通知与取消不通知 | `node scripts/verify-electron-dsh-notify.mjs` |
+| 插件设置页交互（预览、确认安装、搜索失败与重试、窄屏） | `node scripts/verify-electron-plugin-interactions.mjs` |
+| 固定原包真实装载（REA、Free Search、Ops、WorkBuddy）；默认使用最近一次打包的 `Magi.app` 运行时，改动运行时后须先重新打包 | `cargo test -p magi-daemon --test plugin_phase1_samples` |
 
-改写钩子：`cargo test -p magi-conversation-runtime --lib extension_hooks`（可改写区域、授权、一次征询、拒绝时保留原生视图）、`extension_summary_replaces`/`custom_summary_that_fails`/`cancelled_compaction`（压缩前自定义摘要、门禁拒绝、取消）与 `cargo test -p magi-daemon --lib history_rewrite_hooks`（真实 Node 扩展的改写提案、授权开关、取消与自定义摘要，撤销授权后摘要被忽略）。
+上表里 `verify-electron-dsh-management.mjs` 经验收 registry gate 把目标包的 `latest` 固定到锁定版本（`pinLatest`），上游发版不会改变它的目标；最近一轮的逐项结果见[阶段 2 收尾验收](plugin-validation/phase-2/closeout-2026-11-20/README.md)。
 
-工具结果投影与摘要恢复：`cargo test -p magi-conversation-runtime --lib compaction_projects_tool_sources` 验证摘要来源遵循当前插件投影，插件变化后旧摘要失效；`cargo test -p magi-session-store --lib checkpoint_` 验证摘要提交和继承的快照一致性；`cargo test -p magi-session-store --lib thread_history_is_not_persisted` 验证线程不再序列化历史、旧消息字段不进入运行态及重启清退失效摘要；`cargo test -p magi-daemon --lib session_projection_restores_canonical_history_and_checkpoint` 验证 canonical 日志、工具投影指纹及有效摘要落盘后重启读取，并核对磁盘快照不包含重复的线程历史。
-
-缓存失效原因：`cargo test -p magi-conversation-runtime --lib extension_rewrites_are_attributed`（新增、追加、替换、撤销与未声明改写的归因，记录随 Step 持久化后读回一致）与 `history_projection` 下的扩展改写测试（授权、保护区、工具配对、纯函数重建一致）。
-
-运行状态进界面：`cargo test -p magi-daemon --lib extension_runtime`（状态映射、随生命周期变化并通知界面、缺少 Node 时可见为失败并列出被阻止的 guard）、`cargo test -p magi-api --lib plugin_list_merges`（列表与变更操作返回都合并运行状态且不另存）；**真实浏览器验收（macOS，内置浏览器，release 构建的 daemon + 固定版本 Node，隔离状态目录）已做**：经真实 API 安装、授权、激活一个声明 guard/advise/observe 与 `contextRewrite` 的扩展包；缺少 Node 时详情页显示“不可用”、原因与被阻止动作；随包 Node 就绪后重启 daemon 自动拉起并显示“运行中”；杀掉宿主进程后页面不刷新地依次显示“重启中（已崩溃 N 次）→启动中→运行中”，列表项警示标记同步出现/消失；连续崩溃超过阈值后显示“不可用”、停止自动重启与原因，点击“停用”后阻止提示消失，再“授权并激活”回到“运行中”；浅色、深色、375px 窄屏均无横向溢出且长文本换行。未覆盖：Windows/Linux、真实 Electron、真实对话里 guard 阻止工具调用的人工路径（由测试覆盖）。
-
-扩展工具：`cargo test -p magi-extension-host --test host tools`（真实 Node：绑定、输出、抛错作为工具失败、超时与调用方取消、取消后宿主可继续服务、未批准工具注册使激活失败）、`cargo test -p magi-daemon --lib extension_tools`（授权前目录为空、授权后可见、参数校验拒绝、工具失败回执、未知工具拒绝）、`cargo test -p magi-tool-runtime plugin_side_effect stopping_a_session`（与 MCP 相同的访问档位与审批续跑合同；停止会话取消运行中的插件工具调用）、`cargo test -p magi-plugin-system --test package extension_tools`（清单校验）。未覆盖：真实模型回合里的调用与真实停止按钮的端到端、Windows。
-
-用户命令：`cargo test -p magi-extension-host --test host tools`（含命令绑定、抛错、取消）、`cargo test -p magi-daemon --lib extension_commands`（真实 Node：执行、失败、未声明命令拒绝、停止取消）、`cargo test -p magi-api --lib plugin_commands`（命令只对已激活声明开放，不与其他控制输入混用）、`npm --prefix web run test:bridge`（命令身份经桥进入 Turn 并随队列回显）。未覆盖：真实 Electron 里的斜杠菜单与一轮完整命令、Windows。
-
-钩子接线：`cargo test -p magi-extension-host`（目录与已接线模式）、`cargo test -p magi-conversation-runtime --lib extension_hooks`（子代理 guard、改写重新校验）、`model_step_notifies_observers_after_commit_without_prompt_content`（模型观察）、`cargo test -p magi-daemon --lib extension_bridge`（真实 Node 扩展经 input/subagent.spawn guard 与领域事件转发的完整链路）、`cargo test -p magi-api --lib blocked_input_is_rejected`（被阻止的输入不留任何会话或 Turn 事实）。
-
-随包 Node：`node apps/desktop/scripts/node-runtime.mjs stage <目录>` 下载固定版本、校验归档摘要并在清空环境下执行校验；打包时 afterPack 对最终制品再做同样的执行校验（清单必须含该文件与版本）。以 `MAGI_EXTENSION_NODE` 指向该 Node 运行 `cargo test -p magi-extension-host --test host` 与 `cargo test -p magi-daemon --lib extension` 已在 macOS 通过；`input` 的 advise、`model.request` 的 advise 和 `subagent.spawn` 的 advise 仍按协议明确拒绝；macOS 以外平台未运行。
-
-[插件系统设计](plugin-system-requirements-design.md)第 12 节定义了完整的验收面。设置 `MAGI_PLUGIN_TEST_APP=<Magi.app 路径>` 可让它改为启动发行包内的 daemon，只使用随包 Node。`npm run test:local-plugins` 会启动独立状态目录的真实 daemon、构建并安装临时 Node 插件，覆盖预览、授权、input guard、资源/设置、模型/凭据/快照/blob/通知、直接文件/网络/进程、用户提问、无 Task 服务拒绝、作业调度、停用、升级数据重置和卸载，以及插件贡献主对话模型数据源（`modelSources` 授权预览、目录追加、主对话请求真实发往插件端点、撤销后会话明确失败且不回退）；它不接管已有 daemon。`npm run test:local-plugins-ui` 在同一纵向流程中再启动真实 Electron Chromium，覆盖设置页创建计划、目标会话／预算／回执展示和 390px 深色视口无横向溢出；它仍不是正式安装包验收。`test:electron-plugins` 仍只验收工作区导航与内置 MCP；Windows 运行验收按当前平台条件后置。协议层验收清单见[扩展协议 v1](extension-protocol-v1.md#13-一致性验收协议层)。
-
-`npm run test:electron-dsh-health` 与社区批次共用 `scripts/lib/dsh-health-acceptance.mjs` 的 Health 3.0.5 原包业务合同，使用 macOS 目录发行包、随包 Node 和独立状态根，在线安装固定版本 Health 与 Release Probe。验证诊断、修复预览／取消／确认、文件改变后的过期计划拒绝、真实文件隔离和恢复日志、停用来源展示与诊断交接、原页面显示偏好关闭／重开及持久化、原页面在线自更新和持久回执、应用重启及插件自身停用／重新启用。新实例以随机控制密钥变化及旧密钥 401 拒绝证明，不把每个 supervisor 内的崩溃 generation 当全局实例身份。`MAGI_DSH_HEALTH_OUTPUT` 指定证据目录，`MAGI_DSH_HEALTH_PORT`／`MAGI_DSH_HEALTH_CDP_PORT` 调整验收端口；`MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 可提供桌面技能的原始阴影审计函数。该脚本只验证列出的业务，不作为全部修复类型或生态覆盖率的证明。
-
-`npm run test:electron-dshmarket` 在线安装 **dshmarket 1.73.15**，由原市场页面发起自身更新，在指定包真实 registry 解析进行中打开任务面板并取消，核对 daemon 任务 cancelled、旧摘要／授权／实例保持。随后从原页面显式重试，按原包实际请求身份与 daemon 回执确定目标版本，不用独立 metadata 查询的移动 latest 冒充该次版本；记录 `updates.json`、`cancelled-job.json`、`updated-job.json` 及新版摘要。继续覆盖原页面重挂载、完整应用重启后版本及授权恢复、停用释放文档和重新激活的新实例，安装日志不能重放。通过 `MAGI_DSHMARKET_OUTPUT`、`MAGI_DSHMARKET_PORT`、`MAGI_DSHMARKET_CDP_PORT` 调整输出和端口。设置 `MAGI_PLUGIN_CLIP_AUDIT_SOURCE` 时保留原任务面板的阴影门槛，先完成业务终态再报告视觉失败，不能把部分业务通过当成完整界面验收。该脚本使用独立状态和目录包，不计入既有 9 个社区样本的覆盖率，也不覆盖市场全部管理能力。
-
-市场专项还在同一原包文档中检查 1280px 与 390px 的默认、任务展开、真实悬停及收起状态，保存 `*-layout.json`、截图和可选的 `*-clip.json`。检查原文档未重建、取消操作可达、收起后内容留白恢复，以及原包文档、外层设置滚动容器和主窗口都没有横向溢出；取消按钮通过真实鼠标事件执行。阴影检查保留完整原脚本及物理视口，不能只检查最外层页面的 `scrollWidth` 或靠隐藏滚动条通过。
-
-`npm run test:electron-free-search` 使用标准 macOS 目录包、随包 daemon／Node 和独立状态，在线安装 Free Search **0.9.41**，从原设置页保存 Bing 并取得真实引擎结果，再通过 WorkBuddy **5.21.2** 的当前在线模型完成两个新会话的原生搜索／抓取，核对 daemon 全局绑定、实际工具回执和模型终态。抓取对象为 Google 公网 HTTPS DNS JSON；直接公网地址用于避开本机 fake-IP 域名解析，原包 SSRF 校验保持原样。脚本还检查 **0.9.39** 原子模块 schema 失败在预览时拒绝并保留当前实例、全局停用恢复原生联网、重新激活及完整重启后的选择／授权／配置持久化。`MAGI_FREE_SEARCH_OUTPUT`、`MAGI_FREE_SEARCH_PORT`、`MAGI_FREE_SEARCH_CDP_PORT` 设置输出和端口；`MAGI_FREE_SEARCH_MODEL` 选择在线目录中的真实模型，默认 `deepseek-v4.1-flash`，目录稳定后才选用。版本可由 `MAGI_FREE_SEARCH_VERSION` 指定，但旧候选拒绝与实际设置合同仍须满足。该专项不计入既有 9 个社区分母，不涵盖全部引擎、HTML 抓取、取消或自身在线升级。
-
-`node scripts/compat/cli.mjs inspect <原包目录> --kind dsh --json` 默认与在线安装采用同一完整业务静态准入；`--require` 仅供分项诊断，不能据成功退出推导原包可安装或实际业务通过。`npm run test:compat` 同时覆盖默认 CLI／安装准备对同一必需能力的拒绝及超过 64 KiB 管道输出的完整性。静态检查不会执行原包，不能代替目录包验收。
-
-`test:electron-plugin-runtime` 的公共提示合同使用原有运行时夹具，注册超过八万字符、JSON 补丁超过 256 KiB 的业务指引，经真实 daemon 每轮贡献及插件模型桥核对最终模型请求、完整原文、来源角色和配置替换。`test:compat` 同时验证提示注册、排序、变量插值、撤销、取消、过期设置句柄与预算失败；Rust 接纳点按 Unicode 字符验证单片段及总预算。夹具不计入社区原包的完整业务覆盖率。
-
-`node scripts/verify-electron-genui.mjs` 当前验证原生 UI 边界，而非 GenUI 卡片支持：固定 GenUI 0.3.3 官方原包，安装前明确拒绝消息替换；同一 Electron 内用 WorkBuddy 5.21.2 / deepseek-v4.1-flash 在拒绝前后完成实际回复，核对原生详细／摘要展示、草稿、安装事实和完整重启。旧 GenUI 卡片通过记录为历史合同，不计当前支持。最新证据见[本轮交付](plugin-convergence-delivery.md#本轮边界修正2026-11-10)。
-
-页面文本输入使用同一 `test:electron-plugin-runtime` 夹具，通过原按钮等待真实 daemon 接纳与模型结果，并核对用户草稿保护、在途重复、显式相同身份重试、失效会话拒绝、同版重新启用和完整应用重启后的同身份显式重试。重启前后 canonical 记录按字段深度比较，忽略 JSON 对象字段顺序，保留完整前后快照；不忽略任何业务字段。`npm --prefix web run test:plugin-composer` 验证独立授权、派发前会话／页面／授权失效、在途互斥与真实原生回执观察；超时和失败等待保留 `unknown`，不假定未接纳。`cargo test -p magi-api --lib composer_admission` 及 `cargo test -p magi-plugin-system --test package composer_text` 验证两个授权目标互不继承、旧图片请求及当前摘要／视图边界。机制回归不等于 GenUI 聊天槽位或完整业务完成。
-
-`cargo test -p magi-extension-host` 包含真实 Node 的提示钩子反向读取回归：实例级配置与资源可读，模型、工具、任务和会话快照仍返回 `ReentryDenied`，拒绝请求不进入 daemon 业务服务。钩子关联身份不冒充业务租约；工具／命令的取消与过期租约回归继续由同一宿主测试覆盖。
-
-公共脚本容量由 `cargo test -p magi-plugin-system --test package` 验证浏览器／Node 模块的 16 MiB 上限、其他资源的 4 MiB 上限及展开总量；`test:compat` 复用原封装合同逐字核对超过 5 MiB 的独立模块。`test:electron-plugin-runtime` 的真实后台与页面脚本都超过 5 MiB，通过实际安装、资源字节、Chromium 页面动作及重启核对完整链路。页面业务调用仍只转换必要的回执等待；交付资源须与正式安装产物逐字一致，不能把业务转换当作字节损坏，也不能只检查接口状态码。
-
-原生资源合同由 `cargo test -p magi-api --lib routes::plugins::assets::tests` 核对 GET／HEAD、资源协商头、凭据隔离及进入业务前的容量拒绝。`test:electron-plugin-runtime` 另从实际目录包验证大 ESM 顶层 await 的业务完成、相对模块与 CSS 导入、img／picture 响应式候选、普通／xlink SVG image、206 原字节、304 空响应、脚本 503 的原生 error 事件及页面显式重试、HTTP 取消和实例换代。`MAGI_PLUGIN_RUNTIME_OUTPUT` 指定独立批次证据；可选 `MAGI_PLUGIN_ORIGINAL_RESOURCE` 和 `MAGI_PLUGIN_RESOURCE_ELEMENT` 让同一公共入口逐字交付一份留存的原包运行模块并核对其自定义元素注册，记录 SHA-256。该机制不代表原包已经安装、聊天槽位可用或完整业务通过。
-
-`npm run test:electron-plugin-runtime` 可设置 `MAGI_DSH_EXTERNAL_CLI=<真实 dsh 可执行文件路径>`，让在线安装的 Debugging 原包经真实模型工具调用和原生审批检查另一套独立 DSH 目录：外部 CLI 导出配置、执行 schema 检查及判断变更生效方式，Magi 安装状态保持不变。该可选分支需要本机已有的真实 DSH CLI，不提供替身命令；未设置时不计入对应业务证据。
-
-`npm run test:electron-dsh-profile` 与社区入口共用 `scripts/lib/dsh-manager-acceptance.mjs` 的完整原包管理合同。在线安装 Mgr 0.2.12，先通过其真实路由验证 `dsh add/remove` 的在线替换与卸载，再复用原生升级驱动预览、取消、确认及重新授权更新到固定 0.2.13；随后使用新版原页面完成目标插件启停、故障恢复、在线更新与真实回执、更新／卸载取消、390px 确认、应用重启和卸载。`MAGI_DSH_PROFILE_OUTPUT` 指定证据目录，端口使用 `MAGI_PROFILE_PORT`／`MAGI_PROFILE_CDP_PORT`。社区用 `MAGI_DSH_ACCEPTANCE_PACKAGES=dsh-plugin-mgr` 定向运行同一合同，记录初始与更新版本、摘要和 `manager-business.json`；只运行本包时固定分母仍为 9，整体门槛仍退出 1。旧版路由通过不代表其 Button 页面缺陷已修复；共享 registry gate 只使本次候选解析失败，核对先移除式更新恢复旧摘要、授权和真实运行，并显示恢复说明；在旧版已移除且候选未提交时终止本次应用的 daemon，核对真实翻译进程退出、重启恢复原安装、不重放准备以及原页面显式重试。只验证列出的中断位置，不作为全部掉电阶段或外部副作用可回滚的证明。`test:compat` 另以延迟目录读取验证命令终止后零安装／移除，以及同请求的显式重试。
-
-`MAGI_DSH_OPS_CHAT=1 npm run test:electron-dsh-compatibility` 单独检验 Ops **0.20.8** 原页面诊断对话：在线安装 WorkBuddy **5.21.2**，使用本机已有的 WorkBuddy 登录态，在真实在线目录稳定后固定 **deepseek-v4.1-flash**，完成原生回复并保留模型步骤，再用 Ops 原输入框发送诊断问题、通过原按钮沉淀知识。回执须同时满足实际 HTTP 成功、`ok:true`、非空答复和原页面显示同一答复；原生用户会话的 canonical Turn 必须保持原样。还验证页面请求取消、插件用量独立归属、知识和账本的完整应用重启恢复、不重放／不重复计数、统计两种视角与重置后的恢复。原页面请求仅旁观记录，不替换响应或原包业务；不把原包扫描结论是否准确作为翻译器正确性的证明。输出使用 `MAGI_DSH_COMPATIBILITY_OUTPUT`，包含实际模型目录、`native-model-turn.json`、`ops-chat-receipt.json`、知识、插件账本、统计及原页面截图。该分支失败时保留失败，不运行管理分支补成通过；未设置时仍执行既有安装、原生授权恢复、启停、豁免及重启验收。
-
-`test:electron-dsh-management` 另验证 Share 原页面保存 SVG／PNG 二维码、取消下载后重新保存，并将落盘 PNG 交回原包识别；`test:electron-dsh-health` 验证原页面导出的 JSON 包含真实安装身份。下载观测器只连接脚本自有 Main inspector，核对进程身份后为该 App session 设置本次文件保存位置或取消下载，读取 Electron 的实际终态与落盘字节；不替换原包导出代码、不使用默认 CDP context 的状态冒充 App session 下载成功。脚本的 inspector 端口为各自 CDP 端口加一，需保持空闲；产品运行不启用 inspector。
-
-`test:electron-dsh-management` 与 `npm run test:electron-popular-dsh` 共用 `scripts/lib/dsh-upgrader-acceptance.mjs` 的 Upgrader 原包业务合同，先在线安装 **1.7.5**，在原页面保存实际配置，再由 Magi 原生在线入口预览 **1.8.0**、取消、重新预览、确认及授权，核对摘要、实例和配置后执行新版完整业务；覆盖配置保存、原页面在线升级、并发拒绝、关页／重开、取消、停用／重新启用、版本切换、失败保留、归档写入失败恢复、显式重试及应用重启；原包可用主按钮还需通过八种外观的默认及真实悬停对比度检查。证据为各自输出目录的 `upgrader-business.json`、`upgrader-button-contrast.json` 与截图；管理专项使用 `MAGI_DSH_MANAGEMENT_OUTPUT`，社区批次使用 `MAGI_DSH_ACCEPTANCE_OUTPUT`。registry gate 只暂停本次独立 daemon 的指定包解析，不替换原包、安装回执或业务结果。社区批次仍固定 9 个样本，只有整个合同通过才计入对应业务覆盖；可用 `MAGI_DSH_ACCEPTANCE_PACKAGES` 选择样本排错，但筛选不会缩小完整门槛的分母，未验证项使脚本退出 1。
-
-社区批次在停用／卸载实际打开右栏的原包时，另核对插件页签及隔离文档释放，重新打开原生启动页并继续操作，保存 `*-panel-deactivated.png` 与每个样本的 `panelLifecycle`。所有页面异常仍进入完整批次的失败门槛；该分项只证明面板生命周期，不将样本的核心业务改计为通过。公共运行时验收继续验证多页签切换保留同一原包文档、关闭／重开、停用、重新启用及应用重启。
-
-`test:compat` 和标准发行构建同时核对随包官方 UI 模块所引用的公共颜色语义是否在 `runtime/client/theme.mjs` 中有映射；未知 alias 使浏览器宿主构建失败。`test:electron-plugin-runtime` 再在真实官方组件中验证选中 Pill、Diff 增删行和连接反馈的颜色及文字对比度，不以源码中有变量名代替真实渲染。
-
-实现该能力时必须新增并在本文登记的验证面：
-
-- 两平台（macOS、Windows）无开发工具的干净安装版：安装、启用、诊断、取消、停用、升级，以及随包 Node 版本与宿主版本匹配；
-- 钩子模式：guard 在异常、超时、熔断、宿主缺失时阻止受影响动作，advise 失败保留原生行为并提示，模式变更触发重新授权；
-- 提案与裁决：工具入参被改写后在账本、路径与并发规划、权限和审批之前生效，用户批准的是最终内容，`deny` 不被翻转；
-- 取消与故障：任务取消传播到扩展调用，迟到响应按实例代次拒绝，宿主崩溃只影响该插件；
-- 升级与恢复：dataSchemaVersion 变化时预览明确 dataReset；只清空当前插件数据，提交失败保留恢复日志且关闭准入，不恢复迁移 VM；
-- 缓存：`extension_rewrite` 归因、拒绝路径与重启重建一致（见[缓存架构](prompt-cache-lineage-architecture.md)）；
-- 翻译（后期，不属于当前验收）：pi／DSH 固定版本的一致性报告，不支持的 API 在构建期失败，报告分母为固定样本与必需断言。
+目录包业务使用独立状态根。原包安装和宿主重启后，核对当前实例以及旧页面资源请求失效。构建、固定样本结果与依赖锁见[阶段 1 业务验收](plugin-validation/phase-1/closeout-2026-11-19/README.md)及[旧路径清退记录](plugin-validation/phase-1/retirement-2026-11-18/README.md)。
 
 ### Executor 能力与历史恢复
 

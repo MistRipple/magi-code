@@ -7,21 +7,15 @@
   import { activateAppearanceTheme } from '../../appearance/client';
   import { openExternalUrl } from '../../lib/external-link';
   import { pluginProjection } from '../../stores/plugin-registry.svelte';
-  import { rightPaneState, openPluginTab } from '../../stores/right-pane.svelte';
+  import { rightPaneState, getRightPaneState, openPluginTab, setActiveRightPaneTab, closeTab, type PluginTabPayload } from '../../stores/right-pane.svelte';
+  import type { PluginPaneTab } from '../../lib/plugin-client-mount';
+  import { closeSettings, openSettings } from '../../stores/shell-ui.svelte';
   import {
     callPluginRoute,
-    describePluginSettings,
-    readPluginResource,
-    readPluginSettings,
-    subscribePluginResource,
-    writePluginResource,
-    writePluginSettings,
+    installUpstreamPlugin,
+    previewUpstreamPlugin,
+    reportPluginClientSlots,
   } from '../../web/plugin-api';
-  import { createPluginComposerBridge } from '../../lib/plugin-composer-bridge';
-  import { subscribePluginComposer } from '../../lib/plugin-composer';
-  import { admitPluginComposer, admitPluginView } from '../../web/plugin-api';
-  import type { PluginConversationViewContext } from '../../shared/app-server-protocol.generated';
-
   interface Props {
     pluginId: string;
     entry: string;
@@ -32,13 +26,14 @@
      * 视图所处的位置。`settings` 嵌入设置页的整页滚动：高度由页面经 `view.resize` 上报，
      * 底色取设置页主区域的实际底色；其他位置由宿主给定固定尺寸，页面自己滚动。
      */
-    placement?: 'settings' | 'page' | 'background' | 'chatAssistant';
+    placement?: 'settings' | 'page' | 'rightPane' | 'background';
     viewEntry?: string | null;
-    conversation?: PluginConversationViewContext;
+    sessionId?: string;
+    paneTab?: PluginPaneTab;
+    registerClose?: (close: () => Promise<void>) => () => void;
   }
 
-  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page', viewEntry = entry, conversation }: Props = $props();
-  const inline = $derived(placement === 'chatAssistant');
+  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page', viewEntry = entry, sessionId, paneTab, registerClose }: Props = $props();
   /** 页面上报的内容高度（CSS 像素）；只在 settings 位置生效，重新加载后清空。 */
   let reportedHeight = $state<number | null>(null);
   let settingsInsets = $state({ left: 0, right: 0 });
@@ -47,7 +42,7 @@
   let iframe = $state<HTMLIFrameElement | null>(null);
   let instanceId = crypto.randomUUID();
   let destroyed = false;
-  /** 与 daemon 资源快照上限一致：更大的写入在到达消息桥之前就拒绝。 */
+  /** 插件界面缓存的大小上限。 */
   const MAX_WRITE_BYTES = 4 * 1024 * 1024;
   const installed = $derived(pluginProjection().installed.find((item) => item.manifest.id === pluginId));
   const runtime = $derived(installed?.runtime);
@@ -55,12 +50,13 @@
   const waiting = $derived((!installed && !pluginProjection().loaded) || Boolean(installed?.enabled && (!runtime || runtime.state === 'starting' || runtime.state === 'restarting')));
   const runtimeState = $derived(installed?.enabled ? runtime?.state ?? 'starting' : 'notRunning');
   const resourceDigest = $derived(installed?.digest ?? '');
+  const resourceRoot = $derived(resourceDigest
+    ? `ui-v/${resourceDigest}${runtime?.instanceId ? `/instance/${encodeURIComponent(runtime.instanceId)}` : ''}`
+    : 'ui');
   // 监管可能合并中间状态；即使只看到 running → running，新运行代次也必须创建新文档。
-  // 会话不属于文档身份：消息附加视图在切换会话时保持同一个 iframe，只通过 `conversation` 消息
-  // 下发新会话（带 contextRevision，旧回执不能覆盖新会话）；会话相关的提交由 InputArea 在派发前核对当前会话。
   const documentIdentity = $derived(JSON.stringify([pluginId, entry, resourceDigest, ready, runtime?.instanceId]));
   const resourceUrl = $derived(
-    agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/${resourceDigest ? `ui-v/${resourceDigest}` : 'ui'}/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
+    agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/${resourceRoot}/${entry.replace(/^ui\//, '').split('/').map(encodeURIComponent).join('/')}`),
   );
   const resourceOrigin = $derived(new URL(resourceUrl, window.location.href).origin);
 
@@ -122,13 +118,51 @@
   }
 
   function currentViewId(): string | null {
+    if (paneTab) return paneTab.viewId;
     return pluginProjection().manifests.find(item => item.id === pluginId)?.contributions.views?.find(view => view.entry === viewEntry)?.id ?? null;
+  }
+
+  let viewportObserver: ResizeObserver | undefined;
+  let observedParent: Element | null = null;
+  let observedFrame: Element | null = null;
+
+  function disconnectViewportObserver(): void {
+    viewportObserver?.disconnect();
+    viewportObserver = undefined;
+    observedParent = null;
+    observedFrame = null;
+  }
+
+  function ensureSettingsViewportObserver(): void {
+    if (placement !== 'settings' || !iframe?.parentElement) {
+      disconnectViewportObserver();
+      return;
+    }
+    const parent = iframe.parentElement;
+    const frame = iframe.closest('.settings-frame');
+    if (viewportObserver && observedParent === parent && observedFrame === frame) return;
+    disconnectViewportObserver();
+    observedParent = parent;
+    observedFrame = frame;
+    viewportObserver = new ResizeObserver(sendHostContext);
+    viewportObserver.observe(parent);
+    if (frame && frame !== parent) viewportObserver.observe(frame);
   }
 
   function sendHostContext(): void {
     if (destroyed || placement === 'settings' && !iframe?.getClientRects().length) return;
-    send({ type: 'context', placement, viewId: currentViewId(), locale: i18n.locale, theme: readTheme(), ...hostViewport() });
-    void sendConversationContext();
+    if (placement === 'settings') ensureSettingsViewportObserver();
+    else disconnectViewportObserver();
+    send({
+      type: 'context',
+      placement,
+      sessionId,
+      paneTab,
+      viewId: currentViewId(),
+      locale: i18n.locale,
+      theme: readTheme(),
+      ...hostViewport(),
+    });
   }
   function hostViewport() {
     if (placement === 'settings' && iframe) {
@@ -141,19 +175,6 @@
     }
     if (settingsInsets.left || settingsInsets.right) settingsInsets = { left: 0, right: 0 };
     return {};
-  }
-  let viewportObserver: ResizeObserver | undefined;
-
-  let contextRevision = 0;
-  async function sendConversationContext(): Promise<void> {
-    if (!inline || !conversation || !documentDigest) return;
-    const revision = ++contextRevision, expectedInstance = instanceId, context = conversation;
-    try {
-      await admitPluginView(pluginId, { expectedDigest: documentDigest, entry: documentEntry, placement: 'chatAssistant' });
-      if (revision === contextRevision) send({ type: 'conversation', context }, expectedInstance);
-    } catch {
-      if (revision === contextRevision) send({ type: 'conversation', context: null }, expectedInstance);
-    }
   }
 
   function send(message: Record<string, unknown>, expectedInstance = instanceId): void {
@@ -169,96 +190,191 @@
     }, '*');
   }
 
-  const activeResourceSubscriptions = new Map<string, () => void>();
-  const STREAM_ROUTE = '/__magi_compat/streams';
-  const activeStreams = new Map<string, string>();
   let documentDigest = '';
   let documentRuntimeId: string | undefined;
-  let documentEntry = '';
   let navigationIdentity = '';
-  let composerSubscribed = false;
-  let composerTarget: 'images' | 'text' = 'images';
-  let composerBridge = makeComposerBridge();
-  function makeComposerBridge() {
-    const expectedInstance = instanceId;
-    return createPluginComposerBridge(async (target) => {
-      if (!documentDigest) throw new Error('插件页面缺少安装摘要');
-      await admitPluginComposer(pluginId, { expectedDigest: documentDigest, entry: documentEntry, target });
-    }, () => instanceId === expectedInstance, pluginId);
-  }
-  function sendComposerSnapshot(): void {
-    if (destroyed || !composerSubscribed) return;
-    const expectedInstance = instanceId;
-    void composerBridge.call('composer.snapshot', { target: composerTarget }).then((snapshot) => {
-      send({ type: 'composer', snapshot }, expectedInstance);
-    }).catch(() => {
-      if (expectedInstance !== instanceId) return;
-      composerSubscribed = false;
-      send({ type: 'composer', snapshot: { sessionId: null, attachmentIds: [], writable: false } }, expectedInstance);
-    });
-  }
+  let routedSessionId: string | undefined;
   const routeControllers = new Map<string, AbortController>();
+  const muxSockets = new Map<string, WebSocket>();
+  const MAX_MUX_SOCKETS = 8;
+  let closeReady: (() => void) | undefined;
+  let closing: Promise<void> | undefined;
 
-  function releaseRoutes(): void {
+  function prepareClose(): Promise<void> {
+    if (!iframe?.contentWindow || !documentRuntimeId) return Promise.resolve();
+    if (!closing) {
+      closing = new Promise<void>(resolve => {
+        const timeout = window.setTimeout(() => closeReady?.(), 500);
+        closeReady = () => {
+          window.clearTimeout(timeout);
+          closeReady = undefined;
+          resolve();
+        };
+        send({ type: 'prepareClose' });
+      }).finally(() => { closing = undefined; });
+    }
+    return closing;
+  }
+
+  function abortRouteCalls(): void {
     for (const controller of routeControllers.values()) controller.abort();
     routeControllers.clear();
-    for (const [id, owner] of activeStreams) {
-      void callPluginRoute(owner, { method: 'POST', path: STREAM_ROUTE, body: { action: 'close', id }, expectedDigest: documentDigest, expectedInstanceId: documentRuntimeId }).catch(() => {});
+  }
+
+  function releaseRoutes(): void {
+    abortRouteCalls();
+    for (const socket of muxSockets.values()) {
+      try { socket.close(1000, 'frame released'); } catch { /* ignore */ }
     }
-    activeStreams.clear();
-    // 迟到 open 回执也不属于下一份文档；收到后会走相同 close 入口。
+    muxSockets.clear();
     instanceId = crypto.randomUUID();
-    composerSubscribed = false;
-    composerBridge = makeComposerBridge();
-  }
-
-
-  function releaseResourceSubscriptions(): void {
-    for (const unsubscribe of activeResourceSubscriptions.values()) unsubscribe();
-    activeResourceSubscriptions.clear();
-  }
-
-  function handleResourceSubscriptionRequest(requestId: string, resourceId: string): void {
-    const expectedInstance = instanceId;
-    if (activeResourceSubscriptions.has(resourceId)) {
-      send({ type: 'response', requestId, ok: true });
-      return;
-    }
-    const unsubscribe = subscribePluginResource(
-      pluginId,
-      resourceId,
-      (resource) => {
-        send({ type: 'event', resourceId, resource }, expectedInstance);
-      },
-      () => {
-        // 订阅失败或被 daemon 结束（停用、撤权、升级）：释放句柄，视图可在恢复后重新订阅。
-        if (expectedInstance !== instanceId) return;
-        activeResourceSubscriptions.get(resourceId)?.();
-        activeResourceSubscriptions.delete(resourceId);
-        send({ type: 'event', resourceId, error: 'subscription_failed' });
-      },
-    );
-    activeResourceSubscriptions.set(resourceId, unsubscribe);
-    send({ type: 'response', requestId, ok: true });
   }
 
   async function handleMessage(event: MessageEvent): Promise<void> {
     if (destroyed || (event.origin !== resourceOrigin && event.origin !== 'null')
       || event.source !== iframe?.contentWindow || !event.data || event.data.channel !== 'magi-plugin-v1'
       || event.data.instanceId !== instanceId) return;
+    const expectedInstance = instanceId;
+    if (event.data.type === 'ws.open') {
+      const socketId = typeof event.data.socketId === 'string' ? event.data.socketId : '';
+      const path = typeof event.data.path === 'string' ? event.data.path : '';
+      if (!socketId || muxSockets.has(socketId) || muxSockets.size >= MAX_MUX_SOCKETS || path !== '/api/remote.mux') {
+        if (socketId) {
+          send({ type: 'ws.error', socketId }, expectedInstance);
+          send({ type: 'ws.close', socketId, code: 1008, reason: 'invalid mux request' }, expectedInstance);
+        }
+        return;
+      }
+      const params = new URLSearchParams();
+      if (documentDigest) params.set('expectedDigest', documentDigest);
+      if (documentRuntimeId) params.set('expectedInstanceId', documentRuntimeId);
+      const wsUrl = new URL(
+        agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/mux${params.size ? `?${params.toString()}` : ''}`),
+        window.location.href,
+      );
+      wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(wsUrl.href);
+      } catch {
+        send({ type: 'ws.error', socketId }, expectedInstance);
+        send({ type: 'ws.close', socketId, code: 1006, reason: 'websocket unavailable' }, expectedInstance);
+        return;
+      }
+      muxSockets.set(socketId, ws);
+      ws.addEventListener('open', () => {
+        if (muxSockets.get(socketId) !== ws) return;
+        send({ type: 'ws.open', socketId }, expectedInstance);
+      });
+      ws.addEventListener('message', ev => {
+        if (muxSockets.get(socketId) !== ws) return;
+        if (typeof ev.data === 'string') {
+          send({ type: 'ws.message', socketId, data: ev.data }, expectedInstance);
+        }
+      });
+      ws.addEventListener('error', () => {
+        if (muxSockets.get(socketId) !== ws) return;
+        send({ type: 'ws.error', socketId }, expectedInstance);
+      });
+      ws.addEventListener('close', ev => {
+        if (muxSockets.get(socketId) === ws) muxSockets.delete(socketId);
+        send({ type: 'ws.close', socketId, code: ev.code, reason: ev.reason }, expectedInstance);
+      });
+      return;
+    }
+    if (event.data.type === 'ws.send') {
+      const socketId = typeof event.data.socketId === 'string' ? event.data.socketId : '';
+      const ws = muxSockets.get(socketId);
+      if (ws && ws.readyState === WebSocket.OPEN && typeof event.data.data === 'string'
+        && event.data.data.length <= MAX_WRITE_BYTES) {
+        ws.send(event.data.data);
+      }
+      return;
+    }
+    if (event.data.type === 'ws.close') {
+      const socketId = typeof event.data.socketId === 'string' ? event.data.socketId : '';
+      const ws = muxSockets.get(socketId);
+      if (ws) {
+        muxSockets.delete(socketId);
+        const code = typeof event.data.code === 'number' ? event.data.code : undefined;
+        const reason = typeof event.data.reason === 'string' ? event.data.reason : undefined;
+        try { ws.close(code, reason); } catch { /* ignore */ }
+      }
+      return;
+    }
     const requestId = typeof event.data.requestId === 'string' ? event.data.requestId : '';
     if (event.data.type === 'cancel') {
       routeControllers.get(requestId)?.abort();
       return;
     }
+    if (event.data.type === 'closeReady') {
+      closeReady?.();
+      return;
+    }
     if (event.data.type !== 'request') return;
     const callingPluginId = pluginId;
-    const expectedInstance = instanceId;
     const callingDigest = documentDigest;
     const callingRuntimeId = documentRuntimeId;
     const operation = event.data.operation;
-    if (!requestId || !['resource.read', 'resource.write', 'resource.subscribe', 'settings.read', 'settings.write', 'settings.describe', 'route.call', 'host.openExternal', 'host.theme.set', 'clipboard.write', 'view.resize', 'view.open', 'view.storage.read', 'view.storage.write', 'composer.snapshot', 'composer.addImages', 'composer.removeImage', 'composer.notify', 'composer.focus', 'composer.submitText'].includes(operation)) return;
+    if (!requestId || ![
+      'route.call', 'host.openExternal', 'host.theme.set', 'clipboard.write',
+      'view.resize', 'view.open', 'view.close', 'view.focus', 'view.storage.read', 'view.storage.write',
+      'slots.report', 'settings.close', 'plugins.install', 'plugins.update', 'plugins.openPackage',
+    ].includes(operation)) return;
     try {
+      if (operation === 'slots.report') {
+        if (paneTab) throw new Error('右栏页面不负责发布插件贡献');
+        const toStrArray = (val: unknown): string[] =>
+          Array.isArray(val) ? val.filter((v): v is string => typeof v === 'string') : [];
+        await reportPluginClientSlots(callingPluginId, {
+          ...(callingRuntimeId ? { instanceId: callingRuntimeId } : {}),
+          mountedSlots: toStrArray(event.data.mountedSlots),
+          unmountedSlots: toStrArray(event.data.unmountedSlots),
+          hasSettingsView: Boolean(event.data.hasSettingsView),
+          mainKeys: toStrArray(event.data.mainKeys),
+          ...(Array.isArray(event.data.rightPaneTabs) ? { rightPaneTabs: event.data.rightPaneTabs } : {}),
+        });
+        send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
+        return;
+      }
+      if (operation === 'settings.close') {
+        closeSettings();
+        send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
+        return;
+      }
+      if (operation === 'plugins.openPackage') {
+        if (typeof event.data.packageName === 'string' && event.data.packageName.trim()) {
+          openSettings('plugins', event.data.packageName.trim());
+        }
+        send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
+        return;
+      }
+      if (operation === 'plugins.install' || operation === 'plugins.update') {
+        let pkg = '';
+        let ver: string | undefined;
+        if (operation === 'plugins.update') {
+          pkg = typeof event.data.packageName === 'string' ? event.data.packageName.trim() : '';
+          ver = typeof event.data.version === 'string' && event.data.version.trim() ? event.data.version.trim() : undefined;
+        } else if (typeof event.data.spec === 'string') {
+          const raw = event.data.spec.trim();
+          const atIdx = raw.lastIndexOf('@');
+          if (atIdx > 0) {
+            pkg = raw.slice(0, atIdx);
+            ver = raw.slice(atIdx + 1) || undefined;
+          } else {
+            pkg = raw;
+          }
+        } else if (event.data.spec && typeof event.data.spec === 'object') {
+          const specObj = event.data.spec as { package?: unknown; name?: unknown; version?: unknown };
+          pkg = typeof specObj.package === 'string' ? specObj.package.trim() : typeof specObj.name === 'string' ? specObj.name.trim() : '';
+          ver = typeof specObj.version === 'string' && specObj.version.trim() ? specObj.version.trim() : undefined;
+        }
+        if (!pkg) throw new Error('缺少插件包名');
+        const preview = await previewUpstreamPlugin({ ecosystem: 'dsh', package: pkg, ...(ver ? { version: ver } : {}) });
+        await installUpstreamPlugin(preview, 'dsh');
+        send({ type: 'response', requestId, ok: true, result: { ok: true, package: preview.package, version: preview.version } }, expectedInstance);
+        return;
+      }
       if (operation === 'host.theme.set') {
         const { library } = getAppearanceRuntimeSnapshot();
         if (typeof event.data.themeId !== 'string' || !library?.themes.some(record => record.pack.id === event.data.themeId)
@@ -295,47 +411,46 @@
         return;
       }
       if (operation === 'view.open') {
+        if (!paneTab?.visible || paneTab.sessionId !== rightPaneState.activeSessionId
+          || documentRuntimeId !== runtime?.instanceId || !ready) throw new Error('右栏视图已失效');
         const manifest = pluginProjection().manifests.find((item) => item.id === pluginId);
         const view = manifest?.contributions.views?.find((item) => item.id === event.data.viewId && item.placements.includes('rightPane'));
         if (!view) throw new Error('插件未提供此右栏视图或已停用');
-        const id = openPluginTab({ pluginId, contributionId: view.id, entry: view.entry, label: view.title,
-          workspaceId: rightPaneState.activeWorkspaceId, sessionId: rightPaneState.activeSessionId });
+        const address: unknown = event.data.address;
+        if (typeof address !== 'string' || address.length > 8192 || !(
+          address === ''
+          || address.startsWith(`dsh-resource://file/session/${encodeURIComponent(paneTab.sessionId)}/`)
+        )) throw new Error('此资源不属于当前右栏会话');
+        const params: unknown = event.data.params;
+        if (params !== undefined && (JSON.stringify(params)?.length ?? Infinity) > 16 * 1024) throw new Error('插件导航参数无效');
+        const title = typeof event.data.title === 'string' ? event.data.title.trim().slice(0, 128) : '';
+        const id = openPluginTab({ pluginId, contributionId: view.id, entry: view.entry, label: title || view.title,
+          workspaceId: rightPaneState.activeWorkspaceId, sessionId: paneTab.sessionId, address, params });
         if (!id) throw new Error('当前没有可打开右栏的会话');
         send({ type: 'response', requestId, ok: true, result: id }, expectedInstance);
         return;
       }
-      if (operation.startsWith('composer.')) {
-        const result = await composerBridge.call(operation, event.data);
-        if (expectedInstance !== instanceId) return;
-        if (operation === 'composer.snapshot') {
-          composerSubscribed = true;
-          composerTarget = event.data.target === 'text' ? 'text' : 'images';
+      if (operation === 'view.close' || operation === 'view.focus') {
+        if (!paneTab?.visible || paneTab.sessionId !== rightPaneState.activeSessionId
+          || documentRuntimeId !== runtime?.instanceId || !ready) throw new Error('右栏视图已失效');
+        const scope = rightPaneState.activeScopeKey;
+        const tab = getRightPaneState(scope).openTabs.find(item => item.id === event.data.tabId
+          && item.kind === 'plugin' && (item.payload as PluginTabPayload).pluginId === pluginId);
+        if (!tab) throw new Error('此标签页不属于当前插件');
+        if (operation === 'view.close') {
+          if (tab.id !== paneTab.id) throw new Error('请从右栏关闭该标签页');
+          await prepareClose();
+          if (!destroyed && expectedInstance === instanceId) closeTab(scope, tab.id);
+        } else {
+          setActiveRightPaneTab(scope, tab.id);
         }
-        send({ type: 'response', requestId, ok: true, result }, expectedInstance);
-        sendComposerSnapshot();
-        return;
-      }
-      const resourceId = typeof event.data.resourceId === 'string' ? event.data.resourceId : '';
-      if (operation.startsWith('resource.') && (!resourceId || resourceId.length > 256)) {
-        throw new Error('插件资源标识无效');
-      }
-      if (operation.endsWith('.write') && JSON.stringify(event.data.value ?? null).length > MAX_WRITE_BYTES) {
-        throw new Error('插件写入内容超过大小上限');
-      }
-      if (operation === 'resource.subscribe') {
-        handleResourceSubscriptionRequest(requestId, resourceId);
+        send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
         return;
       }
       if (operation === 'route.call') {
         // 路径形态由 daemon 的协议校验把关；这里只限制体积，避免页面把大块内容塞进消息桥。
         if (new TextEncoder().encode(JSON.stringify(event.data)).length > 3 * 1024 * 1024 + 64 * 1024) {
           throw new Error('插件写入内容超过大小上限');
-        }
-        const stream = event.data.path === STREAM_ROUTE ? event.data.body : undefined;
-        if (event.data.path === STREAM_ROUTE) {
-          if (!stream || !['open', 'read', 'close'].includes(stream.action) || event.data.method !== 'POST') throw new Error('插件事件请求无效');
-          if (stream.action !== 'open' && !activeStreams.has(stream.id)) throw new Error('事件连接不属于当前视图');
-          if (stream.action === 'open' && activeStreams.size >= 8) throw new Error('插件事件连接超过上限');
         }
         const controller = new AbortController();
         if (routeControllers.has(requestId)) return;
@@ -346,21 +461,13 @@
           path: event.data.path,
           expectedDigest: callingDigest,
           expectedInstanceId: callingRuntimeId,
+          ...(sessionId ? { sessionId } : {}),
           ...(typeof event.data.query === 'string' ? { query: event.data.query } : {}),
           ...(event.data.headers === undefined ? {} : { headers: event.data.headers }),
           ...(event.data.body === undefined ? {} : { body: event.data.body }),
           ...(event.data.bodyBase64 === undefined ? {} : { bodyBase64: event.data.bodyBase64 }),
         }, controller.signal); }
         finally { if (routeControllers.get(requestId) === controller) routeControllers.delete(requestId); }
-        if (stream?.action === 'open' && routed.status === 200 && typeof (routed.body as { id?: unknown })?.id === 'string') {
-          const id = (routed.body as { id: string }).id;
-          if (expectedInstance !== instanceId || controller.signal.aborted) {
-            void callPluginRoute(callingPluginId, { method: 'POST', path: STREAM_ROUTE, body: { action: 'close', id }, expectedDigest: callingDigest, expectedInstanceId: callingRuntimeId }).catch(() => {});
-            return;
-          }
-          activeStreams.set(id, callingPluginId);
-        }
-        if (stream?.action === 'close') activeStreams.delete(stream.id);
         send({ type: 'response', requestId, ok: true, result: routed }, expectedInstance);
         return;
       }
@@ -390,33 +497,14 @@
         send({ type: 'response', requestId, ok: true, result: null }, expectedInstance);
         return;
       }
-      const result = operation === 'resource.read'
-        ? await readPluginResource(pluginId, resourceId)
-        : operation === 'resource.write'
-          ? await writePluginResource(
-            pluginId,
-            resourceId,
-                  typeof event.data.expectedVersion === 'number' ? event.data.expectedVersion : -1,
-            event.data.value,
-          )
-          : operation === 'settings.describe'
-            ? await describePluginSettings(pluginId)
-          : operation === 'settings.read'
-            ? await readPluginSettings(pluginId)
-            : await writePluginSettings(
-              pluginId,
-                      typeof event.data.expectedVersion === 'number' ? event.data.expectedVersion : -1,
-              event.data.value,
-            );
-      send({ type: 'response', requestId, ok: true, result }, expectedInstance);
     } catch (error) {
       send({ type: 'response', requestId, ok: false, error: error instanceof Error ? error.message : String(error) }, expectedInstance);
     }
   }
 
   onMount(() => {
+    const unregisterClose = registerClose?.(prepareClose);
     window.addEventListener('message', handleMessage);
-    const unsubscribeComposer = subscribePluginComposer(sendComposerSnapshot);
     // 主题或语言变化时重新下发；订阅在挂载时立即回调一次，页面尚未初始化时 send 会被忽略，init 后再补一次。
     const unsubscribeAppearance = subscribeAppearanceRuntime(() => {
       // 变量应用到根元素之后再读取。
@@ -424,19 +512,26 @@
     });
     return () => {
       destroyed = true;
-      viewportObserver?.disconnect();
+      closeReady?.();
+      unregisterClose?.();
+      disconnectViewportObserver();
       window.removeEventListener('message', handleMessage);
       unsubscribeAppearance();
-      unsubscribeComposer();
-      releaseResourceSubscriptions();
       releaseRoutes();
     };
   });
 
   $effect(() => {
-    // 语言切换：读取响应式的 locale 即建立依赖。
-    void i18n.locale; void viewEntry; void placement; void conversation;
+    // 语言与外壳挂载位变化时同步下发；会话事实走 daemon → 共享宿主 session 网关的唯一事实源。
+    void i18n.locale; void viewEntry; void placement; void sessionId; void paneTab;
     sendHostContext();
+  });
+
+  $effect.pre(() => {
+    const next = sessionId;
+    if (next === routedSessionId) return;
+    routedSessionId = next;
+    abortRouteCalls();
   });
 
   $effect.pre(() => {
@@ -445,11 +540,9 @@
     const identity = documentIdentity;
     if (identity === navigationIdentity) return;
     navigationIdentity = identity;
-    releaseResourceSubscriptions();
     releaseRoutes();
     documentDigest = '';
     documentRuntimeId = undefined;
-    documentEntry = '';
   });
 </script>
 
@@ -459,8 +552,7 @@
   class="plugin-view"
   class:plugin-view--settings={placement === 'settings'}
   class:plugin-view--sized={placement === 'settings' && reportedHeight !== null}
-  class:plugin-view--inline={inline}
-  style:height={placement === 'settings' && reportedHeight !== null ? `${reportedHeight}px` : inline ? '40px' : undefined}
+  style:height={placement === 'settings' && reportedHeight !== null ? `${reportedHeight}px` : undefined}
   style:margin-left={placement === 'settings' ? `${-settingsInsets.left}px` : undefined}
   style:margin-right={placement === 'settings' ? `${-settingsInsets.right}px` : undefined}
   style:width={placement === 'settings' ? `calc(100% + ${settingsInsets.left + settingsInsets.right}px)` : undefined}
@@ -470,23 +562,24 @@
   title={label}
   bind:this={iframe}
   onload={() => {
-    releaseResourceSubscriptions();
     releaseRoutes();
     reportedHeight = null;
     documentDigest = resourceDigest;
     documentRuntimeId = runtime?.instanceId;
-    documentEntry = entry;
-    viewportObserver?.disconnect();
-    if (placement === 'settings' && iframe?.parentElement) {
-      viewportObserver = new ResizeObserver(sendHostContext);
-      viewportObserver.observe(iframe.parentElement);
-      const frame = iframe.closest('.settings-frame');
-      if (frame && frame !== iframe.parentElement) viewportObserver.observe(frame);
-    }
-    send({ type: 'init', pluginId, placement, viewId: currentViewId(), locale: i18n.locale, theme: readTheme(),
+    disconnectViewportObserver();
+    ensureSettingsViewportObserver();
+    send({
+      type: 'init',
+      pluginId,
+      placement,
+      sessionId,
+      paneTab,
+      viewId: currentViewId(),
+      locale: i18n.locale,
+      theme: readTheme(),
       ...hostViewport(),
-      resourceBase: documentRuntimeId ? agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/assets/${encodeURIComponent(documentDigest)}/${encodeURIComponent(documentRuntimeId)}/`) : undefined });
-    void sendConversationContext();
+      resourceBase: documentRuntimeId ? agentUrl(`/api/plugins/${encodeURIComponent(pluginId)}/assets/${encodeURIComponent(documentDigest)}/${encodeURIComponent(documentRuntimeId)}/`) : undefined,
+    });
   }}
   sandbox="allow-scripts allow-downloads"
   referrerpolicy="no-referrer"
@@ -522,5 +615,4 @@
        短页面也要保留完整视口，不能让 fixed 浮层和 vh 限高跟着正文缩小。 */
     min-height: 100%;
   }
-  .plugin-view--inline { flex: none; background: transparent; }
 </style>

@@ -133,9 +133,37 @@ impl Peer {
         params: Value,
         deadline: Duration,
     ) -> Result<Value, RpcError> {
+        self.request_inner(method, params, deadline, false).await
+    }
+
+    /// Calls a service that accepts a request.cancel notification if its caller stops waiting.
+    pub async fn request_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+    ) -> Result<Value, RpcError> {
+        self.request_inner(method, params, deadline, true).await
+    }
+
+    async fn request_inner(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+        cancellable: bool,
+    ) -> Result<Value, RpcError> {
         if *self.inner.closed.borrow() {
             return Err(RpcError::new(ErrorKind::HostGone, "连接已关闭"));
         }
+        // Before dispatching, reserve space to send cancellation even when the peer is busy.
+        let cancel_slot = if cancellable {
+            Some(self.inner.out.try_reserve().map_err(|_| {
+                RpcError::new(ErrorKind::Backpressure, "发送队列无法接纳可取消请求")
+            })?)
+        } else {
+            None
+        };
         let id = format!("d{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
         {
@@ -157,24 +185,35 @@ impl Peer {
                 "发送队列已满或连接已关闭",
             ));
         }
-        // 调用方丢弃本 future（如被取消）时同样释放挂起槽位，避免占满 `pending` 上限。
-        struct PendingGuard<'a>(&'a Inner, &'a str);
+        struct PendingGuard<'a> {
+            peer: &'a Inner,
+            id: &'a str,
+            cancel_slot: Option<mpsc::Permit<'a, Value>>,
+        }
         impl Drop for PendingGuard<'_> {
             fn drop(&mut self) {
-                self.0.take_pending(self.1);
+                if self.peer.take_pending(self.id).is_some()
+                    && let Some(slot) = self.cancel_slot.take()
+                {
+                    slot.send(notification(
+                        "request.cancel",
+                        serde_json::json!({ "id": self.id }),
+                    ));
+                }
             }
         }
-        let _guard = PendingGuard(&self.inner, &id);
+        let _guard = PendingGuard {
+            peer: &self.inner,
+            id: &id,
+            cancel_slot,
+        };
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RpcError::new(ErrorKind::HostGone, "连接已关闭")),
-            Err(_) => {
-                self.inner.take_pending(&id);
-                Err(RpcError::new(
-                    ErrorKind::DeadlineExceeded,
-                    format!("{method} 超时"),
-                ))
-            }
+            Err(_) => Err(RpcError::new(
+                ErrorKind::DeadlineExceeded,
+                format!("{method} 超时"),
+            )),
         }
     }
 
@@ -183,9 +222,19 @@ impl Peer {
         if *self.inner.closed.borrow() {
             return Err(RpcError::new(ErrorKind::HostGone, "连接已关闭"));
         }
+        let message = notification(method, params);
+        // An observer payload can exceed the frame budget without invalidating
+        // the shared transport or any other requests in flight.
+        if serde_json::to_vec(&message)
+            .map_err(|error| RpcError::new(ErrorKind::InvalidParams, error.to_string()))?
+            .len()
+            > self.inner.limits.frame_bytes
+        {
+            return Err(RpcError::new(ErrorKind::Backpressure, "通知超过传输帧上限"));
+        }
         self.inner
             .out
-            .try_send(notification(method, params))
+            .try_send(message)
             .map_err(|_| RpcError::new(ErrorKind::Backpressure, "发送队列已满"))
     }
 
@@ -344,6 +393,27 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             ErrorKind::HostGone
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_observation_does_not_close_the_shared_transport() {
+        let (a, b) = tokio::io::duplex(4096);
+        let limits = PeerLimits {
+            frame_bytes: 1024,
+            ..PeerLimits::default()
+        };
+        let a = Peer::spawn(a, Arc::new(Echo), limits);
+        let _b = Peer::spawn(b, Arc::new(Echo), limits);
+        let error = a
+            .notify("observe", json!({"text": "x".repeat(1024)}))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Backpressure);
+        assert_eq!(
+            a.request("echo", json!(true), Duration::from_secs(1))
+                .await
+                .unwrap(),
+            json!(true)
         );
     }
 

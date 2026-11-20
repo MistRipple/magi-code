@@ -477,6 +477,13 @@ impl StateRepository {
                         snapshot.durable.canonical_turns =
                             event_projection.canonical_turns().to_vec();
                         snapshot.durable.inputs = event_projection.inputs().to_vec();
+                        // 标题以日志为准：落盘记录落后于最后一条标题事件时在这里追上。
+                        if let (Some(title), Some(session)) = (
+                            event_projection.title(),
+                            snapshot.durable.sessions.first_mut(),
+                        ) {
+                            session.title = title.to_string();
+                        }
                         // canonical event 是唯一事实源；sidecar 只是执行恢复缓存。
                         // event 游标相等只说明 durable canonical 已同步，不能证明 sidecar
                         // 没有停留在较早的活动快照，因此每次恢复都从事件结果重建它。
@@ -654,6 +661,14 @@ impl StateRepository {
                                     &mut sidecars,
                                     record,
                                 );
+                            }
+                            if let Some(title) = event_projection.title()
+                                && let Some(session) = durable
+                                    .sessions
+                                    .iter_mut()
+                                    .find(|session| session.session_id == session_id)
+                            {
+                                session.title = title.to_string();
                             }
                             durable.canonical_turns.extend(new_turns);
                             sidecars.upsert_runtime_sidecar(sidecar);
@@ -1082,20 +1097,47 @@ impl StateRepository {
         workspace_id: Option<&str>,
         workspace_roots: &HashMap<String, PathBuf>,
     ) -> Result<PathBuf, DaemonError> {
-        let projection_root = match workspace_id {
+        if let Some(workspace_id) = workspace_id
+            && !workspace_roots.contains_key(workspace_id)
+        {
+            return Err(DaemonError::internal(format!(
+                "session {session_id} 引用了未注册 workspace，拒绝回落到全局目录: {workspace_id}"
+            )));
+        }
+        Ok(self.session_projection_location(session_id, workspace_id))
+    }
+
+    fn session_projection_location(
+        &self,
+        session_id: &SessionId,
+        workspace_id: Option<&str>,
+    ) -> PathBuf {
+        let root = match workspace_id {
             None => self.session_projection_root(),
-            Some(workspace_id) => {
-                if !workspace_roots.contains_key(workspace_id) {
-                    return Err(DaemonError::internal(format!(
-                        "session {session_id} 引用了未注册 workspace，拒绝回落到全局目录: {workspace_id}"
-                    )));
-                }
-                self.project_storage_root(workspace_id)
-                    .join(".magi")
-                    .join("session-projections")
-            }
+            Some(workspace_id) => self
+                .project_storage_root(workspace_id)
+                .join(".magi")
+                .join("session-projections"),
         };
-        Ok(projection_root.join(Self::session_projection_file_name(session_id)))
+        root.join(Self::session_projection_file_name(session_id))
+    }
+
+    pub(super) fn session_has_no_snapshot(
+        &self,
+        session: &magi_session_store::SessionRecord,
+        cache: &SessionProjectionCache,
+    ) -> bool {
+        // Workspace history can be attached from disk without populating this
+        // repository's write cache. A cold snapshot is still a committed session.
+        !cache.snapshots.contains_key(&session.session_id)
+            && matches!(
+                self.session_projection_location(
+                    &session.session_id,
+                    session.workspace_id.as_deref()
+                )
+                .try_exists(),
+                Ok(false)
+            )
     }
 
     pub(super) fn validate_session_projection(
@@ -1383,6 +1425,7 @@ impl StateRepository {
         };
         let mut writes = Vec::<SessionProjectionWrite>::new();
         let mut removals = Vec::<SessionProjectionRemoval>::new();
+        let mut created = Vec::new();
         let mut sidecar_by_session = HashMap::new();
         for sidecar in &sidecars.runtime_sidecars {
             if partial_snapshot
@@ -1456,6 +1499,13 @@ impl StateRepository {
                 partial_snapshot,
             )?;
             debug_assert_eq!(built_path, path);
+            if self.session_has_no_snapshot(session, &cache)
+                && next_event_cache[&session_id]
+                    .accepted_submissions()
+                    .is_empty()
+            {
+                created.push(session);
+            }
             let digest = ContentDigest::of(&content);
             if previous.as_ref() != Some(&digest) {
                 writes.push(SessionProjectionWrite {
@@ -1653,6 +1703,11 @@ impl StateRepository {
             *event_cache = next_event_cache;
         }
 
+        if let Some(observer) = self.plugin_session_observer.get() {
+            for session in created {
+                observer.publish_created(session);
+            }
+        }
         Ok(())
     }
 
@@ -1716,6 +1771,58 @@ impl StateRepository {
         self.state_root
             .join("session-events")
             .join(Self::session_projection_file_name(session_id).trim_end_matches(".json"))
+    }
+
+    fn open_session_history_source(
+        &self,
+        session_id: &magi_core::SessionId,
+        after: u64,
+        through: Option<u64>,
+    ) -> Result<super::super::session_event_log::EventHistoryRead, DaemonError> {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        let cache = self
+            .session_event_cache
+            .lock()
+            .expect("session event cache lock poisoned");
+        let event_root = self.session_event_root(session_id);
+        if let Some(projection) = cache.get(session_id) {
+            projection.open_history_page(&event_root, after, through)
+        } else {
+            SessionConversationProjection::load(&event_root, session_id)?.open_history_page(
+                &event_root,
+                after,
+                through,
+            )
+        }
+    }
+
+    pub(crate) fn read_session_observation_page(
+        &self,
+        session_id: &magi_core::SessionId,
+        after: u64,
+        through: Option<u64>,
+        limit: usize,
+        subagent_task_id: Option<&str>,
+    ) -> Result<serde_json::Value, DaemonError> {
+        use super::super::session_event_log::CommittedObservationPage;
+        use crate::native_plugin_platform::session_observation::ObservationScope;
+        let scope = match subagent_task_id {
+            Some(task_id) => ObservationScope::Subagent { task_id },
+            None => ObservationScope::Main,
+        };
+        let page = CommittedObservationPage::read_for_scope(
+            session_id,
+            after,
+            through,
+            limit,
+            magi_extension_host::frame::MAX_FRAME_BYTES / 2,
+            scope,
+            |after, through| self.open_session_history_source(session_id, after, through),
+        )?;
+        Ok(serde_json::to_value(page)?)
     }
 
     pub(crate) fn canonical_event_next_sequence(

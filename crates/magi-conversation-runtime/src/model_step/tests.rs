@@ -1544,6 +1544,37 @@ impl ModelBridgeClient for Client {
 }
 struct RejectWrites;
 impl SessionEventWriter for RejectWrites {
+    fn append_model_attempt_stream(
+        &self,
+        _: &magi_core::SessionId,
+        _: &str,
+        _: u64,
+        _: magi_session_store::ModelAttemptStream,
+    ) -> magi_core::DomainResult<u64> {
+        Err(magi_core::DomainError::Persistence {
+            message: "attempt streams are not part of this test".into(),
+        })
+    }
+    fn append_model_request(
+        &self,
+        _: &magi_core::SessionId,
+        _: &str,
+        _: u64,
+        _: magi_session_store::ModelRequestSnapshot,
+    ) -> magi_core::DomainResult<Option<u64>> {
+        Err(magi_core::DomainError::Persistence {
+            message: "model requests are not part of this test".into(),
+        })
+    }
+    fn append_session_title(
+        &self,
+        _: &magi_core::SessionId,
+        _: &str,
+    ) -> magi_core::DomainResult<u64> {
+        Err(magi_core::DomainError::Persistence {
+            message: "title events are not part of this test".into(),
+        })
+    }
     fn append_session_transaction(
         &self,
         _: &SessionId,
@@ -1888,4 +1919,174 @@ fn user_pause_blocks_new_requests_before_turn_cancellation_finishes_and_resume_r
     .invoke(request("resume"))
     .unwrap();
     assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn model_request_snapshot_redacts_credentials_and_skips_external_executors() {
+    let binding = ModelStepBinding {
+        usage_context: None,
+        model: Some("gpt-5".into()),
+        provider: Some("openai".into()),
+        binding_revision: 1,
+        settings_revision: 1,
+    };
+    let step = ModelStep {
+        step_id: "step-req-1".into(),
+        task_id: None,
+        thread_id: ThreadId::new("thread-main"),
+        attempts: Vec::new(),
+        goal_id: None,
+        usage_tokens: None,
+        goal_tokens_after: None,
+        checkpoint_generation: 0,
+        request_fingerprint: "a".repeat(64),
+        provider: "openai".into(),
+        binding: Some(binding),
+        executor_capabilities: None,
+        purpose: Some(magi_session_store::ModelStepPurpose::Execution),
+        message_count: 2,
+        tool_count: 1,
+        max_output_tokens: Some(4096),
+        input_request_ids: Vec::new(),
+        started_at: UtcMillis(1),
+        settled_at: None,
+        status: ModelStepStatus::Started,
+        response_fingerprint: None,
+        prompt_frame: None,
+        cache_epoch: 0,
+    };
+    let req = ModelInvocationRequest {
+        cache_affinity_key: None,
+        prompt_cache_key: None,
+        provider: "openai".into(),
+        prompt: "hi".into(),
+        messages: Some(vec![
+            magi_bridge_client::ChatMessage {
+                input_request_id: None,
+                context_origin: magi_bridge_client::ChatMessageOrigin::StaticPolicy,
+                role: "system".into(),
+                content: Some("Workspace /Users/xie/code/magi with Bearer secret-abc".into()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            },
+            magi_bridge_client::ChatMessage {
+                input_request_id: None,
+                context_origin: magi_bridge_client::ChatMessageOrigin::Conversation,
+                role: "user".into(),
+                content: Some("hello".into()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            },
+        ]),
+        tools: Some(vec![magi_bridge_client::ChatToolDefinition {
+            kind: "function".into(),
+            function: magi_bridge_client::ChatToolFunctionDefinition {
+                name: "web_search".into(),
+                description: "Search web using sk-secret-999".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "token": { "type": "string", "description": "example api_key=raw-val" }
+                    }
+                }),
+            },
+            origin: magi_bridge_client::ChatToolOrigin::Builtin,
+        }]),
+        tool_choice: None,
+    };
+    let ir = magi_bridge_client::prompt_ir::compile_prompt_ir(
+        &req,
+        true,
+        Some(magi_core::ReasoningEffort::Medium),
+        Some(4096),
+    );
+    let native_caps = magi_bridge_client::native_executor_capabilities();
+    let snapshot =
+        build_model_request_snapshot(&step, &req, &ir, &native_caps, Some(4096)).unwrap();
+    assert!(snapshot.redacted);
+    assert!(snapshot.system_prompt.contains("/Users/xie/code/magi"));
+    assert!(!snapshot.system_prompt.contains("secret-abc"));
+    assert_eq!(snapshot.header.config.provider, "openai");
+    assert_eq!(snapshot.header.config.model, "gpt-5");
+    assert_eq!(
+        snapshot.header.config.reasoning_effort.as_deref(),
+        Some("medium")
+    );
+    assert_eq!(snapshot.header.config.max_tokens, Some(4096));
+    assert_eq!(snapshot.header.tools.len(), 1);
+    assert_eq!(snapshot.header.tools[0].name, "web_search");
+    assert!(
+        !snapshot.header.tools[0]
+            .description
+            .contains("sk-secret-999")
+    );
+    assert!(snapshot.header.tools[0].parameters["properties"]["token"].is_object());
+    assert!(
+        !snapshot.header.tools[0].parameters["properties"]["token"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("raw-val")
+    );
+
+    // 外部执行器步骤不得记录系统提示与请求头。
+    let mut external_caps = native_caps.clone();
+    external_caps.tools = magi_bridge_client::ExecutorToolMode::ExecutorOwned;
+    assert!(build_model_request_snapshot(&step, &req, &ir, &external_caps, Some(4096)).is_none());
+
+    let mut external_ctx_caps = native_caps;
+    external_ctx_caps.context = magi_bridge_client::ExecutorContextOwnership::ExecutorOwned;
+    assert!(
+        build_model_request_snapshot(&step, &req, &ir, &external_ctx_caps, Some(4096)).is_none()
+    );
+}
+
+#[test]
+fn external_executor_response_builds_compact_attempt_stream_without_request_header() {
+    let response = ModelResponse {
+        status: magi_bridge_client::ModelResponseStatus::RequiresToolExecution,
+        content: Some("external executor answer".to_string()),
+        thinking: Some("brief reasoning".to_string()),
+        tool_calls: vec![magi_bridge_client::ChatToolCall {
+            id: "ext-call-1".to_string(),
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunction {
+                name: "file_read".to_string(),
+                arguments: r#"{"path":"README.md"}"#.to_string(),
+            },
+        }],
+        usage: None,
+        finish_reason: Some("tool_calls".to_string()),
+        provider_context: Vec::new(),
+    };
+    let records = build_external_executor_attempt_stream(&response)
+        .expect("external executor response with content/tool_calls should produce compact stream");
+    assert!(records.iter().any(|r| r["type"] == "reasoning-chunks"));
+    assert!(records.iter().any(|r| r["type"] == "text-chunks"));
+    assert!(records.iter().any(|r| r["type"] == "tool-call-chunks"));
+    assert_eq!(
+        records.last().and_then(|r| r["chunk"]["type"].as_str()),
+        Some("finish")
+    );
+    assert_eq!(
+        records
+            .last()
+            .and_then(|r| r["chunk"]["reason"]["kind"].as_str()),
+        Some("tool-calls")
+    );
+
+    // Empty response produces no fabricated stream.
+    let empty = ModelResponse {
+        status: magi_bridge_client::ModelResponseStatus::Completed,
+        content: None,
+        thinking: None,
+        tool_calls: Vec::new(),
+        usage: None,
+        finish_reason: Some("stop".to_string()),
+        provider_context: Vec::new(),
+    };
+    assert!(build_external_executor_attempt_stream(&empty).is_none());
 }

@@ -395,15 +395,20 @@ impl NormalizedModelConfig {
         if model.is_empty() {
             return None;
         }
+        let client = HttpModelBridgeClient::new_with_protocol(
+            base_url,
+            self.api_key.clone(),
+            model.to_string(),
+            protocol,
+            self.effective_reasoning_effort(),
+        )
+        .with_reasoning_capability(self.reasoning_capability(model));
         Some(
-            HttpModelBridgeClient::new_with_protocol(
-                base_url,
-                self.api_key.clone(),
-                model.to_string(),
-                protocol,
-                self.effective_reasoning_effort(),
-            )
-            .with_reasoning_capability(self.reasoning_capability(model)),
+            if self.source_id().is_some_and(|id| id.starts_with("plugin/")) {
+                client.without_transport_retries()
+            } else {
+                client
+            },
         )
     }
 

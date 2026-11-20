@@ -488,6 +488,17 @@ pub(super) fn upsert_task_tool_call_result_turn_item(
     item.tool_result = Some(tool_result.to_string());
     if matches!(
         tool_status,
+        ExecutionResultStatus::Succeeded
+            | ExecutionResultStatus::Failed
+            | ExecutionResultStatus::Rejected
+    ) {
+        item.metadata.insert(
+            magi_session_store::TOOL_RESULT_COMMITTED_METADATA_KEY.into(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if matches!(
+        tool_status,
         ExecutionResultStatus::Failed
             | ExecutionResultStatus::Rejected
             | ExecutionResultStatus::NeedsApproval

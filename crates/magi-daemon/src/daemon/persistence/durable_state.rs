@@ -60,7 +60,7 @@ impl StateRepository {
         self.write_json_atomically(self.workspace_recovery_sidecars_path(), state)
     }
 
-    /// 审计/用量账本的追加写段目录（见 docs/durable-log-compaction-design.md §1）。
+    /// 审计/用量账本的追加写段目录。
     pub(crate) fn audit_usage_ledger_path(&self) -> PathBuf {
         self.state_root.join("audit-usage-ledger")
     }

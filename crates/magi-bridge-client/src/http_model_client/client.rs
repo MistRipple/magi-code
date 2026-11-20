@@ -14,6 +14,7 @@ pub struct HttpModelBridgeClient {
     pub(super) reasoning_capability: Option<crate::reasoning::ReasoningCapability>,
     pub(super) temperature: Option<f64>,
     pub(super) stop: Vec<String>,
+    max_transport_retries: usize,
 }
 
 #[derive(Clone)]
@@ -68,7 +69,37 @@ impl HttpModelBridgeClient {
             reasoning_capability: None,
             temperature: None,
             stop: Vec::new(),
+            max_transport_retries: MODEL_PROVIDER_MAX_RETRIES,
         }
+    }
+
+    /// A process-bound provider owns its upstream retry policy. Replaying a
+    /// transport failure can duplicate a request that reached that provider.
+    pub fn without_transport_retries(mut self) -> Self {
+        self.max_transport_retries = 0;
+        self
+    }
+
+    fn finalize_transport_error(&self, error: BridgeClientError) -> BridgeClientError {
+        if self.max_transport_retries == 0
+            && matches!(
+                error,
+                BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Transport,
+                    ..
+                }
+            )
+            && !model_invocation_error_is_cancelled(&error)
+        {
+            return BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Transport,
+                code: Some(-32005),
+                message: format!(
+                    "executor_outcome_unknown: 模型提供方连接中断，本次未自动重发。{error}"
+                ),
+            };
+        }
+        error
     }
 
     pub fn with_reasoning_capability(
@@ -382,6 +413,7 @@ impl HttpModelBridgeClient {
                     on_retry,
                     is_cancelled,
                     observer,
+                    max_retries: self.max_transport_retries,
                 },
             );
 
@@ -428,7 +460,7 @@ impl HttpModelBridgeClient {
                     for delta in buffered_deltas.into_inner() {
                         on_delta(&delta);
                     }
-                    return Err(error);
+                    return Err(self.finalize_transport_error(error));
                 }
             }
         }
@@ -655,9 +687,11 @@ impl HttpModelBridgeClient {
                         on_retry,
                         is_cancelled,
                         observer,
+                        max_retries: self.max_transport_retries,
                     },
                 )
-            })?;
+            })
+            .map_err(|error| self.finalize_transport_error(error))?;
 
         if !(200..300).contains(&status) {
             return Err(provider_http_status_error(

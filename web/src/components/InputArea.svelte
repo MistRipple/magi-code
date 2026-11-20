@@ -73,8 +73,6 @@
     waitForSessionNavigation,
   } from '../shared/session-navigation.svelte';
   import ImageAttachmentTray from './ImageAttachmentTray.svelte';
-  import { registerPluginComposer, notifyPluginComposerChanged, observeComposerSubmission } from '../lib/plugin-composer';
-  import type { PluginComposerTextInput } from '../shared/app-server-protocol.generated';
   import { MAX_COMPOSER_TEXT_CHARS } from '../lib/composer-policy';
   import { materializeSession } from '../web/agent-api';
   import { mainModelContextWindowKey, type MainModelCatalogGroup } from '../shared/main-model-sources';
@@ -1794,50 +1792,6 @@
 
   onMount(() => {
     selectedAccessProfile = readStoredAccessProfile();
-    const releasePluginComposer = registerPluginComposer({
-      sessionId: () => currentSessionId?.trim() || '',
-      add(images) {
-        if (sessionInputLocked || sendPreparing || editingQueuedMessage || editingTurn
-          || selectedImages.length + pendingImageReadCount + images.length > MAX_COMPOSER_IMAGES) return null;
-        const added = images.map((image) => ({ ...image, id: generateId() }));
-        dropSessionCommandForAttachment();
-        selectedImages = [...selectedImages, ...added];
-        return added.map((image) => image.id);
-      },
-      has: (id) => selectedImages.some((image) => image.id === id),
-      writable: () => Boolean(currentSessionId?.trim()) && !sessionInputLocked && !sendPreparing && !editingQueuedMessage && !editingTurn
-        && selectedImages.length + pendingImageReadCount < MAX_COMPOSER_IMAGES,
-      textWritable: () => Boolean(currentSessionId?.trim()) && !isDraftSession && !sessionInputLocked && !sendPreparing
-        && !isComposing && !isInteractionBlocking && !pendingImageReadCount && composerIsPristineForSubmissionRecovery(),
-      beginRead(count) {
-        if (sessionInputLocked || sendPreparing || editingQueuedMessage || editingTurn
-          || selectedImages.length + pendingImageReadCount + count > MAX_COMPOSER_IMAGES) return null;
-        for (let i = 0; i < count; i++) beginImageRead();
-        let finished = false;
-        return () => {
-          if (finished) return;
-          finished = true;
-          for (let i = 0; i < count; i++) finishImageRead();
-        };
-      },
-      remove(id) {
-        if (sessionInputLocked || sendPreparing || editingQueuedMessage || editingTurn) return false;
-        if (!selectedImages.some((image) => image.id === id)) return false;
-        selectedImages = selectedImages.filter((image) => image.id !== id);
-        return true;
-      },
-      focus: () => queueMicrotask(focusEditor),
-      notify: (level, message) => addToast(level, message, undefined, { forceVisible: true }),
-      async submitText(input, admit) {
-        const observation = observeComposerSubmission(input.submissionId);
-        try {
-          const posted = await sendMessage(null, { input, admit });
-          if (posted !== input.submissionId) throw new Error(i18n.t('input.pluginTextUnavailable'));
-          return await observation.result;
-        } finally { observation.dispose(); }
-      },
-    });
-
     function handleFillComposer(event: Event) {
       const text = (event as CustomEvent<{ text?: string }>).detail?.text;
       if (typeof text !== 'string' || !text.trim()) return;
@@ -1977,7 +1931,6 @@
     window.addEventListener('storage', handleStoredAccessProfileChange);
     document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     return () => {
-      releasePluginComposer();
       setComposerHasUnsavedInput(false);
       window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
       window.removeEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
@@ -1991,15 +1944,6 @@
       window.removeEventListener('storage', handleStoredAccessProfileChange);
       document.removeEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     };
-  });
-
-  $effect(() => {
-    void currentSessionId; void selectedImages; void pendingImageReadCount;
-    void sessionInputLocked; void sendPreparing; void editingQueuedMessage; void editingTurn;
-    void inputValue; void selectedContextReferences; void selectedBrowserAnnotations; void selectedBrowserNodeSelections;
-    void selectedGoalMode; void selectedSkill; void selectedSessionCommand; void selectedPluginCommand;
-    void isComposing; void isInteractionBlocking;
-    notifyPluginComposerChanged();
   });
 
   $effect(() => {
@@ -2065,18 +2009,12 @@
 
   // 发送消息（支持图片附件）。
   // daemon 持久接纳投递意图；替代输入等待原执行结算后才启动。
-  async function sendMessage(interruptTurnId: string | null = null, plugin?: { input: PluginComposerTextInput; admit(): Promise<void> }) {
+  async function sendMessage(interruptTurnId: string | null = null) {
     if (sendPreparing) return;
     sendPreparing = true;
     try {
       await waitForPendingImageReads();
-      if (plugin) {
-        await plugin.admit();
-        if (currentSessionId !== plugin.input.sessionId || isDraftSession || isComposing
-          || sessionInputLocked || isInteractionBlocking || pendingImageReadCount) throw new Error(i18n.t('input.pluginTextUnavailable'));
-        if (!composerIsPristineForSubmissionRecovery()) throw new Error(i18n.t('input.pluginTextDraftConflict'));
-      }
-      const rawContent = plugin ? plugin.input.text : resolveComposerRawContent();
+      const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
       if (editingQueuedMessage) { await saveQueuedMessage(rawContent); return; }
       // 配置期间普通问题、补充方案和暂停说明都进入主对话；只有面板明确操作才提交控制动作。
@@ -2121,12 +2059,12 @@
         return;
       }
 
-      const requestId = plugin?.input.submissionId ?? generateId();
+      const requestId = generateId();
       const replaceTurnId = editingTurn?.sessionId === messagesState.currentSessionId
         ? editingTurn.turnId
         : null;
       if (interruptTurnId && (replaceTurnId || selectedSessionCommand || selectedPluginCommand)) return;
-      if (!replaceTurnId && !plugin) {
+      if (!replaceTurnId) {
         submittedComposerDrafts.set(requestId, captureComposerSubmissionDraft(rawContent));
       }
       vscode.postMessage({
@@ -2134,7 +2072,6 @@
         sourceFolderId: targetWorkspace ? selectedSourceFolderId || undefined : undefined,
         text: submissionText,
         requestId,
-        ...(plugin ? { userMessageId: `plugin-input-${plugin.input.submissionId}` } : {}),
         workspaceId: targetWorkspace?.workspaceId || '',
         workspacePath: targetWorkspace ? workspaceNavigationPath(targetWorkspace) : '',
         sessionId: isDraftSession ? '' : (messagesState.currentSessionId || ''),
@@ -2154,7 +2091,7 @@
         browserAnnotationRefs: selectedBrowserAnnotations.map((annotation) => annotation.annotationId),
         browserNodeSelections: selectedBrowserNodeSelections.map(cloneBrowserNodeSelection),
       });
-      if (!replaceTurnId && !plugin) {
+      if (!replaceTurnId) {
         clearComposerState();
       }
       return requestId;

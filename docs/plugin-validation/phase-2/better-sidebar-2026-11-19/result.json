@@ -1,0 +1,62 @@
+{
+  "platform": "macOS arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "7fd3d17cd7347fa4b716fab850d50b644879b960554ec729e037dfb3e205f6c5",
+  "readerSha256": "b6d4ddedb80c1a1562a75e1e2523401180a63b46e26a178296dc53eef06f7f1b",
+  "clientSha256": "33deea6c8eb12073e91764883eb4fef8c47ec3d17ba47efe62296dde9f20474c",
+  "sdkLockSha256": "9f2749a7b06897e0401c8b96f52484295d7906a98054de314dae3bc7fe3e7783",
+  "sample": {
+    "name": "dsh-better-sidebar",
+    "version": "0.32.1",
+    "sha256": "cd0a88c0da237622a83d465ed824f17c39c74e7edf2609c14cf21c813d70c517",
+    "integrity": "sha512-UcIEAkLuZXz0SkNDwMtycCoO59yCasowG6DqhxkG+jAjQfofF0BbXIOctfjqsU8WyaP6XoSvi4LgMFhEfinBsw=="
+  },
+  "checks": {
+    "activation": {
+      "instanceId": "1:1:include:better-sidebar",
+      "runtime": "running",
+      "views": [
+        "文件",
+        "Git",
+        "任务管理",
+        "侧边对话(beta)",
+        "Git",
+        "文件"
+      ],
+      "unmountedSlots": [
+        "conversation.session.header.utilities",
+        "shell.overlay",
+        "sidebar.right.pane.tab.title",
+        "sidebar.right.tab.guide"
+      ]
+    },
+    "routeScope": {
+      "actualWorkspace": true,
+      "mismatchedSessionDenied": true
+    },
+    "committedHistory": {
+      "blankBeforeTurn": true,
+      "blankAfterTurn": false
+    },
+    "fileExplorer": {
+      "filename": "sidebar-check.txt",
+      "originalRow": true
+    },
+    "fileEditor": {
+      "editedOnDisk": true,
+      "nativeComposerVisible": true,
+      "nativeReplyVisible": true
+    },
+    "closeEditor": true,
+    "instanceRevocation": {
+      "stoppedRoute": 403,
+      "obsoleteRoute": 409,
+      "obsoleteSlotReport": 409
+    },
+    "restart": {
+      "committedHistory": true,
+      "editedFileReadBackByOriginalPlugin": true
+    }
+  },
+  "installLockSha256": "8967da98f8fed9cd15162178c9ea2043333de0a2513078ca03a03805c6115fce"
+}

@@ -1,0 +1,67 @@
+[
+  {
+    "case": "cancel-dispatch",
+    "turnId": "turn-session-action-1795024606067",
+    "status": "running",
+    "calls": [
+      {
+        "callId": "call_00_TWhezFJCvU7s6hDyzvs30454",
+        "status": "running",
+        "resultStatus": null,
+        "errorCode": null
+      }
+    ]
+  },
+  {
+    "case": "cancelled-fetch",
+    "turnId": "turn-session-action-1795024606067",
+    "status": "cancelled",
+    "calls": [
+      {
+        "callId": "call_00_TWhezFJCvU7s6hDyzvs30454",
+        "status": "cancelled",
+        "resultStatus": null,
+        "errorCode": null
+      }
+    ]
+  },
+  {
+    "case": "crash-dispatch",
+    "turnId": "turn-session-action-1795024609396",
+    "status": "running",
+    "calls": [
+      {
+        "callId": "call_00_DECCJ1FkCalVrPBkkmcV6473",
+        "status": "running",
+        "resultStatus": null,
+        "errorCode": null
+      }
+    ]
+  },
+  {
+    "case": "host-crash-fetch",
+    "turnId": "turn-session-action-1795024609396",
+    "status": "failed",
+    "calls": [
+      {
+        "callId": "call_00_DECCJ1FkCalVrPBkkmcV6473",
+        "status": "failed",
+        "resultStatus": "failed",
+        "errorCode": "network_error"
+      }
+    ]
+  },
+  {
+    "case": "native-after-host-crash",
+    "turnId": "turn-session-action-1795024619863",
+    "status": "completed",
+    "calls": [
+      {
+        "callId": "call_00_hCEv7dD4qcAwyQ33xh8M4396",
+        "status": "completed",
+        "resultStatus": "succeeded",
+        "errorCode": null
+      }
+    ]
+  }
+]

@@ -1,0 +1,36 @@
+{
+  "scope": "configuration-preparation-only",
+  "platform": "darwin",
+  "arch": "arm64",
+  "node": "v26.13.1",
+  "capturedAt": "2026-11-17T18:22:36.667Z",
+  "rows": 4000,
+  "rowShape": {
+    "id": "row<number>",
+    "name": "business",
+    "disabled": true
+  },
+  "sourceSplit": [
+    2000,
+    2000
+  ],
+  "sourceKinds": [
+    "base array",
+    "overlay insert array"
+  ],
+  "results": [
+    {
+      "reverse": false,
+      "ms": 81,
+      "sourceEdits": 0,
+      "executables": 0
+    },
+    {
+      "reverse": true,
+      "ms": 66,
+      "sourceEdits": 2,
+      "executables": 0
+    }
+  ],
+  "business": "not-run"
+}

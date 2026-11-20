@@ -1018,6 +1018,11 @@ impl StreamAccumulator {
     pub fn saw_terminal(&self) -> bool {
         self.terminal
     }
+
+    /// 上游给出的终止原因（原样，未归一）。
+    pub fn stop_reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref()
+    }
 }
 
 fn tool_call_argument_fragment(arguments: Option<&Value>) -> Option<String> {

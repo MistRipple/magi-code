@@ -1,0 +1,82 @@
+{
+  "scope": "macOS arm64 Electron directory package, Mgr native settings",
+  "samples": [
+    {
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.12",
+      "sha256": "694b301bdd9c116e8fb01b1820e13932b9ad398bda5d1e6139db0de35372be9c",
+      "integrity": "sha512-NlEUaaJ6uOekU95H0pw0sGCfluOaiOJV3FFKLzaI4NiD+F5GGqb2srrqP179vemWaF7M+QzxroZk04Wg2vnmCQ==",
+      "revision": 2,
+      "dependenciesSha256": "de71f0457b2a209adf3eebf0d98d6b1d64bd91400c7db837da19ac85a43715ea",
+      "dependencyLock": "mgr-0.2.12-package-lock.json"
+    },
+    {
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.13",
+      "sha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+      "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+      "revision": 3,
+      "dependenciesSha256": "ce35d80479428e83460a6afa2b58b92a39790834b312a00f4dad711e68400bb4",
+      "dependencyLock": "mgr-0.2.13-package-lock.json"
+    }
+  ],
+  "checks": {
+    "initialInstallFromSettings": true,
+    "wrongDigestRejected": true,
+    "cancelledDuringNpm": {
+      "connectionClosed": true,
+      "stagingRemoved": true,
+      "retainedVersion": "0.2.12",
+      "sameInstance": true
+    },
+    "selfUpdateCommitted": true,
+    "selfUpdateActivated": true,
+    "originalListReturned": true,
+    "oldGatewayStatus": 409,
+    "hostCrash": {
+      "oldRouteStatus": 409,
+      "inFlightRouteStatus": 409,
+      "newRouteStatus": 200,
+      "recoveredVersion": "0.2.13",
+      "newInstance": "2:3:include:dsh-plugin-mgr"
+    },
+    "invalidConfig": {
+      "reportedInSettings": true,
+      "mutationStatus": 409,
+      "retainedRunningInstance": true
+    },
+    "fileRepairRestored": true,
+    "originalPageToggle": true,
+    "originalPageUpdate": true,
+    "originalPageUninstall": true,
+    "applicationRestart": {
+      "targetStillRemoved": true,
+      "revision": 9,
+      "originalListStatus": 200
+    }
+  },
+  "targetSamples": [
+    {
+      "name": "dsh-free-search",
+      "version": "0.9.41",
+      "sha256": "a9440128741e4e5f2d09810873fbd057a149c1117230550a98f79cab5fa05030",
+      "integrity": "sha512-d77vythaU13nuEsJN2LxScTWqiLKbj5zA0tFgxCqHLSnid7wa2Ep9/iqzM39sgvYpcqZ9dk9n/9r2nF0oA64XQ==",
+      "revision": 4,
+      "dependenciesSha256": "0d00bd2c382978ed94a43f4f69b949e1dc8119b91ad0f0818762fcfdf21cc410",
+      "dependencyLock": "target-0.9.41-package-lock.json"
+    },
+    {
+      "name": "dsh-free-search",
+      "version": "0.9.70",
+      "sha256": "d856dd1719dcb1768d1838f6b29faf720a351849061b2496c09a7b8da1c662cd",
+      "integrity": "sha512-kTqL6JAK1CnRkQFFddli2kyh8exk9B7841cwHruFfP7k5qMvVfPVbxBq8Eo6On7lPc8+nxyQ3oeNspFw3n+CuQ==",
+      "revision": 8,
+      "dependenciesSha256": "8d13dd27f7f4e5e36fed08714bb2044a6f4f0cce03159711a1228d81ea47f5ae",
+      "dependencyLock": "target-0.9.70-package-lock.json"
+    }
+  ],
+  "buildIdentity": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+  "daemonSha256": "20affebb69601dc57e2a51dc0dde43076104bc9ebc1db2fedbe25931f432f532",
+  "sdkLockSha256": "91cc0c27d189c8b844222a7d652850ce59d7a3fc53863863382f34db5f1a9443",
+  "result": "passed"
+}

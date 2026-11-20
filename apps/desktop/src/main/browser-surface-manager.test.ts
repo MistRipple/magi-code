@@ -1026,7 +1026,7 @@ test("等待视口提交的循环每轮让出事件循环、过期提交重新�
   assert.match(body, /commit\.state === "invalidated" \|\|\s*commit\.state === "superseded"/u);
 });
 
-test("P1-12 代理保留集合由 Main 持有，所有控制释放路径都清除并重新发布快照", () => {
+test("代理保留集合由 Main 持有，所有控制释放路径都清除并重新发布快照", () => {
   const setStart = source.indexOf("private setAgentRetained(");
   const setEnd = source.indexOf("\n  }\n", setStart);
   assert.ok(setStart >= 0 && setEnd > setStart);
@@ -1058,7 +1058,7 @@ test("P1-12 代理保留集合由 Main 持有，所有控制释放路径都清�
   );
 });
 
-test("P3-6 自动化驱动路径不写布局，只做后台物化", () => {
+test("自动化驱动路径不写布局，只做后台物化", () => {
   const start = desktopControlServerSource.indexOf(
     "private async requireRenderablePrimaryBinding(",
   );
@@ -1071,7 +1071,7 @@ test("P3-6 自动化驱动路径不写布局，只做后台物化", () => {
   assert.doesNotMatch(windowManagerSource, /async ensureBrowserSurface\(/u);
 });
 
-test("P1-12 右栏浏览器宿主是唯一的 tabId 键控列表，保留页面离屏挂载", () => {
+test("右栏浏览器宿主是唯一的 tabId 键控列表，保留页面离屏挂载", () => {
   const normalizedRightPane = normalizeSourceWhitespace(rightPaneSource);
   assert.match(normalizedRightPane, /#each browserHosts as host \(host\.tabId\)/u);
   assert.equal(

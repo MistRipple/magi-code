@@ -9,10 +9,10 @@ pub struct WorkerInfo {
     pub role: String,
     /// Task kinds this worker is capable of handling.
     pub supported_kinds: Vec<TaskKind>,
-    /// Maximum number of concurrent tasks this worker can handle (design 5.4).
+    /// Maximum number of concurrent tasks this worker can handle.
     /// None means unlimited.
     pub parallelism_limit: Option<u32>,
-    /// Role-specific system prompt template injected at LLM invocation (design 8.1).
+    /// Role-specific system prompt template injected at LLM invocation.
     pub system_prompt_template: Option<String>,
 }
 

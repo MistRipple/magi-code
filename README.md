@@ -293,7 +293,6 @@ crates/
   magi-knowledge-store/           代码索引与项目知识存储 (ADR, FAQ, 经验)
   ...                             （共 35 个独立细分 crate）
 web/                              Svelte 5 响应式 Web 工作台（Runes 驱动、消息流、RightPane 多功能面板）
-plugin-center/                    官方插件中心市场元数据与打包
 scripts/                          研发辅助、协议生成、代码生成与端到端验收脚本
 ~~~
 

@@ -293,7 +293,6 @@ crates/
   magi-knowledge-store/           Code indexing and project knowledge storage (ADRs, FAQs, experience)
   ...                             (35 specialized Rust crates in total)
 web/                              Svelte 5 responsive workbench (Runes-driven, message streams, RightPane)
-plugin-center/                    Official plugin marketplace metadata and packaging
 scripts/                          Development automation, protocol generation, and integration verifications
 ~~~
 

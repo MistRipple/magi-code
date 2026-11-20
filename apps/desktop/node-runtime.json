@@ -1,5 +1,6 @@
 {
   "version": "26.13.0",
+  "npmVersion": "11.20.0",
   "source": "https://nodejs.org/dist/v26.13.0",
   "archives": {
     "darwin-arm64": { "file": "node-v26.13.0-darwin-arm64.tar.gz", "sha256": "d38bd5e5a2ddce6bbb5ce45e46e208337da4d51fffe611e567fd32073d6439f6" },

@@ -435,6 +435,32 @@ mod tests {
 
     struct RejectingWriter;
     impl SessionEventWriter for RejectingWriter {
+        fn append_model_attempt_stream(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: crate::ModelAttemptStream,
+        ) -> magi_core::DomainResult<u64> {
+            Err(magi_core::DomainError::Persistence {
+                message: "attempt streams are not part of this test".into(),
+            })
+        }
+        fn append_model_request(
+            &self,
+            _: &magi_core::SessionId,
+            _: &str,
+            _: u64,
+            _: crate::ModelRequestSnapshot,
+        ) -> magi_core::DomainResult<Option<u64>> {
+            Ok(None)
+        }
+        fn append_session_title(&self, _: &SessionId, _: &str) -> magi_core::DomainResult<u64> {
+            Err(DomainError::Persistence {
+                message: "title events are not part of this test".into(),
+            })
+        }
+
         fn append_session_transaction(
             &self,
             _: &SessionId,

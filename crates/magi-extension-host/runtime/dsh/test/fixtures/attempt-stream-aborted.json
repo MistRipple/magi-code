@@ -1,0 +1,1 @@
+[{"chunk":{"blockType":"text","index":0,"type":"block-start"},"time":2000,"type":"chunk"},{"dt":[15],"index":0,"texts":["半","截"],"time0":2000,"type":"text-chunks"},{"chunk":{"reason":{"failure":{"code":"CANCELLED","message":"model invocation cancelled"},"kind":"aborted"},"type":"finish"},"time":2030,"type":"chunk"}]

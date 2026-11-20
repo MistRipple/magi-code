@@ -1,29 +1,34 @@
 // 在线安装真实 npm 原包并调用本机 WorkBuddy 登录态；会产生真实模型请求，按需显式运行。
 // 独立 Magi / DSH 状态根，不导出凭据，不修改用户已有 Magi 会话。
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { cp, mkdir, mkdtemp, writeFile, readFile, realpath } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { cp, mkdir, mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectAppPage, connectTarget, launchApp, pageTools, waitFor, createReporter } from './lib/electron-harness.mjs';
 import { verifyWorkbuddyStats } from './lib/workbuddy-stats-acceptance.mjs';
-import { previewFixedUpstreamFromNative, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
+import { installFixedUpstreamFromNative, waitForPluginModel } from './lib/plugin-native-acceptance.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appRoot = process.env.MAGI_PLUGIN_TEST_APP || join(root, 'target/electron-dist/mac-arm64/Magi.app');
-const port = 38938, cdpPort = 9308, origin = `http://127.0.0.1:${port}`;
+const port = Number(process.env.MAGI_WORKBUDDY_PORT ?? 38938);
+const cdpPort = Number(process.env.MAGI_WORKBUDDY_CDP_PORT ?? 9308), origin = `http://127.0.0.1:${port}`;
 const work = await mkdtemp(join(tmpdir(), 'magi-workbuddy-live-'));
 const output = process.env.MAGI_WORKBUDDY_OUTPUT || join(root, 'target/plugin-acceptance/workbuddy');
 const report = createReporter(), errors = [];
 const lifecycleRequests = [];
-const clipAuditSource = process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE ? await readFile(process.env.MAGI_PLUGIN_CLIP_AUDIT_SOURCE, 'utf8') : null;
+const packageName = 'dsh-connect-workbuddy', version = '5.21.2';
+const stateRoot = join(work, 'state');
+const baseline = JSON.parse(await readFile(new URL('../docs/plugin-validation/phase-1/manifest.json', import.meta.url)));
 let app, page, frame, ui, pluginId;
 await mkdir(output, { recursive: true });
-await mkdir(join(work, 'dsh'), { mode: 0o700 });
-// 沿用该用户的设备身份；账号仍由未经修改的原包从 WorkBuddy 桌面登录目录发现。
-await cp(join(homedir(), '.dsh/.workbuddy-device.json'), join(work, 'dsh/.workbuddy-device.json')).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+const dshHome = join(stateRoot, 'plugins', 'dsh-home');
+await mkdir(dshHome, { recursive: true, mode: 0o700 });
+// 使用独立状态；登录目录仍由原包自己读取。
+await cp(join(homedir(), '.dsh/.workbuddy-device.json'), join(dshHome, '.workbuddy-device.json'))
+  .catch(error => { if (error.code !== 'ENOENT') throw error; });
 const api = async (path, body, method = body === undefined ? 'GET' : 'POST') => {
   const response = await fetch(origin + path, { method, headers: { origin, 'content-type': 'application/json' },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(180_000) });
@@ -32,7 +37,7 @@ const api = async (path, body, method = body === undefined ? 'GET' : 'POST') => 
   assert.equal(response.status, 200, `${path}: ${JSON.stringify(value)}`);
   return value;
 };
-const installed = async () => (await api('/api/plugins')).plugins.find((p) => p.manifest.name === 'DSH Connect WorkBuddy');
+const installed = async () => (await api('/api/plugins')).plugins.find((p) => p.manifest.id === packageName);
 const screenshot = async (name) => {
   // DOM 已渲染不等于合成帧已提交；截图要记录实际完成绘制的页面。
   await page.evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
@@ -49,7 +54,8 @@ const tab = async (id) => {
 };
 async function start() {
   app = launchApp({ executable: join(appRoot, 'Contents/MacOS/Magi'), cwd: root, cdpPort,
-    env: { MAGI_STATE_ROOT: join(work, 'state'), DSH_HOME: join(work, 'dsh'), MAGI_DESKTOP_DAEMON_PORT: String(port), MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_EXTENSION_COMPAT: '' } });
+    env: { MAGI_STATE_ROOT: stateRoot, MAGI_HOST: '127.0.0.1', MAGI_DESKTOP_DAEMON_PORT: String(port),
+      MAGI_OPEN_BROWSER: '0', MAGI_EXTENSION_NODE: '', MAGI_DSH_SDK_ROOT: '', MAGI_DESKTOP_REUSE_DAEMON: '' } });
   page = await waitFor(() => connectAppPage(cdpPort, port, errors), '真实 Magi 主窗口', 60_000);
   await page.call('Network.enable');
   page.on('Network.requestWillBeSent', ({ request }) => {
@@ -59,118 +65,67 @@ async function start() {
   ui = pageTools(page);
   await waitFor(() => ui.exists('[data-testid=sidebar-settings]'), '工作台');
 }
-async function verifyCliCommand(selected) {
-  const binary = process.env.MAGI_WORKBUDDY_CLI_BINARY;
-  if (!binary) return;
-  const settings = await api(`/api/plugins/${pluginId}/settings`);
-  const injectResult=process.env.MAGI_WORKBUDDY_CLI_INJECT_RESULT==='1';
-  await api(`/api/plugins/${pluginId}/settings`, { expectedVersion: settings.version, value: {
-    ...settings.value, cliBridge: { ...settings.value?.cliBridge, enabled: true, binary,
-      permissionMode: 'dontAsk', injectResult, timeoutSecs: 90,
-      ...(process.env.MAGI_WORKBUDDY_CLI_MODEL ? {model:process.env.MAGI_WORKBUDDY_CLI_MODEL} : {}),
-    },
-  } }, 'PUT');
-  const command = await waitFor(async () => (await installed())?.manifest.contributions.commands.find(command=>command.title==='codebuddy'), '在线原包的 CodeBuddy 命令');
-  const directory = join(work, 'cli-project'); await mkdir(directory);
-  await promisify(execFile)('git',['init','--quiet',directory]);
-  // CLI 拥有自己的工具权限；这里只授权验收文件的读取。
-  await mkdir(join(directory,'.codebuddy'));
-  await writeFile(join(directory,'.codebuddy/settings.local.json'),JSON.stringify({permissions:{allow:['Read(./verification.txt)'],deny:['Edit','Write','Bash']}}));
-  const marker = 'MAGI_COMMAND_FILE_'+Date.now().toString(36);
-  await writeFile(join(directory, 'verification.txt'), marker);
-  const {workspace} = await api('/api/workspaces/create',{name:'CodeBuddy command acceptance',sourceFolders:[{path:directory}]});
-  const session = (await api('/api/session/materialize',{scope:'workspace',workspaceId:workspace.workspaceId})).sessionId;
-  if(injectResult) await api('/api/settings/orchestrator/session/save',{scope:'workspace',workspaceId:workspace.workspaceId,sessionId:session,
-    config:{sourceId:selected.sourceId,model:selected.id,reasoningEffort:null}});
-  const turn = await api('/api/session/turn',{scope:'workspace',workspaceId:workspace.workspaceId,sessionId:session,
-    pluginCommandId:`plugin/${pluginId}/${command.id}`,text:'Read verification.txt in the current directory and reply with only its full contents. Do not modify any file.',
-    requestId:'workbuddy-cli-live',userMessageId:'workbuddy-cli-live-user'});
-  const result = await waitFor(async () => (await api(`/api/messages?scope=workspace&workspaceId=${workspace.workspaceId}&sessionId=${session}`)).canonicalTurns
-    ?.find(item=>item.turnId===turn.turnId && ['completed','failed','cancelled','blocked'].includes(item.status)), '真实 CodeBuddy CLI 读项目文件',120_000);
-  const text = result.items.filter(item=>item.kind==='assistant_text').map(item=>item.content??'').join('\n');
-  const task = turn.rootTaskId && await api(`/api/agent-runs/projection/${turn.rootTaskId}?scope=workspace&workspaceId=${workspace.workspaceId}&sessionId=${session}`);
-  await writeFile(join(output,'codebuddy-command.json'),JSON.stringify({version:(await installed()).manifest.version,binary,
-    model:process.env.MAGI_WORKBUDDY_CLI_MODEL??null,sessionId:session,turnId:turn.turnId,taskId:turn.rootTaskId,
-    taskStatus:task?.root_task.status,status:result.status,text,injectResult},null,2));
-  report.check('真实 CodeBuddy 命令由原生 Task 调度并完成结算', Boolean(turn.rootTaskId)
-    && task.root_task.status==='completed' && result.items.find(item=>item.kind==='user_message')?.metadata.executionProfile==='task',
-    JSON.stringify({taskStatus:task?.root_task.status,turnStatus:result.status,text}));
-  report.check('原包 /codebuddy 在真实会话目录调用实际 CLI 并读取文件结果', result.status==='completed'
-    && text.includes(marker) && text.includes(await realpath(directory)), JSON.stringify({status:result.status,text}));
-  report.check('CodeBuddy 命令保持只读业务结果与原有文件', await readFile(join(directory,'verification.txt'),'utf8')===marker);
-  if(injectResult) {
-    const injected=await waitFor(async()=>{
-      const turns=(await api(`/api/messages?scope=workspace&workspaceId=${workspace.workspaceId}&sessionId=${session}`)).canonicalTurns;
-      return turns.find(turn=>turn.items.some(item=>item.metadata?.pluginMessage?.pluginId===pluginId)
-        && ['completed','failed','cancelled','blocked'].includes(turn.status));
-    },'未经修改的 CodeBuddy 原包回注后由真实主模型答复',180000);
-    const message=injected.items.find(item=>item.metadata?.pluginMessage?.pluginId===pluginId);
-    const answer=injected.items.filter(item=>item.kind==='assistant_text').map(item=>item.content??'').join('\n').trim();
-    await writeFile(join(output,'codebuddy-injection.json'),JSON.stringify({sessionId:session,commandTurnId:turn.turnId,
-      status:injected.status,origin:message?.metadata.pluginMessage,message:message?.content,answer,modelSteps:injected.modelSteps},null,2));
-    report.check('原包自动回注实际 CLI 结果并保存来源，沿原生队列唤醒真实主模型',injected.status==='completed'
-      && message?.content.includes(marker)&&message.metadata.pluginMessage.sourceTurnId===result.turnId
-      && message.metadata.pluginMessage.delivery==='steer'&&injected.modelSteps.length>0&&answer.length>0,
-      JSON.stringify({status:injected.status,origin:message?.metadata.pluginMessage,answer}));
-    await page.call('Page.navigate',{url:`${origin}/web.html?scope=workspace&workspaceId=${workspace.workspaceId}&sessionId=${session}`});
-    await waitFor(()=>page.evaluate('Boolean(document.querySelector("[data-source=plugin]"))'),'真实原包回注的会话展示');
-    await screenshot('codebuddy-injection');
-  }
-
+async function openSettings() {
+  frame?.close();
+  await tab(`plugin:${pluginId}:settings`);
+  const url = await waitFor(() => page.evaluate('document.querySelector(".settings-frame:not([hidden]) iframe")?.src'), '原包设置界面');
+  frame = await waitFor(() => connectTarget(cdpPort, target => ['iframe', 'page'].includes(target.type) && target.url === url,
+    'WorkBuddy 原包设置', errors), '原包设置 iframe');
+  await waitFor(() => frame.evaluate('document.querySelectorAll("button").length > 3 && !document.body.innerText.includes("界面加载失败")'), '原包设置卡片', 60_000);
 }
+const poolTab = `[...document.querySelectorAll('button,[role=tab]')].find(node => /^(账号池|Account pool)$/i.test(node.innerText.trim()))`;
+const selectedAccounts = () => frame.evaluate(
+  String.raw`document.body.innerText.match(/^(?:已选|Selected)\s+\d+\s*\/\s*\d+$/im)?.[0]`);
+async function accountPool() {
+  await waitFor(() => frame.evaluate(`(() => {
+    if (document.querySelector('.dsm-workbuddy-pool-members-actions')) return true;
+    (${poolTab})?.click();
+    return false;
+  })()`), '原包账号池');
+  return await waitFor(selectedAccounts, '原包账号池成员计数');
+}
+const patchPath = join(stateRoot, 'plugins', 'loading-source', 'cordis.patch.yml');
 try {
   report.check('独立验收端口空闲', !await fetch(origin + '/health').then(() => true, () => false)
     && !await fetch(`http://127.0.0.1:${cdpPort}/json/version`).then(() => true, () => false));
   await start();
-  await tab('plugins');
-  await waitFor(() => ui.exists('[data-testid=plugin-search]'), '插件搜索');
-  await page.evaluate('const input=document.querySelector("[data-testid=plugin-search]"); input.value="dsh-connect-workbuddy"; input.dispatchEvent(new Event("input",{bubbles:true})); true');
-  const upstreamRow = '[data-testid=plugin-row][data-plugin-id="upstream:dsh:dsh-connect-workbuddy"]';
-  await waitFor(() => ui.exists(upstreamRow), 'npm 在线搜索结果', 60_000);
-  await ui.click(upstreamRow);
-  report.check('在线搜索呈现真实 DSH 上游包', await ui.exists('[data-testid=plugin-upstream-badges]'));
-  await previewFixedUpstreamFromNative({ page, packageName: 'dsh-connect-workbuddy', version: '5.21.2' });
-  const preview = await waitFor(async () => {
-    if (await ui.exists('[data-testid=plugin-candidate][data-origin=upstream]')) return { ok: true };
-    const error = await page.evaluate('[...document.querySelectorAll("[role=status]")].map(e=>e.textContent).find(t=>t.includes("翻译上游插件失败"))');
-    return error && { error };
-  }, '原包在线下载与翻译预览', 180_000);
-  assert.ok(preview.ok, preview.error);
-  const previewText = await ui.text('[data-testid=plugin-candidate]');
-  report.check('在线安装预览展示真实界面影响说明', await ui.exists('[data-testid=plugin-impact-ui]')
-    && /设置页/.test(await ui.text('[data-testid=plugin-impact-ui]')));
-  report.check('预览显示 npm 完整性摘要与可选兼容限制', /sha512-/.test(previewText) && /可选路径/.test(previewText), previewText?.slice(-1500));
-  await screenshot('install-preview');
-  await ui.click('[data-action=confirm-candidate]');
-  const plugin = await waitFor(installed, '确认在线安装', 120_000);
+  const preview = await api('/api/plugins/upstream/preview', { ecosystem: 'dsh', package: packageName, version });
+  const sample = baseline.packages.find(row => row.name === packageName && row.version === version);
+  assert.equal(preview.candidate.digest, sample.sha256);
+  assert.equal(preview.integrity, sample.integrity);
+  const plugin = await installFixedUpstreamFromNative({ page, request: api, packageName, version });
   pluginId = plugin.manifest.id;
-  assert.equal(plugin.manifest.version, '5.21.2');
-  report.check('WorkBuddy 工具和命令仍独立声明结果回注授权', plugin.manifest.permissions.some(permission => permission.kind === 'sessionWrite'
-    && permission.targets.includes('context') && permission.targets.includes('wake')));
-  report.check(`已在线安装 ${plugin.manifest.name}@${plugin.manifest.version}`, plugin.source.kind === 'upstream');
   const row = `[data-testid=plugin-row][data-plugin-id="${pluginId}"]`;
-  await tab(`plugin:${pluginId}:settings`);
-  const activated = await waitFor(async () => {
-    const item = await installed();
-    return ['running', 'failed'].includes(item.runtime?.state) && item;
-  }, '真实 WorkBuddy 原包运行', 120_000);
-  assert.equal(activated.runtime.state, 'running', activated.runtime.reason);
-  report.check('真实 Cordis 原包启动成功', true);
-  report.check('安装完成即启用，不再发出任何授权或启用请求', lifecycleRequests.length === 0 && activated.enabled);
-  report.check('配置只在设置页声明，原包同组件主区别名不生成主对话或右栏入口', activated.manifest.contributions.views.filter(view=>view.placements.includes('settings')).length === 1
-    && !activated.manifest.contributions.views.some(view=>view.placements.includes('main')||view.placements.includes('rightPane'))
-    && !await ui.exists('[data-testid=top-tab-plugin]'));
+  report.check('固定官方原包从设置页在线安装并启用', plugin.manifest.version === version
+    && plugin.source.location === `dsh:${packageName}@${version}`
+    && plugin.enabled && plugin.runtime.state === 'running' && lifecycleRequests.length === 0);
   const selected = await waitForPluginModel({ request: api, pluginId, modelId: process.env.MAGI_WORKBUDDY_MODEL || 'deepseek-v4.1-flash',
     record: value => writeFile(join(output, 'model-selection.json'), JSON.stringify(value, null, 2)) });
   report.check('真实 WorkBuddy 模型数据源进入主对话目录', Boolean(selected));
-  await tab(`plugin:${pluginId}:settings`);
-  await waitFor(() => ui.exists('.settings-frame:not([hidden]) iframe'), '原包设置界面');
-  const frameUrl = await page.evaluate('document.querySelector(".settings-frame:not([hidden]) iframe").src');
-  frame = await waitFor(() => connectTarget(cdpPort, (t) => (t.type === 'iframe' || t.type === 'page') && t.url === frameUrl, 'WorkBuddy 原生设置', errors), 'WorkBuddy 设置 iframe');
-  await waitFor(() => frame.evaluate('document.querySelectorAll("button").length > 3 && !document.body.innerText.includes("界面加载失败")'), '原生设置卡片渲染', 60_000);
-  report.check('未经修改的上游设置卡片实际渲染', true);
-  report.check('原包配置通过独立插件设置 Tab 展示，主对话没有配置页签', await page.evaluate(`document.querySelector(${JSON.stringify(`[data-testid="settings-nav-plugin:${pluginId}:settings"]`)})?.getAttribute('aria-current') === 'page'`)
-    && !await ui.exists('[data-testid=top-tab-plugin]'));
+  await openSettings();
+  report.check('原包配置在独立设置 Tab 展示', await page.evaluate(`document.querySelector(${JSON.stringify(`[data-testid="settings-nav-plugin:${pluginId}:settings"]`)})?.getAttribute('aria-current') === 'page'
+    && document.querySelector('.settings-frame:not([hidden]) iframe')?.dataset.pluginId === ${JSON.stringify(pluginId)}`));
+  const beforeMembers = await accountPool();
+  const patchBefore = await readFile(patchPath, 'utf8');
+  const pick = /^\D*0\s*\//.test(beforeMembers) ? '全选|Select all' : '全不选|Select none|Deselect all';
+  await frame.evaluate(`[...document.querySelectorAll('.dsm-workbuddy-pool-members-actions button')]
+    .find(node => new RegExp(${JSON.stringify('^(?:' + pick + ')$')}, 'i').test(node.innerText.trim())).click()`);
+  const afterMembers = await waitFor(async () => {
+    const count = await selectedAccounts();
+    return count !== beforeMembers && count;
+  }, '原包修改成员后显示草稿');
+  await waitFor(() => frame.evaluate(`(() => {
+    const button = [...document.querySelectorAll('.dsm-workbuddy-pool button')].find(node => /^(保存|Save)$/.test(node.innerText.trim()));
+    if (!button || button.disabled) return false;
+    button.click(); return true;
+  })()`), '原包保存草稿');
+  await waitFor(async () => (await readFile(patchPath, 'utf8')) !== patchBefore, 'daemon 提交原包配置');
+  await waitFor(() => frame.evaluate('!document.querySelector(".dsm-workbuddy-pool-dirty")'), '原包显示已保存');
+  await tab('plugins');
+  await openSettings();
+  await accountPool();
+  await waitFor(async () => await selectedAccounts() === afterMembers, '切回后页面读取已提交账号池');
+  report.check('原包设置保存后切回仍读到新成员数', true);
   await screenshot('settings');
   const session = (await api('/api/session/materialize', { scope: 'personal' })).sessionId;
   await api('/api/settings/orchestrator/session/save', { scope: 'personal', sessionId: session, config: { sourceId: selected.sourceId, model: selected.id, reasoningEffort: null } });
@@ -187,6 +142,46 @@ try {
   await waitFor(() => page.evaluate('document.body.innerText.includes("MAGI_WORKBUDDY_LIVE_OK")'), '真实回复展示');
   await screenshot('conversation');
   const statsVerification = process.env.MAGI_WORKBUDDY_STATS === '1' ? await verifyWorkbuddyStats({ request:api,page,session,output,check:report.check }) : null;
+  const cancelled = await api('/api/session/turn', { scope: 'personal', sessionId: session,
+    text: 'Write a long explanation of the tides. Do not call tools.', requestId: 'workbuddy-cancel', userMessageId: 'workbuddy-cancel-user' });
+  const readCancelled = async () => (await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).canonicalTurns
+    .find(value => value.turnId === cancelled.turnId);
+  await waitFor(async () => (await readCancelled())?.modelSteps.some(step => step.attempts?.some(attempt => !attempt.settledAt)), '模型请求在途');
+  await api('/api/session/interrupt', { sessionId: session });
+  const cancelledTurn = await waitFor(async () => {
+    const value = await readCancelled();
+    return value?.status === 'cancelled' && value;
+  }, '原生取消提交');
+  report.check('在途 WorkBuddy 模型请求可由 Magi 取消', cancelledTurn.status === 'cancelled');
+  const beforeCrash = await installed();
+  const dropped = await api('/api/session/turn', { scope: 'personal', sessionId: session,
+    text: 'Write a long explanation of tidal currents. Do not call tools.', requestId: 'workbuddy-host-crash', userMessageId: 'workbuddy-host-crash-user' });
+  const readDropped = async () => (await api(`/api/messages?scope=personal&sessionId=${encodeURIComponent(session)}`)).canonicalTurns
+    .find(value => value.turnId === dropped.turnId);
+  await waitFor(async () => (await readDropped())?.modelSteps.some(step => step.attempts?.some(attempt => !attempt.settledAt)), '宿主崩溃场景的在途请求');
+  const processes = execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,command='], { encoding: 'utf8' })
+    .trim().split('\n').map(line => line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)).filter(Boolean);
+  const daemons = processes.filter(row => Number(row[2]) === app.child.pid && row[3].includes('/daemon/magi-daemon-app'));
+  assert.equal(daemons.length, 1, '等待隔离验收应用的唯一 daemon');
+  const hosts = processes.filter(row => row[2] === daemons[0][1] && row[3].includes('/dsh/runtime/entry.mjs'));
+  assert.equal(hosts.length, 1, '只终止本轮独立 daemon 的共享插件宿主');
+  process.kill(Number(hosts[0][1]), 'SIGKILL');
+  console.log('已终止验收应用的共享插件宿主，核对调用与新代次');
+  const droppedTurn = await waitFor(async () => {
+    const value = await readDropped();
+    await writeFile(join(output, 'host-crash-turn.json'), JSON.stringify(value, null, 2));
+    return ['failed', 'cancelled', 'completed', 'blocked'].includes(value?.status) && value;
+  }, '宿主崩溃后在途模型请求结算', 60_000);
+  report.check('宿主崩溃期间的已开始模型请求结束且未重新派发',
+    droppedTurn.status !== 'completed' && droppedTurn.modelSteps.flatMap(step => step.attempts ?? []).length === 1,
+    JSON.stringify({ status: droppedTurn.status, attempts: droppedTurn.modelSteps.flatMap(step => step.attempts ?? []).length }));
+  const afterCrash = await waitFor(async () => {
+    const row = await installed();
+    return row?.runtime?.state === 'running' && row.runtime.instanceId !== beforeCrash.runtime.instanceId && row;
+  }, '共享宿主自动恢复 WorkBuddy 新实例', 90_000);
+  assert.equal(afterCrash.digest, beforeCrash.digest);
+  await waitForPluginModel({ request: api, pluginId, modelId: selected.id, record: async () => {} });
+  report.check('崩溃后恢复固定原包模型目录及新实例', true);
   await tab(`plugin:${pluginId}:settings`);
   await waitFor(() => ui.exists(`iframe[data-plugin-id="${pluginId}"]`), '停用前真实原包文档');
   const beforeStop = await installed();
@@ -210,8 +205,8 @@ try {
     && lifecycleRequests.slice(requestOffset).every(item => item.expectedDigest === plugin.digest));
   await waitFor(() => ui.exists(`iframe[data-plugin-id="${pluginId}"]`), '重新启用后的原包文档');
   await writeFile(join(output, 'lifecycle-requests.json'), JSON.stringify(lifecycleRequests, null, 2));
-  await verifyCliCommand(selected);
-  const beforeRestart = await installed(), savedSettings = await api(`/api/plugins/${pluginId}/settings`);
+  const beforeRestart = await installed();
+  const statsBeforeRestart = statsVerification && await api('/api/settings/stats?sessionId=' + encodeURIComponent(statsVerification.sessionId));
   frame?.close(); frame = null; page.close(); page = null;
   await writeFile(join(output, 'before-restart.log'), app.log.join('')); await app.stop();
   await start();
@@ -220,17 +215,36 @@ try {
     record: value => writeFile(join(output, 'model-selection-restarted.json'), JSON.stringify(value, null, 2)) });
   report.check('应用重启保持同一原包、授权和配置并恢复新宿主及真实模型目录', restored.digest === beforeRestart.digest
     && restored.runtime.instanceId !== beforeRestart.runtime.instanceId
-    && JSON.stringify(await api(`/api/plugins/${pluginId}/settings`)) === JSON.stringify(savedSettings));
+    && restored.enabled);
+  await openSettings();
+  await accountPool();
+  await waitFor(async () => await selectedAccounts() === afterMembers, '重启后页面读取已提交账号池');
+  report.check('应用重启后原页面读取已保存成员数', true);
+  const restoredCancellation = await readCancelled();
+  report.check('应用重启后保持取消终态和原执行次数', restoredCancellation.status === 'cancelled'
+    && restoredCancellation.modelSteps.length === cancelledTurn.modelSteps.length);
   if (statsVerification) {
     const restoredStats = await api('/api/settings/stats?sessionId='+encodeURIComponent(statsVerification.sessionId));
     await writeFile(join(output,'stats-restored.json'),JSON.stringify(restoredStats,null,2));
-    report.check('完整重启恢复同一统计，无重复计数或模型重放',JSON.stringify(restoredStats.totals)===JSON.stringify(statsVerification.stats.totals));
+    report.check('完整重启恢复包含取消调用的统计，无重复计数或模型重放',
+      JSON.stringify(restoredStats.totals) === JSON.stringify(statsBeforeRestart.totals));
   }
   report.check('主窗口与上游设置无未捕获异常', errors.length === 0 && !/Uncaught|可信 Renderer 控制台错误/.test(app.log.join('')), errors.join('\n'));
-  await writeFile(join(output, 'installed.json'), JSON.stringify({ completed: true, pluginId, version: plugin.manifest.version, digest: plugin.digest, source: plugin.source, model: selected.id, sessionId: session, turnId: turn.turnId, stateRoot: join(work, 'state') }, null, 2));
+  const resources = join(appRoot, 'Contents', 'Resources');
+  const build = JSON.parse(await readFile(join(resources, 'browser-capability-manifest.json')));
+  const state = JSON.parse(await readFile(join(stateRoot, 'plugins', 'state.json')));
+  const lock = await readFile(join(state.loading.configuration.preparation.projectDirectory, 'package-lock.json'));
+  await writeFile(join(output, 'package-lock.json'), lock);
+  await writeFile(join(output, 'result.json'), JSON.stringify({ completed: true, package: packageName, version,
+    archiveSha256: sample.sha256, integrity: sample.integrity, model: selected.id, buildIdentity: build.buildIdentity,
+    daemonSha256: build.components.daemon.sha256,
+    sdkLockSha256: build.files.find(file => file.path === 'daemon/dsh/package-lock.json').sha256,
+    dependenciesSha256: createHash('sha256').update(lock).digest('hex'),
+    checks: report.results.map(({ name, ok }) => ({ name, ok })) }, null, 2) + '\n');
   console.log(report.summary());
 } catch (error) {
   console.error(error);
+  if (frame) await writeFile(join(output, 'failure-page.txt'), await frame.evaluate('document.body.innerText').catch(() => ''));
   if (ui) await screenshot('failure').catch(() => {});
   process.exitCode = 1;
 } finally {

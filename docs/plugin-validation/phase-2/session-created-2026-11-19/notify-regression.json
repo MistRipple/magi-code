@@ -1,0 +1,43 @@
+{
+  "platform": "darwin arm64",
+  "electron": "45.0.0",
+  "daemonSha256": "c60aabc49aafa2b98975047448823bd3d7efa766de0c366a072faea684f12910",
+  "sdkLockSha256": "7af3cb1d8834be2fd81b29aadbbab3c08c051876746b4a6a2075aa8afe286e9e",
+  "observerSha256": "5d80f24b48563f36a46362c121e47f67a48fbeb455cbb7b043d1df135b9ece36",
+  "samples": [
+    {
+      "name": "@idoall/dsh-notify",
+      "version": "0.4.9",
+      "sha256": "434713c399be76faac104c69b89c73ae91aa750aba4552cbb01aa505b91fa713",
+      "integrity": "sha512-6Yc70cfCwodLJboVRJIt2kFvSjSpJeusRmgVt4ivA49ivJXtNH5fyGSn6SzEdRxFQjdKhjeUwnO70OgYTINlRw=="
+    },
+    {
+      "name": "dsh-connect-workbuddy",
+      "version": "5.21.2",
+      "sha256": "3237011989e3d52483c1ec0e76874dd4d2f296a5b119cd25a08385cee0ab3fc0",
+      "integrity": "sha512-Yu2W+/WUCzPhP2fUi45B+L98GP7xTYQqSc0/XM7lQedaids5Kmj2LBqyJ3zI7SsrN4gtt84ZOnFqdlbKVU5NZg=="
+    }
+  ],
+  "checks": {
+    "completed": {
+      "provider": "deepseek-v4.1-flash",
+      "canonicalStatus": "completed",
+      "notificationKind": "completed",
+      "turn": 1
+    },
+    "cancelled": {
+      "canonicalStatus": "cancelled",
+      "inFlight": true,
+      "noCompletionOrFailureNotification": true
+    },
+    "failed": {
+      "providerHttpStatus": 401,
+      "canonicalStatus": "failed",
+      "nativeCode": "model_auth_failed",
+      "notificationKind": "failed",
+      "matchedNativeSummary": true,
+      "turn": 3
+    }
+  },
+  "dependencyLockSha256": "a11419b204a3e22b3902b6df52b2cf5ca150e68713b412da3d0bd048a832de85"
+}

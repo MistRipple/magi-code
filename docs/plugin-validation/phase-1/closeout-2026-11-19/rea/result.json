@@ -1,0 +1,136 @@
+{
+  "completed": true,
+  "businessVerified": true,
+  "package": "dsh-rea",
+  "version": "1.2.0",
+  "archiveSha256": "3671ae98e98d3f736cccb2d89a822d72fa2e142da5b89aa437f7082f3ee621b3",
+  "integrity": "sha512-nioBr1WqCACU9K7N6h6NLw9i03vAg/IWnJRtprTA7kdsGYRg/gptO70obW51ijtnZJw5dR5BjiV5R4KkcBfigA==",
+  "toolCount": 255,
+  "reaVersion": "6.9.0",
+  "buildIdentity": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+  "daemonSha256": "866ee7f286467075dd39ec73653d7e9de584593bce182dec68bf4ffc6237b94a",
+  "sdkLockSha256": "d3c2f75c3212b96733ec7cf9afda06de9d228f708f2e970eadda0279444f8679",
+  "dependenciesSha256": "bfeeeaf5683671904ebb3c678c0e0629fb5656f6db470e798b006c3c0aa384d1",
+  "checks": [
+    {
+      "name": "独立验收端口空闲",
+      "ok": true
+    },
+    {
+      "name": "精确包名搜索优先",
+      "ok": true
+    },
+    {
+      "name": "安装前真实 SVG 保持矢量并可在列表和详情解码",
+      "ok": true
+    },
+    {
+      "name": "在线原包预览展示完整性摘要",
+      "ok": true
+    },
+    {
+      "name": "安装保留原包 SVG 和在线来源",
+      "ok": true
+    },
+    {
+      "name": "安装前后 SVG 原字节一致且直接导航被隔离",
+      "ok": true
+    },
+    {
+      "name": "真实 REA 工具突破静态清单的 128 项限制并进入 daemon",
+      "ok": true
+    },
+    {
+      "name": "REA 版本与工具数由原页面状态卡读取",
+      "ok": true
+    },
+    {
+      "name": "原生 React 设置表单与状态卡片加载，无未提供模块",
+      "ok": true
+    },
+    {
+      "name": "上游 Ghidra 外链保留 href、target 与链接色",
+      "ok": true
+    },
+    {
+      "name": "原生表单默认值与运行期配置一致",
+      "ok": true
+    },
+    {
+      "name": "原生表单保存经 CAS 持久化并触发上游 MCP 配置重载",
+      "ok": true
+    },
+    {
+      "name": "390px 原生设置无横向溢出",
+      "ok": true
+    },
+    {
+      "name": "切换设置分类保留隔离文档并移出可交互区域",
+      "ok": true
+    },
+    {
+      "name": "返回插件设置复用同一文档，保留未保存表单与滚动位置",
+      "ok": true
+    },
+    {
+      "name": "设置页保活不会把未提交草稿写成 daemon 配置",
+      "ok": true
+    },
+    {
+      "name": "返回对话再打开设置仍保留同一原包表单",
+      "ok": true
+    },
+    {
+      "name": "停用清空真实 MCP 动态目录",
+      "ok": true
+    },
+    {
+      "name": "全局停用释放设置文档，不把页面保活当成插件继续运行",
+      "ok": true
+    },
+    {
+      "name": "重激活保留配置并恢复真实 MCP 工具",
+      "ok": true
+    },
+    {
+      "name": "重新启用创建新文档并读取 daemon 配置，不复活旧页面草稿",
+      "ok": true
+    },
+    {
+      "name": "真实模型经原生 Task 与原生审批执行 REA 原包分析，而非只枚举工具",
+      "ok": true
+    },
+    {
+      "name": "原始 REA 结果包含样本 IPC、桥 API 与源文件 SHA-256",
+      "ok": true
+    },
+    {
+      "name": "真实模型根据 REA 原始结果给出事实或明确报告结果截断",
+      "ok": true
+    },
+    {
+      "name": "静态分析保留样本原字节，插件在独立新会话无需再次启用",
+      "ok": true
+    },
+    {
+      "name": "REA 分析在执行中可取消",
+      "ok": true
+    },
+    {
+      "name": "REA 分析在共享宿主崩溃后结算且不重放",
+      "ok": true
+    },
+    {
+      "name": "宿主恢复后能够重新完成 REA 分析，历史取消终态保持",
+      "ok": true
+    },
+    {
+      "name": "主窗口和原包 iframe 无未捕获运行异常",
+      "ok": true
+    },
+    {
+      "name": "完整应用重启恢复实际 REA 工具及已提交的设置",
+      "ok": true
+    }
+  ]
+}

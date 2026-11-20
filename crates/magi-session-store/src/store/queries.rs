@@ -46,13 +46,7 @@ fn mainline_resume_candidate_in(
         return None;
     }
     // 被新消息取代的取消不是“停止”，只有用户主动停止才可以继续。
-    if turn.status == CanonicalTurnStatus::Cancelled
-        && user_item
-            .metadata
-            .get("interruptionSource")
-            .and_then(serde_json::Value::as_str)
-            != Some("user")
-    {
+    if turn.status == CanonicalTurnStatus::Cancelled && !turn.was_interrupted_by_user() {
         return None;
     }
     let original_user_message = user_item.content.as_deref()?.trim().to_string();

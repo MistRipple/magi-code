@@ -2,6 +2,7 @@ mod project_migration;
 
 use super::config::DaemonError;
 use super::session_event_log::SessionConversationProjection;
+use crate::native_plugin_platform::PluginSessionObserver;
 use magi_core::{DomainError, DomainResult, SessionId, Task};
 use magi_event_bus::AuditUsageLedgerSnapshot;
 use magi_knowledge_store::KnowledgeState;
@@ -16,7 +17,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 use tracing::warn;
 
@@ -30,6 +31,7 @@ pub(crate) struct StateRepository {
     session_event_cache: Arc<Mutex<HashMap<magi_core::SessionId, SessionConversationProjection>>>,
     event_accepted_submissions: Arc<Mutex<Vec<AcceptedSubmissionRecord>>>,
     unavailable_sessions: Arc<Mutex<Vec<UnavailableSession>>>,
+    plugin_session_observer: Arc<OnceLock<PluginSessionObserver>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -168,7 +170,14 @@ impl StateRepository {
             session_event_cache: Arc::new(Mutex::new(HashMap::new())),
             event_accepted_submissions: Arc::new(Mutex::new(Vec::new())),
             unavailable_sessions: Arc::new(Mutex::new(Vec::new())),
+            plugin_session_observer: Arc::new(OnceLock::new()),
         }
+    }
+
+    pub(crate) fn install_plugin_session_observer(&self, observer: PluginSessionObserver) {
+        self.plugin_session_observer
+            .set(observer)
+            .expect("plugin session observer is installed once");
     }
 
     pub(crate) fn shared_write_lock(&self) -> Arc<Mutex<()>> {
@@ -374,9 +383,304 @@ impl SessionEventWriter for StateRepository {
             Some(acceptance),
         )
     }
+
+    fn append_session_title(&self, session_id: &SessionId, title: &str) -> DomainResult<u64> {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        self.append_session_title_locked(session_id, title)
+    }
+
+    fn append_session_command_event(
+        &self,
+        session_id: &SessionId,
+        event: magi_session_store::SessionCommandEvent,
+    ) -> DomainResult<u64> {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        self.append_session_command_event_locked(session_id, event)
+    }
+
+    fn append_model_attempt_stream(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        turn_seq: u64,
+        stream: magi_session_store::ModelAttemptStream,
+    ) -> DomainResult<u64> {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        self.append_model_attempt_stream_locked(session_id, turn_id, turn_seq, stream)
+    }
+
+    fn append_model_request(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        turn_seq: u64,
+        request: magi_session_store::ModelRequestSnapshot,
+    ) -> DomainResult<Option<u64>> {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("state repository write lock poisoned");
+        self.append_model_request_locked(session_id, turn_id, turn_seq, request)
+    }
+
+    fn publish_live_assistant_stream(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        step_id: &str,
+        attempt_id: &str,
+        event: magi_session_store::LiveAssistantStreamEvent,
+    ) {
+        let Some(observer) = self.plugin_session_observer.get() else {
+            return;
+        };
+        let main_step = if matches!(event, magi_session_store::LiveAssistantStreamEvent::Start) {
+            let cache = self
+                .session_event_cache
+                .lock()
+                .expect("session event cache lock poisoned");
+            cache
+                .get(session_id)
+                .filter(|projection| projection.is_resident())
+                .and_then(|projection| {
+                    crate::native_plugin_platform::session_observation::main_execution_step_position(
+                        projection.canonical_turns(),
+                        turn_id,
+                        step_id,
+                    )
+                    .map(|(turn, step)| (turn, step, projection.last_event_seq()))
+                })
+        } else {
+            None
+        };
+        observer.publish_live_assistant_stream(session_id, attempt_id, main_step, event);
+    }
 }
 
 impl StateRepository {
+    fn append_session_title_locked(
+        &self,
+        session_id: &SessionId,
+        title: &str,
+    ) -> DomainResult<u64> {
+        let mut cache = self
+            .session_event_cache
+            .lock()
+            .expect("session event cache lock poisoned");
+        let event_root = self.session_event_root(session_id);
+        // 提交可能触发检查点，检查点要写出完整回合：已释放回合（或从未载入）的会话
+        // 先从事件目录重放常驻，与回合事务的写入路径一致，不能带着空回合去写检查点。
+        if !cache
+            .get(session_id)
+            .is_some_and(SessionConversationProjection::is_resident)
+        {
+            let loaded =
+                SessionConversationProjection::load(&event_root, session_id).map_err(|error| {
+                    DomainError::Persistence {
+                        message: error.to_string(),
+                    }
+                })?;
+            cache.insert(session_id.clone(), loaded);
+        }
+        let current = cache
+            .get(session_id)
+            .expect("projection was made resident above")
+            .clone();
+        let (mut next, event) = current
+            .append_session_title(&event_root, session_id, title)
+            .map_err(|error| DomainError::Persistence {
+                message: error.to_string(),
+            })?;
+        next.touch();
+        let previous = cache
+            .insert(session_id.clone(), next)
+            .expect("previous session projection was resident");
+        trim_resident_event_projections(&mut cache);
+        if let Some(observer) = self.plugin_session_observer.get()
+            && let Some(projection) = cache.get(session_id)
+        {
+            let before_request = previous.latest_model_request_state();
+            observer.publish(
+                std::slice::from_ref(&event),
+                previous.canonical_turns(),
+                previous.inputs(),
+                before_request.as_ref(),
+                projection.canonical_turns(),
+            );
+        }
+        Ok(event.event_seq)
+    }
+
+    fn append_session_command_event_locked(
+        &self,
+        session_id: &SessionId,
+        command_event: magi_session_store::SessionCommandEvent,
+    ) -> DomainResult<u64> {
+        let mut cache = self
+            .session_event_cache
+            .lock()
+            .expect("session event cache lock poisoned");
+        let event_root = self.session_event_root(session_id);
+        if !cache
+            .get(session_id)
+            .is_some_and(SessionConversationProjection::is_resident)
+        {
+            let loaded =
+                SessionConversationProjection::load(&event_root, session_id).map_err(|error| {
+                    DomainError::Persistence {
+                        message: error.to_string(),
+                    }
+                })?;
+            cache.insert(session_id.clone(), loaded);
+        }
+        let current = cache
+            .get(session_id)
+            .expect("projection was made resident above")
+            .clone();
+        let (mut next, event) = current
+            .append_session_command_event(&event_root, session_id, command_event)
+            .map_err(|error| DomainError::Persistence {
+                message: error.to_string(),
+            })?;
+        next.touch();
+        let previous = cache
+            .insert(session_id.clone(), next)
+            .expect("previous session projection was resident");
+        trim_resident_event_projections(&mut cache);
+        if let Some(observer) = self.plugin_session_observer.get()
+            && let Some(projection) = cache.get(session_id)
+        {
+            let before_request = previous.latest_model_request_state();
+            observer.publish(
+                std::slice::from_ref(&event),
+                previous.canonical_turns(),
+                previous.inputs(),
+                before_request.as_ref(),
+                projection.canonical_turns(),
+            );
+        }
+        Ok(event.event_seq)
+    }
+
+    fn append_model_attempt_stream_locked(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        turn_seq: u64,
+        stream: magi_session_store::ModelAttemptStream,
+    ) -> DomainResult<u64> {
+        let mut cache = self
+            .session_event_cache
+            .lock()
+            .expect("session event cache lock poisoned");
+        let event_root = self.session_event_root(session_id);
+        // 事件按回合身份校验，且提交可能触发检查点：回合必须常驻（与回合事务同一规则）。
+        if !cache
+            .get(session_id)
+            .is_some_and(SessionConversationProjection::is_resident)
+        {
+            let loaded =
+                SessionConversationProjection::load(&event_root, session_id).map_err(|error| {
+                    DomainError::Persistence {
+                        message: error.to_string(),
+                    }
+                })?;
+            cache.insert(session_id.clone(), loaded);
+        }
+        let current = cache
+            .get(session_id)
+            .expect("projection was made resident above")
+            .clone();
+        let (mut next, event) = current
+            .append_model_attempt_stream(&event_root, session_id, turn_id, turn_seq, stream)
+            .map_err(|error| DomainError::Persistence {
+                message: error.to_string(),
+            })?;
+        next.touch();
+        let previous = cache
+            .insert(session_id.clone(), next)
+            .expect("previous session projection was resident");
+        trim_resident_event_projections(&mut cache);
+        if let Some(observer) = self.plugin_session_observer.get()
+            && let Some(projection) = cache.get(session_id)
+        {
+            let before_request = previous.latest_model_request_state();
+            observer.publish(
+                std::slice::from_ref(&event),
+                previous.canonical_turns(),
+                previous.inputs(),
+                before_request.as_ref(),
+                projection.canonical_turns(),
+            );
+        }
+        Ok(event.event_seq)
+    }
+
+    fn append_model_request_locked(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+        turn_seq: u64,
+        request: magi_session_store::ModelRequestSnapshot,
+    ) -> DomainResult<Option<u64>> {
+        let mut cache = self
+            .session_event_cache
+            .lock()
+            .expect("session event cache lock poisoned");
+        let event_root = self.session_event_root(session_id);
+        if !cache
+            .get(session_id)
+            .is_some_and(SessionConversationProjection::is_resident)
+        {
+            let loaded =
+                SessionConversationProjection::load(&event_root, session_id).map_err(|error| {
+                    DomainError::Persistence {
+                        message: error.to_string(),
+                    }
+                })?;
+            cache.insert(session_id.clone(), loaded);
+        }
+        let current = cache
+            .get(session_id)
+            .expect("projection was made resident above")
+            .clone();
+        let Some((mut next, event)) = current
+            .append_model_request(&event_root, session_id, turn_id, turn_seq, request)
+            .map_err(|error| DomainError::Persistence {
+                message: error.to_string(),
+            })?
+        else {
+            return Ok(None);
+        };
+        next.touch();
+        let previous = cache
+            .insert(session_id.clone(), next)
+            .expect("previous session projection was resident");
+        trim_resident_event_projections(&mut cache);
+        if let Some(observer) = self.plugin_session_observer.get()
+            && let Some(projection) = cache.get(session_id)
+        {
+            let before_request = previous.latest_model_request_state();
+            observer.publish(
+                std::slice::from_ref(&event),
+                previous.canonical_turns(),
+                previous.inputs(),
+                before_request.as_ref(),
+                projection.canonical_turns(),
+            );
+        }
+        Ok(Some(event.event_seq))
+    }
+
     fn append_canonical_turn_transaction_locked(
         &self,
         session_id: &SessionId,
@@ -384,6 +688,13 @@ impl StateRepository {
         inputs: &[SessionInputMutation],
         acceptance: Option<AcceptedSubmissionRecord>,
     ) -> DomainResult<()> {
+        let first_session_commit = acceptance.as_ref().is_some_and(|record| {
+            let snapshots = self
+                .session_projection_cache
+                .lock()
+                .expect("session projection cache lock poisoned");
+            self.session_has_no_snapshot(&record.session.session, &snapshots)
+        });
         let mut cache = self
             .session_event_cache
             .lock()
@@ -406,7 +717,13 @@ impl StateRepository {
         let projection = cache
             .get(session_id)
             .expect("projection was made resident above");
-        let next = projection
+        // First-turn acceptance can persist a session before its directory
+        // snapshot exists. Both durable paths run under the repository write lock.
+        let created = acceptance
+            .as_ref()
+            .filter(|_| first_session_commit && projection.accepted_submissions().is_empty())
+            .map(|record| record.session.session.clone());
+        let (mut next, events) = projection
             .append_session_transaction(
                 &event_root,
                 session_id,
@@ -417,9 +734,10 @@ impl StateRepository {
             .map_err(|error| DomainError::Persistence {
                 message: error.to_string(),
             })?;
-        let mut next = next;
         next.touch();
-        cache.insert(session_id.clone(), next);
+        let previous = cache
+            .insert(session_id.clone(), next)
+            .expect("previous session projection was resident");
         trim_resident_event_projections(&mut cache);
         if let Some(acceptance) = acceptance {
             let mut accepted = self
@@ -432,6 +750,23 @@ impl StateRepository {
                         == acceptance.session.canonical_turn.turn_id)
             });
             accepted.push(acceptance);
+        }
+        // Send while the repository still holds its write order. Plugin dispatch
+        // cannot wait on the repository or influence the committed transaction.
+        if let Some(observer) = self.plugin_session_observer.get()
+            && let Some(projection) = cache.get(session_id)
+        {
+            if let Some(session) = created {
+                observer.publish_created(&session);
+            }
+            let before_request = previous.latest_model_request_state();
+            observer.publish(
+                &events,
+                previous.canonical_turns(),
+                previous.inputs(),
+                before_request.as_ref(),
+                projection.canonical_turns(),
+            );
         }
         Ok(())
     }

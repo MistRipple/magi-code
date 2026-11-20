@@ -32,7 +32,7 @@ Magi 提供 Electron 桌面 GUI 和 Web 工作台，手机和平板访问同一 
 
 ## 插件、GUI/Web 和预留接口的边界
 
-插件包、安装、授权和生命周期由 daemon 管理，后台由受信 Node 扩展宿主运行，业务提案经唯一 ExtensionBus 裁决。扩展能力及 UI 槽位以[插件系统设计](plugin-system-requirements-design.md)和[扩展协议](extension-protocol-v1.md)为准，不在本文维护第二份能力目录。插件不替换 Magi 的工作流或会话引擎。
+插件包、安装、授权和生命周期由 daemon 管理。共享 Cordis Node 宿主运行原包，Magi 原生领域服务裁决插件提交的业务动作。扩展能力及 UI 槽位见 [DSH 对齐设计](dsh-seam-alignment.md)，进程间控制见[共享宿主协议](plugin-host-protocol.md)。
 
 工具参数被改写后重新校验权限；插件不能把拒绝改为允许。guard 失败、超时或熔断阻止受影响动作。停用和升级停止新接纳，并沿原生命周期取消或等待工作、结算资源；受信 Node 对文件、网络和进程的直接访问不因此成为沙箱能力。
 

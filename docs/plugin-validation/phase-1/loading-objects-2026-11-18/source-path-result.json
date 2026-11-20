@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 1,
+  "scope": "admitted-include-source-path-and-original-mgr-file-intake",
+  "capturedAt": "2026-11-18T00:54:01.803780+00:00",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "hostLock": {
+    "path": "crates/magi-extension-host/runtime/dsh/package-lock.json",
+    "sha256": "9cbccb124b07ce443f6ca31bdfe3fa1f4c538aa58bf8096cfdcfffc416104e3c"
+  },
+  "preparedProject": "target/dsh-phase-1/projects/mgr-source-path-2026-11-18",
+  "dependencyLock": {
+    "path": "target/dsh-phase-1/projects/mgr-source-path-2026-11-18/package-lock.json",
+    "sha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+  },
+  "original": {
+    "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+    "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+    "name": "dsh-plugin-mgr",
+    "version": "0.2.13",
+    "verifiedOriginalFiles": {
+      "LICENSE": "d650e965595d51ade8795344e77785c82bfa3bb3c1f41f3d5f57c4ca19d5966e",
+      "dist/client.js": "fe305e14c80b6fcf95e54a96c341dbf14d289531b5eefb3205d4f007bd9bec1c",
+      "dist/http-q4G0rVPe.js": "9a2b24830ea79ea2793de04cb49034fccc4fb78ed2a3d175d972dc96ba24e9eb",
+      "dist/index.js": "5c81bd2b0c5e54292294bc5ab70a62b31c48b65b73576539b95889efb084fd0d",
+      "dist/internal.js": "6dce13d22cfce594bed2feee96ee8d100f81321a2919fd77d965cebcd0e90464",
+      "package.json": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "README.md": "69b9eee2f9c249e66800aa0eaa247c3041423532d5a542ec769bbbe38fffe2e3",
+      "icon.svg": "6307668063214a63967fed558e1a73194a3394911288cf833dbea0892f49df74",
+      "cordis.patch.yml": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9"
+    }
+  },
+  "sourceSha256": {
+    "crates/magi-extension-host/runtime/dsh/build-include-journal.mjs": "2bc5b4a44f251918c9061aeeb0178462cdddd0c008a8cfafd4462ea74c88cdcf",
+    "crates/magi-extension-host/runtime/dsh/committed-tree.mjs": "f5070a3a5152e9fec32108179de69a116c85adb3d3cf44659ca076b1ac3eeb21",
+    "crates/magi-extension-host/runtime/dsh/configuration-access.mjs": "b63e6faefd27a7d9785527fde4730600fef7e251dc2f18253f0064d82f646706",
+    "crates/magi-extension-host/runtime/dsh/configuration-edit.mjs": "8fd4fe591537500d52e36230ad3ca2e53b2cf24dde1f1a2da58018582d4a3ec4",
+    "crates/magi-extension-host/runtime/dsh/configuration-group.mjs": "a3433cc52232c3cec64230b80e47a9a53bd0f814eca89f34b9e06e48475c52e5",
+    "crates/magi-extension-host/runtime/dsh/configuration-order.mjs": "39d8107d22d104cd1430f0f97be2a8ac72421f46adb7412f6188e64db7b14010",
+    "crates/magi-extension-host/runtime/dsh/configuration.mjs": "fc2f380e19b67aefc2c71e14190efd681556ed5cdfb100874f4e929bbeaf9082",
+    "crates/magi-extension-host/runtime/dsh/entry.mjs": "74fb3a079b63e9ab60a5be6ee4ad879715c29a2e2e337b60a8955b109dc4a37e",
+    "crates/magi-extension-host/runtime/dsh/include-journal.entry.mjs": "71bcb5073022ad0476505cb2915c17bf69f0d34ce44bc8bf022ca916493a4bbd",
+    "crates/magi-extension-host/runtime/dsh/include-journal.generated.mjs": "d6adf43ccd07df6c60709b06dee0f0e180a7cf5f6a6fef88ffe565b5f2e11c32",
+    "crates/magi-extension-host/runtime/dsh/lifecycle.mjs": "630e2b88ca6f34b66c1639bc6b05e63f5c22431fbcd8fe37138232e15d6b822c",
+    "crates/magi-extension-host/runtime/dsh/loading-objects.mjs": "e326462e9ae7e19c76b1f8f360bf4cf3dcb495134418cf994d950748a60ccfb2",
+    "crates/magi-extension-host/runtime/dsh/packages.mjs": "ac10dcd3a6f67fee94caf1abcafc28637ab3eac0c059453eb2be8c8c60f4572d",
+    "crates/magi-extension-host/runtime/dsh/test/committed-tree.test.mjs": "50940df7dd356ce422d66e2372e21c6909b7dff21d736a8d06a229b4d685d823",
+    "crates/magi-extension-host/runtime/dsh/test/configuration-access.test.mjs": "dfe3728137d22adad1673e3dbc13ca1af66c6932a909d436651dc2122983aab3",
+    "crates/magi-extension-host/runtime/dsh/test/configuration-edit.test.mjs": "8d210ecc9299659a332620da33460ddf597de1e27a3217d63795ea08f4567f1d",
+    "crates/magi-extension-host/runtime/dsh/test/configuration.test.mjs": "17c77fa91a369db21d47dcee96f0d71ccbe2f4d661fdbaf300b243180db8af6a",
+    "crates/magi-extension-host/runtime/dsh/test/lifecycle.test.mjs": "590b80f7b43b3755ce166ad2ebe3c1f5d08d237c99b64a7fddd212893f707df5",
+    "crates/magi-extension-host/runtime/dsh/test/memory-root.test.mjs": "103bb24ad865e1e552ed081195a2271b1a2f3039cb54f6c57eb5e0716ed80cff",
+    "crates/magi-extension-host/runtime/dsh/test/packages.test.mjs": "ee0eeb4570107f07f01560e5e3aa7ddd1a1ed0a05ca7bed479209182f5c252dc",
+    "crates/magi-plugin-system/tests/loading_host.rs": "0fa6d6ac689f2f343086e4a47bc9dd62a21b7dd6bfec353076fa692fc746cd11"
+  },
+  "verification": {
+    "nodePassed": 60,
+    "rustPassed": 181,
+    "rustIgnored": 5,
+    "originalRustPassed": 5,
+    "clippy": "passed"
+  },
+  "regression": {
+    "before": "Node resolved an admitted absolute path as a URL, truncating the actual name at #",
+    "after": "Include.filename and base URL use the admitted file"
+  },
+  "originalSourceIntake": {
+    "acceptedRevisions": [
+      1,
+      2,
+      3
+    ],
+    "activationGenerations": [
+      1,
+      2
+    ],
+    "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+    "business": "not-run",
+    "candidateWriter": "original dist/internal.js disableRows and enableRows",
+    "finalStatus": {
+      "activationGeneration": 2,
+      "configurationEpoch": 1,
+      "hostGeneration": 1,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader",
+        "webServer"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.13"
+    },
+    "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+    "originalBundleUnchanged": true,
+    "package": "dsh-plugin-mgr@0.2.13",
+    "scope": "source-notification-intake",
+    "states": [
+      "waiting",
+      "removed",
+      "waiting"
+    ]
+  },
+  "limits": [
+    "Mgr original enableRows/disableRows executed outside Mgr apply with actual candidate path supplied by test",
+    "Mgr instance waiting for public loader and webServer",
+    "Mgr route, page, install, update, uninstall and full Electron flow not run"
+  ]
+}

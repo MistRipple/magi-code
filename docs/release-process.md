@@ -62,7 +62,7 @@ git config user.email east_xiaodong@126.com
 ### 环境、磁盘与凭据
 
 - Node.js 与 Electron 45 的内置 Node 24 对齐，使用 24.x，最低 24.22.1。Vite 8、Electron 45、ASAR 4 和 Desktop/Worker 的 Node 24 目标均在该基线验证。
-- 受信扩展宿主随包携带固定版本 Node（与上面的开发工具链 Node 24 无关，由 `apps/desktop/node-runtime.json` 固定版本与各平台归档的 SHA-256）。升级它时：从 `https://nodejs.org/dist/vX.Y.Z/SHASUMS256.txt` 取六个平台归档的摘要写入该文件，运行 `node apps/desktop/scripts/node-runtime.mjs stage <目录>` 确认下载、摘要与清空环境下的真实执行都通过，再走正常发布预检。发行包约增加 140MB（未压缩），Node 许可证随 `licenses/` 交付。
+- 受信扩展宿主使用官方归档中的 Node 和 npm。`apps/desktop/node-runtime.json` 固定两者版本及各平台归档的 SHA-256。升级时从对应 Node 版本的 `SHASUMS256.txt` 取六个平台归档的摘要，并核对归档附带的 npm 版本。运行 `node apps/desktop/scripts/node-runtime.mjs stage <目录>`，校验归档并在空环境中运行两个程序，再走正常发布预检。npm 随 `daemon/node/npm/` 交付，许可证在同目录。共享 SDK 的装配使用该 npm 执行 `ci`，生产依赖锁在 `crates/magi-extension-host/runtime/dsh/package-lock.json`。解包检查校验这些资源的逐文件摘要。
 - Rust 以 rust-toolchain.toml 为准，目前为 1.97.0，安装 clippy、rustfmt；预检脚本与工作流必须对齐。
 - 安装 cargo-audit，当前安全工作流固定为 0.22.2。另需 Git、GitHub CLI、jq、curl 及当前平台原生构建工具；macOS 需要 Xcode Command Line Tools。
 - 检查磁盘空间。Rust debug/release 缓存、Electron 解包目录和安装包会同时占用空间。只清理已确认可重建、没有进程使用的生成缓存，不删除状态目录、工作区数据或未提交文件。

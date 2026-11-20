@@ -25,9 +25,10 @@ const api = async (path, body) => {
   const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result)); return result;
 };
 const query = (text) => page.evaluate(`(()=>{const input=document.querySelector('[data-testid=plugin-search]'); input.value=${JSON.stringify(text)};input.dispatchEvent(new Event('input',{bubbles:true}));return true;})()`);
-const search = async (text) => {
+// 只有第一次搜索某个词才显示"搜索中"；之前搜过的词按产品规则直接显示缓存结果并在后台刷新。
+const search = async (text, { cached = false } = {}) => {
   await query(text);
-  await waitFor(() => ui.exists('[data-testid=plugin-search-loading]'), '搜索加载反馈');
+  if (!cached) await waitFor(() => ui.exists('[data-testid=plugin-search-loading]'), '搜索加载反馈');
   await waitFor(async () => !await ui.exists('[data-testid=plugin-search-loading]'), '搜索完成', 60_000);
 };
 async function screenshot(name) {
@@ -158,23 +159,31 @@ try {
   await waitFor(async () => (await api('/api/plugins')).plugins.find((p) => p.manifest.id === plugin.manifest.id)?.manifest.version === plugin.manifest.version, '在线升级完成', 190_000);
   report.check('真实 npm 旧版一键更新到当前版本', true, `${older.version} → ${plugin.manifest.version}`);
   await waitFor(async () => !await ui.exists('[data-testid=plugin-search-loading]'), '安装后的搜索刷新', 60_000);
-  const failure = await intercept(`${origin}/api/plugins/upstream?*`);
-  await query('dsh-rea'); const failed = await failure.request();
-  await page.call('Fetch.fulfillRequest', { requestId: failed.requestId, responseCode: 503, responseHeaders: [{ name: 'content-type', value: 'application/json' }], body: Buffer.from(JSON.stringify({ message: 'INTERACTION_SEARCH_FAILURE' })).toString('base64') });
-  await failure.stop();
-  await waitFor(() => ui.exists('[data-testid=plugin-upstream-error]'), '搜索错误反馈');
+  // 搜索词变化会先后发出多次请求，页面按设计丢弃被取代请求的失败，只显示当前请求的结果：
+  // 让这一段时间内所有被拦截的搜索请求都失败，直到错误提示出现。
+  const failureBody = Buffer.from(JSON.stringify({ message: 'INTERACTION_SEARCH_FAILURE' })).toString('base64');
+  const stopFailing = page.on('Fetch.requestPaused', (event) => {
+    page.call('Fetch.fulfillRequest', { requestId: event.requestId, responseCode: 503, responseHeaders: [{ name: 'content-type', value: 'application/json' }], body: failureBody }).catch(() => {});
+  });
+  await page.call('Fetch.enable', { patterns: [{ urlPattern: `${origin}/api/plugins/upstream?*`, requestStage: 'Request' }] });
+  await query('dsh-rea');
+  try { await waitFor(() => ui.exists('[data-testid=plugin-upstream-error]'), '搜索错误反馈'); }
+  finally { await page.call('Fetch.disable'); stopFailing(); }
   report.check('搜索失败停止加载并提供原位重试', !await ui.exists('[data-testid=plugin-search-loading]') && (await ui.text('[data-testid=plugin-upstream-error]')).includes('INTERACTION_SEARCH_FAILURE'));
   await ui.click('[data-testid=plugin-upstream-error] button');
   await waitFor(async () => !await ui.exists('[data-testid=plugin-search-loading]') && await ui.exists(row('dsh-rea')), '重试恢复', 60_000);
   const stale = await intercept(`${origin}/api/plugins/upstream?q=dsh-rea`);
   await query('dsh-rea '); const old = await stale.request();
-  await search('dsh-connect-workbuddy');
+  // 这个搜索词在前面已经搜过，结果在页面缓存里：按产品规则不会再显示"搜索中"，所以只等新结果出现。
+  await query('dsh-connect-workbuddy');
+  // 此时 WorkBuddy 已安装，结果行的身份是已安装插件的 id，而不是未安装的上游行。
+  await waitFor(async () => !await ui.exists('[data-testid=plugin-search-loading]') && await first() === plugin.manifest.id, '新搜索结果', 60_000);
   await page.call('Fetch.continueRequest', { requestId: old.requestId }).catch(() => {}); await stale.stop();
   await waitFor(() => old.networkId && finishedRequests.has(old.networkId), '旧搜索请求结束');
   report.check('连续改词后旧请求不能覆盖新搜索结果', await first() === plugin.manifest.id);
   await page.call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
   await page.call('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'light' }] });
-  await search('dsh-rea'); await ui.click(row('dsh-rea'));
+  await search('dsh-rea', { cached: true }); await ui.click(row('dsh-rea'));
   const narrowFailure = await intercept(`${origin}/api/plugins/upstream/preview`);
   await ui.click('[data-testid=plugin-detail-install]');
   const narrowRequest = await narrowFailure.request();

@@ -1,0 +1,37 @@
+{
+  "samples": [
+    {
+      "name": "@idoall/dsh-notify",
+      "version": "0.4.9",
+      "status": 409,
+      "message": "解析插件依赖失败：Shared SDK dependency is missing: @deepseek-ai/dsh-client-ui-session",
+      "code": "CONFLICT"
+    },
+    {
+      "name": "dsh-plugin-mission-control",
+      "version": "0.2.1",
+      "status": 200,
+      "runtimeState": "running"
+    },
+    {
+      "name": "dsh-eval-control",
+      "version": "0.5.0",
+      "status": 409,
+      "message": "解析插件依赖失败：Shared SDK dependency is missing: @deepseek-ai/dsh",
+      "code": "CONFLICT"
+    },
+    {
+      "name": "dsh-plugin-message-history",
+      "version": "1.0.6",
+      "status": 200,
+      "runtimeState": "running"
+    },
+    {
+      "name": "dsh-better-sidebar",
+      "version": "0.32.1",
+      "status": 409,
+      "message": "解析插件依赖失败：Shared SDK dependency is missing: @deepseek-ai/dsh-client-locale",
+      "code": "CONFLICT"
+    }
+  ]
+}

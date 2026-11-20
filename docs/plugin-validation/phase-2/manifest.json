@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "phase": 2,
+  "status": "exit-criteria-unmet",
+  "source": "https://registry.npmjs.org",
+  "dshSdk": "0.2.2-rc.3",
+  "packages": [
+    {
+      "name": "@idoall/dsh-notify",
+      "version": "0.4.9",
+      "sha256": "434713c399be76faac104c69b89c73ae91aa750aba4552cbb01aa505b91fa713",
+      "integrity": "sha512-6Yc70cfCwodLJboVRJIt2kFvSjSpJeusRmgVt4ivA49ivJXtNH5fyGSn6SzEdRxFQjdKhjeUwnO70OgYTINlRw==",
+      "business": "completion and failure notifications from canonical session events, with no notice on user cancellation",
+      "observedBusiness": "original notification endpoint verified for completion, model authentication failure and user cancellation",
+      "businessEvidence": "notify-turns-2026-11-19/result.json",
+      "uiScope": "backend only in this batch",
+      "tarball": "https://registry.npmjs.org/@idoall/dsh-notify/-/dsh-notify-0.4.9.tgz"
+    },
+    {
+      "name": "dsh-plugin-mission-control",
+      "version": "0.2.1",
+      "sha256": "d003b87356dfd2174a4d2194888ff830aa8d95e857b50b494bbd7260119ca251",
+      "integrity": "sha512-bjw79GBSvZQG/sQ41u0KgHQ3irdrA8KguLKVfNm6YUVwwI4/y8Viy/eTU+9Nx3IeUoLbjKuETxttxm+o1XFC4A==",
+      "business": "mission state driven by session and agent events",
+      "observedBusiness": "original package sends REVIEW on completion and ASSIGNED on user cancellation; maps the SDK error outcome to REVIEW instead of BLOCKED",
+      "businessEvidence": "mission-control-turns-2026-11-19/result.json",
+      "toolActivityEvidence": "mission-control-tools-2026-11-19/fixed.json",
+      "sharedObservationEvidence": "shared-observations-2026-11-19/mission-control.json",
+      "sessionCreatedEvidence": "session-created-2026-11-19/result.json",
+      "uiScope": "backend only in this batch",
+      "tarball": "https://registry.npmjs.org/dsh-plugin-mission-control/-/dsh-plugin-mission-control-0.2.1.tgz"
+    },
+    {
+      "name": "dsh-eval-control",
+      "version": "0.5.0",
+      "sha256": "3518c52bf3c34b772a3862085109f47724dadf0a04cabaa1f4c77738101b83bd",
+      "integrity": "sha512-rDegSQDfCRwbMqDXcI7UkaEAXgp/sJtwv1QmRlBs2pPYfYJbS7qxtN4+WvPvweTCqNtsk4+znkHWXKBcM+HZtQ==",
+      "business": "session reader and evaluation control",
+      "businessStatus": "blocked",
+      "countsInFixedSampleDenominator": true,
+      "blockerEvidence": "sdk-admission-2026-11-19/eval-settings-blocked-current.json",
+      "blocker": "Required npm peer @deepseek-ai/dsh is the full upstream application and is outside Magi's packaged SDK contract",
+      "uiScope": "client conversation injection remains outside phase 2 range",
+      "tarball": "https://registry.npmjs.org/dsh-eval-control/-/dsh-eval-control-0.5.0.tgz"
+    },
+    {
+      "name": "dsh-plugin-message-history",
+      "version": "1.0.6",
+      "sha256": "515d9940416782c95c4487e77985a3eb41beb0ddd50836211aa1af072503e82b",
+      "integrity": "sha512-QKn0vz7nap+IB2kwKs4RKkx01qG8wVhMhHmceTGaHikAmXfi8WGieUQQihL+rbw9DopJtXz4CRzCjs9gDgqSwA==",
+      "business": "session history projection",
+      "observedBusiness": "live text input, isolation when disabled and recovery of the original history store after restart",
+      "businessEvidence": "live-input-2026-11-19/result.json",
+      "checkpointHistoryEvidence": "checkpoint-history-2026-11-19/fixed.json",
+      "sharedObservationEvidence": "shared-observations-2026-11-19/message-history.json",
+      "uiScope": "conversation client injection remains outside phase 2 range",
+      "tarball": "https://registry.npmjs.org/dsh-plugin-message-history/-/dsh-plugin-message-history-1.0.6.tgz"
+    }
+  ],
+  "platform": "macOS arm64 development Electron",
+  "businessStatus": "partial-with-blocked-sample",
+  "eventSource": "CanonicalTurnEvent.event_seq in the daemon session log",
+  "remainingContract": "global session query, full session and agent services and event projections, the full session standard kit, and original right-pane title components",
+  "closeoutEvidence": "better-sidebar-2026-11-19/README.md",
+  "rightPaneCandidates": [
+    {
+      "name": "dsh-better-sidebar",
+      "version": "0.32.1",
+      "tarball": "https://registry.npmjs.org/dsh-better-sidebar/-/dsh-better-sidebar-0.32.1.tgz",
+      "sha256": "cd0a88c0da237622a83d465ed824f17c39c74e7edf2609c14cf21c813d70c517",
+      "integrity": "sha512-UcIEAkLuZXz0SkNDwMtycCoO59yCasowG6DqhxkG+jAjQfofF0BbXIOctfjqsU8WyaP6XoSvi4LgMFhEfinBsw==",
+      "business": "Open the original file editor body and title within the Magi right pane for the selected session",
+      "sourceEvidence": "package/lib/client.js:35885-35916",
+      "status": "scoped committed history, original file tree and right-pane editor save verified on one macOS arm64 Electron build; original tab title component remains open",
+      "businessEvidence": "better-sidebar-2026-11-19/result.json",
+      "collapseEvidence": "better-sidebar-collapse-2026-11-19/result.json",
+      "admissionEvidence": "sdk-admission-2026-11-19/result.json",
+      "runtimeStatusEvidence": "sdk-admission-2026-11-19/better-sidebar-waiting-after.json"
+    }
+  ],
+  "previewEvidence": "preview.json",
+  "subsequentEvidence": "sdk-admission-2026-11-19/result.json",
+  "liveInputEvidence": "live-input-2026-11-19/result.json",
+  "sdkLockSha256": "d3c2f75c3212b96733ec7cf9afda06de9d228f708f2e970eadda0279444f8679",
+  "magiBuild": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "daemonSha256": "866ee7f286467075dd39ec73653d7e9de584593bce182dec68bf4ffc6237b94a"
+  }
+}

@@ -7,9 +7,9 @@ use crate::models::{
     InterruptedGoalResumeCheckpoint, SessionAcceptanceRecord, SessionDurableState,
     SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
     SessionRuntimeSidecar, SessionRuntimeSidecarState, SessionSidecarFlushReason,
-    SessionStoreState, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
-    ThreadContextCheckpoint, ThreadContextSnapshot, ThreadModelProviderContext, ThreadVisibility,
-    TimelineEntry,
+    SessionStoreState, TURN_INTERRUPTION_SOURCE_METADATA_KEY, TURN_INTERRUPTION_SOURCE_USER,
+    ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction, ThreadContextCheckpoint,
+    ThreadContextSnapshot, ThreadModelProviderContext, ThreadVisibility, TimelineEntry,
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, GoalId, MissionId, PlanState,
@@ -20,8 +20,6 @@ use magi_tool_runtime::BuiltinToolName;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-const TURN_INTERRUPTION_SOURCE_METADATA_KEY: &str = "interruptionSource";
-const TURN_INTERRUPTION_SOURCE_USER: &str = "user";
 const TURN_INTERRUPTION_SOURCE_DAEMON_RESTART: &str = "daemon_restart";
 const TURN_INTERRUPTED_AT_METADATA_KEY: &str = "interruptedAt";
 const INTERRUPTION_NOTICE_KIND: &str = "session_interrupted";

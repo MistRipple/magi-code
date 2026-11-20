@@ -1,7 +1,6 @@
 //! 内置工具失败载荷的唯一出口。
 //!
-//! 约定见 `docs/builtin-tool-failure-contract.md`：每个失败都有按类别区分的稳定 `error_code`
-//! （`{tool}_{类别}`）、面向模型的 `error`（只描述类别，不带底层错误文本）和 `instruction`
+//! 每个失败载荷都有按类别区分的稳定 `error_code`（`{tool}_{类别}`）、面向模型的 `error`（只描述类别，不带底层错误文本）和 `instruction`
 //! （下一步怎么做）。底层错误的完整内容只写日志。
 
 use magi_core::{HostPathError, ToolFailure};

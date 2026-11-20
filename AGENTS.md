@@ -6,7 +6,7 @@
 
 - Magi 的业务内核是 `magi-daemon`。`apps/daemon` 的 `magi-daemon-app` 是开发和无头入口；Electron 正式发行版由 Main 通过受控 sidecar 托管 daemon。
 - UI、Worker 和宿主不复制 daemon 的会话、任务、权限或持久化事实；UI 只消费和展示服务端事实，不反向发明业务协议，也不绕开授权入口。
-- 产品范围：只提供 Electron 桌面 GUI 与 Web 工作台（手机和平板走同一 Web 工作台的响应式布局），没有 Magi CLI 或独立移动端；外部 Agent Executor 只预留通用扩展接口；插件由 daemon 托管的 Node 扩展宿主承载，QuickJS 与 SDK 1 已删除。不要按这些已排除的方向新增实现。
+- 产品范围：只提供 Electron 桌面 GUI 与 Web 工作台（手机和平板走同一 Web 工作台的响应式布局），没有 Magi CLI 或独立移动端；外部 Agent Executor 只预留通用扩展接口；插件由 daemon 托管的 Node 插件宿主承载，唯一对外插件接口是 DSH 插件合约（SDK 2 只作宿主与 daemon 间的内部协议），QuickJS 与 SDK 1 已删除。不要按这些已排除的方向新增实现。
 - 协议字段、DTO 结构、事件信封与宿主桥接命令处于冻结与收敛状态，只做对应协议兼容规则内的增量修改。
 - 工程约束、运行入口和整体架构见 [docs/README.md](docs/README.md)。
 
@@ -27,7 +27,7 @@
 ## 功能开发
 
 - 先明确用户任务、完整操作流程、状态归属、失败恢复和验收结果，再实现公共能力；不要用单样本补丁或临时兼容代替正式功能。
-- 插件翻译功能遵循[产品合同](docs/plugin-system-requirements-design.md#60-翻译功能的产品合同2026-11-08)及[每轮推进与完成门槛](docs/plugin-system-requirements-design.md#每轮推进与完成门槛2026-11-09)，以真实业务完成验收。
+- 插件功能遵循 [DSH 对齐设计](docs/dsh-seam-alignment.md)：DSH 原包直接安装、直接运行，不做翻译层、兼容分支或补丁；按其[推进阶段与退出条件](docs/dsh-seam-alignment.md#10-推进阶段与退出条件)推进，以固定原包的真实业务任务验收。
 - 涉及界面设计、文案、布局或交互的新增、优化与修复，先读并遵循 [UX/UI 设计与开发规范](docs/ux-ui-guidelines.md)，沿共享组件实施并完成对应验收；规范要求不等于已经实现。
 
 ## 生成物
@@ -40,6 +40,7 @@
 | Browser 工具目录 | `contracts/desktop-browser/browser-tool.schema.json` | `npm run browser-tool-catalog:generate` |
 | Browser 网络边界 | `contracts/desktop-browser/network-policy.json` | `npm run browser-network-policy:generate` |
 | `docs/architecture.html` | Cargo metadata | `npm run docs:architecture` |
+| `crates/magi-extension-host/runtime/dsh/include-journal.generated.mjs` | 锁定 Include 包的公开源码导出、`include-journal.entry.mjs` | `npm --prefix crates/magi-extension-host/runtime/dsh run include:generate` |
 
 各生成流程的细节见 [`contracts/AGENTS.md`](contracts/AGENTS.md)。
 
@@ -63,7 +64,7 @@
 | App Server schema/生成物 | `npm run protocol:check` |
 | Browser 工具 schema/catalog/生成物 | `npm run browser-tool-catalog:check` |
 | Browser 工具执行语义 | `npm run test:browser-core`；涉及真实 Electron/Chromium 行为时按局部规则做运行验收 |
-| 插件包、生命周期、扩展宿主 | `cargo test -p magi-plugin-system -p magi-extension-host --all-targets --locked`；官方插件中心改动加 `npm run plugin-center:check`；真实业务验收按[每轮推进与完成门槛](docs/plugin-system-requirements-design.md#每轮推进与完成门槛2026-11-09) |
+| 插件包、生命周期、扩展宿主 | `cargo test -p magi-plugin-system -p magi-extension-host --all-targets --locked`；真实业务验收按[推进阶段与退出条件](docs/dsh-seam-alignment.md#10-推进阶段与退出条件) |
 | 内置代理提示词、工具定义 | `cargo test -p magi-agent-role`、`cargo test -p magi-conversation-runtime --test prompt_layout_snapshots` 及受影响的提示词断言测试；见下方“提示词与工具定义” |
 | 发布或创建/移动版本 Tag | 严格遵循 [发布流程](docs/release-process.md) |
 

@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-11-18T03:18:45.653592+00:00",
+  "scope": "configured-loader-resource-disposal",
+  "platform": "Darwin",
+  "arch": "arm64",
+  "baseCommit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+  "sdkLockSha256": "f357651dc7f38f034fa4f7993b125f427d6b7670aaaa87eafdc2610077f4ab34",
+  "checks": {
+    "node": {
+      "passed": 64,
+      "skipped": 0
+    },
+    "rust": {
+      "passed": 185,
+      "ignored": 6
+    },
+    "clippy": "passed",
+    "runtimeDisposal": {
+      "nestedIncludeScope": "passed",
+      "staleBatchRejectedAtomically": "passed",
+      "routeLeaseRevoked": "passed",
+      "sameRevisionDidNotReactivate": "passed",
+      "configuredRowsAndSourcePreserved": "passed"
+    }
+  },
+  "mgr": {
+    "oldArchive": {
+      "archiveSha256": "694b301bdd9c116e8fb01b1820e13932b9ad398bda5d1e6139db0de35372be9c",
+      "integrity": "sha512-NlEUaaJ6uOekU95H0pw0sGCfluOaiOJV3FFKLzaI4NiD+F5GGqb2srrqP179vemWaF7M+QzxroZk04Wg2vnmCQ==",
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.12"
+    },
+    "newArchive": {
+      "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+      "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.13"
+    },
+    "acceptedRevisions": [
+      1,
+      2
+    ],
+    "first": {
+      "activationGeneration": 1,
+      "callEpoch": 1,
+      "configurationEpoch": 1,
+      "hostGeneration": 1,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.12"
+    },
+    "replacement": {
+      "activationGeneration": 2,
+      "callEpoch": 1,
+      "configurationEpoch": 1,
+      "hostGeneration": 1,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.13"
+    },
+    "recovered": {
+      "activationGeneration": 3,
+      "callEpoch": 1,
+      "configurationEpoch": 1,
+      "hostGeneration": 2,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.13"
+    },
+    "business": "not-run"
+  }
+}

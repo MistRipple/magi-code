@@ -407,6 +407,7 @@ fn test_session_record(session_id: &SessionId, workspace_id: &str, title: &str) 
         updated_at: now,
         message_count: None,
         workspace_id: Some(workspace_id.to_string()),
+        initial_working_directory_ref: None,
         last_completed_at: None,
         last_viewed_at: None,
         kind: Default::default(),

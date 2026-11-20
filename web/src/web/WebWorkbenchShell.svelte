@@ -328,6 +328,7 @@ import {
     overlay?: boolean;
     desktopSurface?: boolean;
     visible?: boolean;
+    parked?: boolean;
     agentRetainedSurfaces?: MagiDesktopBrowserSurfaceSnapshot[];
   };
   type WebFolderPickerProps = {
@@ -511,8 +512,10 @@ import {
     if (!desktopAppSurface || !desktopSnapshot) return;
     const pendingIntent = pendingDesktopPanelIntentFor(rightPaneState.activeScopeKey);
     if (pendingIntent) {
-      const committed = desktopSnapshot.layout.activePanelKind === pendingIntent.kind
-        && desktopSnapshot.layout.activeTabId === pendingIntent.tabId;
+      const committed = pendingIntent.kind === 'plugin'
+        ? desktopSnapshot.layout.activePanelKind === null && desktopSnapshot.layout.activeTabId === null
+        : desktopSnapshot.layout.activePanelKind === pendingIntent.kind
+          && desktopSnapshot.layout.activeTabId === pendingIntent.tabId;
       if (committed) {
         clearPendingDesktopPanelIntent(
           rightPaneState.activeScopeKey,
@@ -549,6 +552,10 @@ import {
   );
   const rightPaneBackgroundMounted = $derived(
     agentRetainedSurfaces.length > 0,
+  );
+  // 折叠只隐藏已打开的插件文档，避免在同一会话中丢掉编辑器的在途输入。
+  const rightPaneHasOpenPluginTab = $derived(
+    activeRightPaneState.openTabs.some((tab) => tab.kind === 'plugin'),
   );
   const panelVisibility = $derived(resolvePanelVisibility({
     sidebarDrawer: sidebarIsDrawer,
@@ -603,12 +610,8 @@ import {
         browser,
       };
     }
-    if (activeTab.kind === 'plugin') {
-      // 防御分支：应用级视图不应出现在 perSession 容器里。
-      return { scopeKey, kind: null, tabId: null, browserSessionId: null, browser: null };
-    }
-    if (activeTab.kind === 'launcher' || activeTab.kind === 'agents') {
-      // 新标签页和代理列表只是右栏里的界面入口，Desktop 没有对应面板；与空面板一样不激活任何原生面板。
+    if (activeTab.kind === 'plugin' || activeTab.kind === 'launcher' || activeTab.kind === 'agents') {
+      // 由 Renderer 展示的内容不占用 Main 的原生面板。
       return { scopeKey, kind: null, tabId: null, browserSessionId: null, browser: null };
     }
     return {
@@ -3739,8 +3742,8 @@ import {
       <div class="workbench-app-pane" data-testid="workbench-app-pane">
         <App />
       </div>
-      {#if inlineRightPaneVisible && RightPaneComponent}
-        {#if !previewIsOverlay}
+      {#if !desktopAppSurface && RightPaneComponent && (inlineRightPaneVisible || rightPaneHasOpenPluginTab)}
+        {#if inlineRightPaneVisible && !previewIsOverlay}
           <div
             class="preview-resize-handle"
             role="separator"
@@ -3753,8 +3756,10 @@ import {
         <RightPaneComponent
           workspaceRoot={selectedWorkspace?.rootPath || ''}
           overlay={previewIsOverlay}
+          visible={inlineRightPaneVisible && !shellUi.settingsOpen}
+          parked={!inlineRightPaneVisible}
         />
-      {:else if desktopAppSurface && RightPaneComponent && (desktopRightPaneVisible || rightPaneBackgroundMounted)}
+      {:else if desktopAppSurface && RightPaneComponent && (desktopRightPaneVisible || rightPaneBackgroundMounted || rightPaneHasOpenPluginTab)}
         {#if desktopRightPaneVisible}
           <div
             class="desktop-right-pane-resize-handle"
@@ -3775,6 +3780,7 @@ import {
             workspaceRoot={selectedWorkspace?.rootPath || ''}
             desktopSurface={true}
             visible={desktopRightPaneVisible && !shellUi.settingsOpen}
+            parked={!desktopRightPaneVisible && !rightPaneBackgroundMounted}
             agentRetainedSurfaces={agentRetainedSurfaces}
           />
         </div>

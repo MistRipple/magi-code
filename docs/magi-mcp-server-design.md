@@ -346,7 +346,7 @@ OAuth 协议和本机批准入口已实现；第三方客户端兼容矩阵、�
 
 ### 检查命令
 
-- Rust：按改动运行 `cargo check -p magi-mcp-server`、`cargo check -p magi-api` 和受影响的测试；真实外部客户端通路并入 `npm run test:electron-plugins`，使用设置页生成的发行包 stdio 配置与 HTTP。
+- Rust：按改动运行 `cargo check -p magi-mcp-server`、`cargo check -p magi-api` 和受影响的测试；`npm run test:electron-mcp-server` 独立验收原生 MCP 设置与真实外部客户端通路，使用 daemon 生成的发行包 stdio 配置与 HTTP。
 - 涉及设置页：`npm --prefix web run check` 与 `test:mcp-server` 等对应回归。
 - 网络与安全边界变化时验证第 15 节所列风险场景，记录实际运行的范围。
 

@@ -1,0 +1,96 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--dsw-font-family, system-ui, -apple-system, BlinkMacSystemFont, sans-serif);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-primary, #e4e4e7);
+  background: transparent;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.magi-dsh-page-shell {
+  flex: 1;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--dsw-alias-bg-base, transparent);
+}
+
+.magi-dsh-right-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  min-width: 0;
+}
+
+.magi-dsh-settings-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding-top: 4px;
+  padding-bottom: 16px;
+}
+
+.magi-dsh-section-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(128, 128, 128, 0.2));
+}
+
+.magi-dsh-section-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--dsw-radius-md, 8px);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, inherit);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.magi-dsh-section-btn:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(128, 128, 128, 0.1));
+  color: var(--dsw-alias-label-primary, inherit);
+}
+
+.magi-dsh-section-btn.is-active {
+  background: var(--dsw-alias-button-ghost-active-fill, rgba(128, 128, 128, 0.16));
+  border-color: var(--dsw-alias-border-l2, rgba(128, 128, 128, 0.25));
+  color: var(--dsw-alias-label-primary, inherit);
+}
+
+.magi-dsh-section-single-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary, inherit);
+}
+
+.magi-dsh-tabs-bar {
+  display: flex;
+  align-items: center;
+}
+
+.magi-dsh-slot-block {
+  min-width: 0;
+}

@@ -15,9 +15,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-mod compatibility;
 mod drain;
 mod image_attachments;
+mod loading;
 mod migration;
 mod removal;
 mod runtime_catalog;
@@ -25,6 +25,13 @@ mod upgrade;
 mod web;
 
 pub use drain::PluginDrainGuard;
+pub(crate) use loading::RequiredLoadingSource;
+pub use loading::{
+    LoadingActivation, LoadingApplication, LoadingApplicationToken, LoadingCandidate,
+    LoadingConfiguration, LoadingEditProposal, LoadingExecutable, LoadingHostCrashSummary,
+    LoadingInstanceStatus, LoadingPlan, LoadingPreparation, LoadingSource, LoadingSourceEdit,
+};
+pub(crate) use loading::{LoadingInstanceAction, LoadingInstanceChangeSpec, LoadingInstanceTarget};
 pub use removal::PluginChangeScope;
 
 const STATE_FILE: &str = "state.json";
@@ -83,6 +90,8 @@ pub struct PluginManagerState {
     removals: BTreeMap<String, removal::PendingRemoval>,
     #[serde(default)]
     web: web::WebConfiguration,
+    #[serde(default, skip_serializing_if = "loading::LoadingState::is_empty")]
+    loading: loading::LoadingState,
 }
 
 impl Default for PluginManagerState {
@@ -92,6 +101,7 @@ impl Default for PluginManagerState {
             plugins: BTreeMap::new(),
             removals: BTreeMap::new(),
             web: web::WebConfiguration::default(),
+            loading: loading::LoadingState::default(),
         }
     }
 }
@@ -119,6 +129,9 @@ pub struct PluginManager {
     root: PathBuf,
     runtime_catalogs: BTreeMap<String, runtime_catalog::RuntimeCatalog>,
     state: PluginManagerState,
+    loading_application: Option<LoadingApplication>,
+    loading_bindings: BTreeMap<String, loading::LoadingBinding>,
+    last_loading_host_crash: Option<LoadingHostCrashSummary>,
     resources: PluginResourceStore,
     /// 已校验包的内存副本，按插件 ID 缓存并以摘要核对；包文件不可变，
     /// 避免每次投影、准入或调用都重新读盘并解压 ZIP。
@@ -184,6 +197,7 @@ impl PluginManager {
         if state.schema_version != STATE_VERSION {
             return Err(PluginError::CorruptState("插件状态版本不受支持".into()));
         }
+        state.loading.validate()?;
         let mut missing = Vec::new();
         for plugin in state.plugins.values() {
             validate_plugin_path(plugin)?;
@@ -202,6 +216,9 @@ impl PluginManager {
             root,
             runtime_catalogs: BTreeMap::new(),
             state,
+            loading_application: None,
+            loading_bindings: BTreeMap::new(),
+            last_loading_host_crash: None,
             resources,
             packages: Mutex::new(BTreeMap::new()),
             draining: BTreeSet::new(),
@@ -713,6 +730,7 @@ impl PluginManager {
         include_upstream: bool,
     ) -> Result<PluginList, PluginError> {
         Ok(PluginList {
+            configuration_error: None,
             plugins: self
                 .state
                 .plugins
@@ -739,8 +757,8 @@ impl PluginManager {
                         source: installed.source.projection(),
                         upstream_manifest,
                         upstream_archive_path,
-                        translation_runtime: None,
                         disabled_by: installed.disabled_by.clone(),
+                        reinstall_required: false,
                         // 扩展宿主的运行状态属于 daemon 的 ExtensionRuntime，由 API 层合并，管理器不持有它。
                         runtime: None,
                     })

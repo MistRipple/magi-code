@@ -68,17 +68,9 @@ fn response(bytes: Option<Icon>) -> Response {
 }
 
 async fn load(registry: &str, package: &str, version: &str) -> Result<Option<Icon>, ApiError> {
-    let url = format!("{registry}/{}/{version}", package_path(package));
-    let bytes = download_bytes(&url, MAX_REGISTRY_DOCUMENT_BYTES, "上游插件图标元数据").await?;
-    let raw: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| ApiError::InvalidInput("registry 元数据格式无效".into()))?;
-    let document: VersionDocument = serde_json::from_value(raw.clone())
-        .map_err(|_| ApiError::InvalidInput("registry 元数据格式无效".into()))?;
-    if document.name != package || document.version != version {
-        return Err(ApiError::InvalidInput("图标包身份与请求不一致".into()));
-    }
+    let document = artifacts::registry_document(registry, package, Some(version)).await?;
     // 没有声明就展示通用图标，不猜测 README 图片，也不为此下载整个包。
-    let Some(path) = raw.get("icon").and_then(Value::as_str).map(str::to_owned) else {
+    let Some(path) = document.icon.as_str().map(str::to_owned) else {
         return Ok(None);
     };
     validate_path(&path)?;

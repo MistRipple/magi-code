@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "scope": "configuration-preparation-and-domain-commit",
+  "capturedAt": "2026-11-17T14:16:41.795204+00:00",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "sourceSha256": {
+    "crates/magi-plugin-system/src/lifecycle/loading.rs": "d3578f76f0f03811e79cc929c937d2f5cb909b31c38c0833fe62c660a9d8bfad",
+    "crates/magi-plugin-system/tests/loading.rs": "da98c83423a8395558fca613ae89399018a4b245f4ebf69a3f3db976f0e426fa",
+    "crates/magi-plugin-system/tests/loading_host.rs": "30c0c94482477e965f9f6f663053bc88b96fd4d4745be6f2362ebce2f5b7ffec",
+    "crates/magi-extension-host/runtime/dsh/configuration.mjs": "dc5d1a47abe6c3698b041350e7a682d47263ae73f6bdfe7b9fa097f554007832",
+    "crates/magi-extension-host/runtime/dsh/entry.mjs": "157c0bd989791b3acc3120b2f56a81bcdf755d19b42ef8b998f9c5a6ec62430b",
+    "crates/magi-extension-host/src/shared.rs": "7353960d8ea714353f727624522044b530f2525652e995bbeab448492fb745f9",
+    "crates/magi-extension-host/runtime/dsh/package.json": "0f6ca13703c7ea97fad03a0e764e7314e4acc59e9be4d06a188b78f4adf0accd",
+    "crates/magi-extension-host/runtime/dsh/package-lock.json": "f72f1c95ade8ed319991a06085789236ee4c4c753eaeffba185a553384c5bb92"
+  },
+  "original": {
+    "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+    "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+    "name": "dsh-plugin-mgr",
+    "version": "0.2.13"
+  },
+  "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+  "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+  "test": "fixed_mgr_original_bundle_produces_a_committable_configuration_without_activation",
+  "result": {
+    "status": "passed",
+    "acceptedRevisions": [
+      1,
+      2
+    ],
+    "first": "original bundle inserted the original mgr entry; package identity and shared SDK addresses were checked",
+    "second": "an actual source patch set disabled:true and was committed as the next desired revision",
+    "originalBundleUnchanged": true,
+    "activation": "not-run",
+    "business": "not-run"
+  },
+  "unverified": [
+    "Formal daemon coordinator and graph application",
+    "Complete Loader/Include mutation and flush contract",
+    "Dynamic sources requiring runtime context",
+    "Native settings CAS integration and file notification intake",
+    "Online installation, update, cancellation and crash recovery in the product",
+    "Electron UI and all original business tasks"
+  ],
+  "stateNote": "The test uses a temporary PluginManager state root and removes it at teardown. This proves the real Node preparation-to-domain-commit path, not an installed persistent plugin instance."
+}

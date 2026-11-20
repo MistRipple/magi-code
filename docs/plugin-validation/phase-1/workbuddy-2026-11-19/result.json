@@ -1,0 +1,119 @@
+{
+  "completed": true,
+  "package": "dsh-connect-workbuddy",
+  "version": "5.21.2",
+  "archiveSha256": "3237011989e3d52483c1ec0e76874dd4d2f296a5b119cd25a08385cee0ab3fc0",
+  "integrity": "sha512-Yu2W+/WUCzPhP2fUi45B+L98GP7xTYQqSc0/XM7lQedaids5Kmj2LBqyJ3zI7SsrN4gtt84ZOnFqdlbKVU5NZg==",
+  "model": "deepseek-v4.1-flash",
+  "buildIdentity": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+  "daemonSha256": "1d255fb20275417a1b8bb8e683cd7e5e3a9f81a129cd40b79c4dcd151ee414ae",
+  "sdkLockSha256": "d3c2f75c3212b96733ec7cf9afda06de9d228f708f2e970eadda0279444f8679",
+  "dependenciesSha256": "068ca75756d157a3e9cf4c1d2cce99d756b9f4f6f7eb7e1ae55a73c0711ccc1e",
+  "checks": [
+    {
+      "name": "独立验收端口空闲",
+      "ok": true
+    },
+    {
+      "name": "固定官方原包从设置页在线安装并启用",
+      "ok": true
+    },
+    {
+      "name": "真实 WorkBuddy 模型数据源进入主对话目录",
+      "ok": true
+    },
+    {
+      "name": "原包配置在独立设置 Tab 展示",
+      "ok": true
+    },
+    {
+      "name": "原包设置保存后切回仍读到新成员数",
+      "ok": true
+    },
+    {
+      "name": "真实 WorkBuddy 登录态与 deepseek-v4.1-flash 完成模型调用",
+      "ok": true
+    },
+    {
+      "name": "模型结算后用量事件自动刷新原生统计，无需重新打开面板",
+      "ok": true
+    },
+    {
+      "name": "较长回复实际分段收流，正文首段时间和生成区间进入同一账本",
+      "ok": true
+    },
+    {
+      "name": "输入计数包含缓存，缓存读取不超过本次完整输入",
+      "ok": true
+    },
+    {
+      "name": "新增输入与缓存样本按真实回执完整累计，不重复减去缓存",
+      "ok": true
+    },
+    {
+      "name": "原生面板自动显示最新累计输出和首 token 样本",
+      "ok": true
+    },
+    {
+      "name": "整体输出速度由真实总输出和完整请求计时累计，无需上游拆分思考 Token",
+      "ok": true
+    },
+    {
+      "name": "面板与输入区显示同一真实整体速度，并说明包含思考与等待",
+      "ok": true
+    },
+    {
+      "name": "缺少正文拆分不妨碍整体速度，也不伪造正文速度",
+      "ok": true
+    },
+    {
+      "name": "390px 统计面板和性能明细保持可见，无横向裁切",
+      "ok": true
+    },
+    {
+      "name": "在途 WorkBuddy 模型请求可由 Magi 取消",
+      "ok": true
+    },
+    {
+      "name": "宿主崩溃期间的已开始模型请求结束且未重新派发",
+      "ok": true
+    },
+    {
+      "name": "崩溃后恢复固定原包模型目录及新实例",
+      "ok": true
+    },
+    {
+      "name": "停用回收真实 WorkBuddy 模型数据源",
+      "ok": true
+    },
+    {
+      "name": "停用回收隐藏页面，旧文档地址不能继续取得业务页面",
+      "ok": true
+    },
+    {
+      "name": "设置页重新启用创建新实例，只发出一次启用请求",
+      "ok": true
+    },
+    {
+      "name": "应用重启保持同一原包、授权和配置并恢复新宿主及真实模型目录",
+      "ok": true
+    },
+    {
+      "name": "应用重启后原页面读取已保存成员数",
+      "ok": true
+    },
+    {
+      "name": "应用重启后保持取消终态和原执行次数",
+      "ok": true
+    },
+    {
+      "name": "完整重启恢复包含取消调用的统计，无重复计数或模型重放",
+      "ok": true
+    },
+    {
+      "name": "主窗口与上游设置无未捕获异常",
+      "ok": true
+    }
+  ],
+  "result": "passed"
+}

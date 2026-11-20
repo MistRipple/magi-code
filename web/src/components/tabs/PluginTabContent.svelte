@@ -1,9 +1,19 @@
 <script lang="ts">
   import PluginFrame from './PluginFrame.svelte';
   import { pluginProjection } from '../../stores/plugin-registry.svelte';
-  import { registerPluginClientOutlet } from '../../lib/plugin-client-mount';
-  interface Props { pluginId: string; entry: string; label: string; frameTestId?: string; placement?: 'settings' | 'page'; active?: boolean }
-  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page', active = true }: Props = $props();
+  import { registerPluginClientOutlet, type PluginClientOutlet, type PluginPaneTab } from '../../lib/plugin-client-mount';
+  interface Props {
+    pluginId: string;
+    entry: string;
+    label: string;
+    frameTestId?: string;
+    placement?: PluginClientOutlet['placement'] | 'rightPane';
+    sessionId?: string;
+    active?: boolean;
+    paneTab?: PluginPaneTab;
+    registerClose?: (close: () => Promise<void>) => () => void;
+  }
+  let { pluginId, entry, label, frameTestId = 'plugin-view', placement = 'page', sessionId, active = true, paneTab, registerClose }: Props = $props();
   function isPersistent(): boolean {
     return Boolean(pluginProjection().installed.find(item => item.manifest.id === pluginId)?.manifest.contributions.client);
   }
@@ -13,11 +23,27 @@
     releaseOutlet();
     return { duration: 0 };
   }
-  function outlet(node: HTMLElement, value: { active: boolean; pluginId: string; entry: string; placement: 'settings' | 'page'; frameTestId: string }) {
+  type OutletValue = Omit<PluginClientOutlet, 'node' | 'placement'> & {
+    active: boolean;
+    pluginId: string;
+    placement: PluginClientOutlet['placement'] | 'rightPane';
+  };
+  function outlet(node: HTMLElement, value: OutletValue) {
     let release = () => {};
     const update = (next: typeof value) => {
       release();
-      release = next.active ? registerPluginClientOutlet(next.pluginId, { node, entry: next.entry, placement: next.placement, frameTestId: next.frameTestId }) : () => {};
+      const { active, pluginId, ...outlet } = next;
+      if (!active || outlet.placement === 'rightPane') {
+        release = () => {};
+      } else {
+        release = registerPluginClientOutlet(pluginId, {
+          node,
+          entry: outlet.entry,
+          frameTestId: outlet.frameTestId,
+          sessionId: outlet.sessionId,
+          placement: outlet.placement,
+        });
+      }
     };
     update(value);
     releaseOutlet = () => release();
@@ -25,10 +51,10 @@
   }
 </script>
 
-{#if isPersistent()}
-  <div class="plugin-client-outlet" use:outlet={{ active, pluginId, entry, placement, frameTestId }} out:parkBeforeRemoval|global></div>
+{#if isPersistent() && placement !== 'rightPane'}
+  <div class="plugin-client-outlet" use:outlet={{ active, pluginId, entry, placement, sessionId, frameTestId }} out:parkBeforeRemoval|global></div>
 {:else}
-  <PluginFrame {pluginId} {entry} {label} {frameTestId} {placement} />
+  <PluginFrame {pluginId} {entry} {label} {frameTestId} {placement} {sessionId} {paneTab} {registerClose} />
 {/if}
 
 <style>

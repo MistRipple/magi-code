@@ -4,15 +4,14 @@
   import { confirmMessage } from '../stores/confirm-dialog.svelte';
   import {
     applyPluginCandidate,
+    cancelPluginInstall,
     disablePlugin,
     enablePlugin,
-    fetchPluginCenter,
-    installFromPluginCenter,
     listInstalledPlugins,
     installUpstreamPlugin,
     previewPluginCandidate,
     previewUpstreamPlugin,
-    savePluginCenterConfig,
+    restartPluginHost,
     searchUpstreamPlugins,
     uninstallPlugin,
     type PluginCandidate,
@@ -23,31 +22,26 @@
   import PluginGuidePage from './PluginGuidePage.svelte';
   import Icon from './Icon.svelte';
   import SettingsDetailPage from './SettingsDetailPage.svelte';
-  import { loadViewDraft, saveViewDraft, clearViewDraft } from '../lib/view-drafts';
+  import { loadViewDraft, saveViewDraft } from '../lib/view-drafts';
   import { openSettings, shellUi } from '../stores/shell-ui.svelte';
   import { buildStoreItems, filterStoreItems, installedUpstreamRequest, paginate, storeGroup, type StoreFilter, type StoreGroup, type StoreItem } from '../lib/plugin-store';
   import { pluginRegistryRevision, pluginProjection } from '../stores/plugin-registry.svelte';
   import { cachedUpstreamProjection, rememberUpstreamProjection } from '../lib/plugin-upstream-cache';
-  import type { PluginCandidatePreview, PluginEcosystem, PluginUpstreamRequest, PluginCenterProjection, PluginList, PluginManifest, PluginUpstreamPreview, PluginUpstreamProjection } from '../shared/app-server-protocol.generated';
+  import type { PluginCandidatePreview, PluginEcosystem, PluginUpstreamRequest, PluginList, PluginManifest, PluginUpstreamPreview, PluginUpstreamProjection } from '../shared/app-server-protocol.generated';
 
   // 先用全局投影里已有的已安装插件起步，进入页面时列表不是空的，也不需要等一次请求。
   let list = $state<PluginList | null>(pluginProjection().loaded ? { plugins: pluginProjection().installed } : null);
-  let address = $state('');
+  let address = $state(loadViewDraft('plugin-sources', 'archive', { address: '' }, 'memory').address);
   let busy = $state(false);
   let busyLabel = $state('');
   let previewController = $state<AbortController | null>(null);
+  let installRequestId = $state<string | null>(null);
+  let cancellingInstall = $state(false);
+  let installApplying = $state(false);
+  const canCancelInstall = $derived(installRequestId !== null && !installApplying);
   let detailPane: HTMLElement;
   let message = $state('');
-  let center = $state<PluginCenterProjection | null>(null);
-  let centerUrl = $state('');
-  let centerKeyId = $state('');
-  let centerPublicKey = $state('');
-  let centerConfigOpen = $state(false);
-  let centerSynced = false;
-  let centerDraftBaseline = $state('');
   let listRequestSeq = 0;
-  let centerRequestSeq = 0;
-  let centerFailure = $state('');
   let guideOpen = $state(false);
   /** 已通过准备阶段、等待用户确认的候选包；确认前不写入任何安装状态。 */
   type Staged =
@@ -67,35 +61,9 @@
     const installed = await listInstalledPlugins();
     if (requestSeq !== listRequestSeq) return;
     list = installed;
-    void refreshCenter();
   }
 
-  async function refreshCenter(): Promise<void> {
-    const requestSeq = ++centerRequestSeq;
-    try {
-      const next = await fetchPluginCenter();
-      if (requestSeq !== centerRequestSeq) return;
-      center = next;
-      centerFailure = '';
-      // 只在首次读取和保存后同步输入框，避免用户正在输入时被周期刷新覆盖。
-      if (!centerSynced) {
-        centerSynced = true;
-        centerUrl = center.config.url;
-        const key = center.config.trustedKeys[0];
-        centerKeyId = key?.keyId ?? '';
-        centerPublicKey = key?.publicKey ?? '';
-        centerDraftBaseline = JSON.stringify(center.config);
-        const restored = loadViewDraft('plugin-sources', centerDraftBaseline, { centerUrl, centerKeyId, centerPublicKey, address }, 'memory');
-        ({ centerUrl, centerKeyId, centerPublicKey, address } = restored);
-      }
-    } catch (error) {
-      if (requestSeq !== centerRequestSeq) return;
-      // 插件中心不可用不应阻止管理已安装插件。
-      centerFailure = describe(error);
-    }
-  }
-
-  /** 搜索上游生态的官方 npm 发布。失败只影响上游条目，不影响已安装与插件中心。 */
+  /** 搜索上游生态的官方 npm 发布。失败时仍可管理已安装插件。 */
   async function refreshUpstream(text: string, requestSeq: number, signal: AbortSignal): Promise<void> {
     try {
       const next = await searchUpstreamPlugins(text, signal);
@@ -109,20 +77,6 @@
     } finally {
       if (requestSeq === upstreamSeq) upstreamLoading = false;
     }
-  }
-
-  async function saveCenterConfig(): Promise<void> {
-    await run(async () => {
-      await savePluginCenterConfig({
-        url: centerUrl.trim(),
-        trustedKeys: centerKeyId.trim() && centerPublicKey.trim()
-          ? [{ keyId: centerKeyId.trim(), publicKey: centerPublicKey.trim() }]
-          : [],
-      });
-      centerConfigOpen = false;
-      clearViewDraft('plugin-sources');
-      centerSynced = false;
-    });
   }
 
   function describe(error: unknown): string {
@@ -216,26 +170,16 @@
   async function stageAddress(): Promise<void> {
     const source = address.trim();
     if (!source) return;
-    if (source.startsWith('github:') || /^(?:git\+)?https:\/\/github\.com\//i.test(source)) {
-      await prepareCandidate(async signal => {
-        let locator = source.slice(7);
-        if (!source.startsWith('github:')) {
-          const url = new URL(source.replace(/^git\+/, ''));
-          if (url.username || url.password || url.search || url.port) throw new Error(i18n.t('settings.plugins.github.invalidAddress'));
-          locator = url.pathname.slice(1) + url.hash;
-        }
-        const [repository, reference, ...extra] = locator.split('#');
-        if (extra.length) throw new Error(i18n.t('settings.plugins.github.invalidAddress'));
-        return { kind: 'upstream', ecosystem: 'dsh', preview: await previewUpstreamPlugin({ ecosystem: 'dsh', github: { repository, ...(reference === undefined ? {} : { reference }) } }, signal) };
-      });
-    } else await stage({ source: source.includes(':') ? source : `address:${source}` });
+    await stage({ source: source.startsWith('local:') || source.startsWith('address:') ? source : `address:${source}` });
   }
 
   async function confirmStaged(): Promise<void> {
     const pending = staged;
     if (!pending) return;
     await run(async () => {
-      if (pending.kind === 'upstream') await installUpstreamPlugin(pending.preview, pending.ecosystem);
+      if (pending.kind === 'upstream') {
+        if (!await submitUpstream(pending.preview, pending.ecosystem)) return;
+      }
       else await applyPluginCandidate(pending.candidate, pending.preview);
       staged = null;
       address = '';
@@ -246,7 +190,46 @@
     }, i18n.t('settings.plugins.candidate.installing'));
   }
 
-  const hasCatalog = $derived(Boolean(center && center.entries.length > 0));
+  async function submitUpstream(preview: PluginUpstreamPreview, ecosystem: PluginEcosystem): Promise<boolean> {
+    const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+    installRequestId = id;
+    try {
+      const applied = await installUpstreamPlugin(preview, ecosystem, id);
+      if (!applied) {
+        message = i18n.t('settings.plugins.candidate.cancelled');
+        await revealFeedback();
+      }
+      return applied;
+    } finally {
+      installRequestId = null;
+      cancellingInstall = false;
+      installApplying = false;
+    }
+  }
+
+  async function cancelActiveInstall(): Promise<void> {
+    const id = installRequestId;
+    if (!id || cancellingInstall || installApplying) return;
+    cancellingInstall = true;
+    message = '';
+    try {
+      const result = await cancelPluginInstall(id);
+      if (id !== installRequestId) return;
+      if (result === 'too-late') {
+        installApplying = true;
+        busyLabel = i18n.t('settings.plugins.candidate.applying');
+      } else if (result === 'not-running') {
+        message = i18n.t('settings.plugins.candidate.cancelPending');
+        await revealFeedback();
+      }
+    } catch (error) {
+      if (id !== installRequestId) return;
+      message = describe(error);
+      await revealFeedback();
+    } finally {
+      if (id === installRequestId) cancellingInstall = false;
+    }
+  }
 
   /** 插件的名称与说明显示清单原文。 */
   function manifestText(manifest: PluginManifest, field: 'name' | 'description'): string {
@@ -273,7 +256,7 @@
     shellUi.settingsRequestedPlugin = null;
   });
 
-  const items = $derived(buildStoreItems(plugins, center?.entries ?? [], upstream?.entries ?? [], manifestText));
+  const items = $derived(buildStoreItems(plugins, upstream?.entries ?? [], manifestText));
   const filtered = $derived(filterStoreItems(items, filter, query));
   const view = $derived(paginate(filtered, page, PAGE_SIZE));
   /** 默认选中当前页第一项；所选插件不在当前页（翻页、过滤后）时回到第一项。 */
@@ -304,12 +287,11 @@
   }
 
   async function installItem(item: StoreItem): Promise<void> {
-    if (item.catalog) await run(() => installFromPluginCenter(item.catalog!));
-    else if (item.upstream) await stageUpstream(item.upstream);
+    if (item.upstream) await stageUpstream(item.upstream);
   }
 
   /**
-   * 上游条目升级：点击一次即完成取包、翻译和提交，不再停在确认页。
+   * 上游条目升级：点击一次即完成取包及提交，不再停在确认页。
    * 只有会清空插件数据（dataReset）的升级才保留确认页，避免无提示丢数据。
    */
   async function upgradeUpstream(entry: PluginUpstreamRequest): Promise<void> {
@@ -318,20 +300,12 @@
       const candidate = preview.candidate;
       if (candidate.operation === 'unchanged') { message = i18n.t('settings.plugins.candidate.unchanged'); return; }
       if (candidate.dataReset) { staged = { kind: 'upstream', ecosystem: entry.ecosystem, preview }; return; }
-      await installUpstreamPlugin(preview, entry.ecosystem);
+      await submitUpstream(preview, entry.ecosystem);
     }, i18n.t('settings.plugins.candidate.installing'));
   }
 
-  /** 升级：插件中心与上游条目都是一次点击直接完成。 */
-  async function updateFromCenter(item: StoreItem): Promise<void> {
-    if (item.installed?.translationRuntime?.state === 'updateAvailable' && item.upstream?.state !== 'updatable') {
-      const request = installedUpstreamRequest(item.installed);
-      if (request) await upgradeUpstream(request);
-    } else if (item.installed?.source.github) {
-      const { repository, reference } = item.installed.source.github;
-      await upgradeUpstream({ ecosystem: 'dsh', github: { repository, reference } });
-    } else if (item.catalog && item.catalog.state === 'updatable') await run(() => installFromPluginCenter(item.catalog!));
-    else if (item.upstream) await upgradeUpstream(item.upstream);
+  async function updateFromUpstream(item: StoreItem): Promise<void> {
+    if (item.upstream) await upgradeUpstream(item.upstream);
   }
 
   // 搜索词变化后稍作等待再请求 registry；注册表变化（安装、卸载）后立即刷新，使安装状态保持准确。
@@ -366,7 +340,7 @@
   function changePage(next: number): void { cancelPreview(); message = ''; selectedId = null; page = next; }
 
   $effect(() => {
-    if (centerSynced && centerDraftBaseline) saveViewDraft('plugin-sources', centerDraftBaseline, { centerUrl, centerKeyId, centerPublicKey, address }, 'memory');
+    saveViewDraft('plugin-sources', 'archive', { address }, 'memory');
   });
 
   function closeSources(): void {
@@ -405,6 +379,12 @@
       </div>
     </div>
 
+    {#if list?.configurationError}
+      <div class="settings-notice settings-notice--warn" data-testid="plugin-configuration-error" role="status">
+        <Icon name="alert-triangle" size={14} />
+        <span>{i18n.t('settings.plugins.configurationError', { reason: list.configurationError })}</span>
+      </div>
+    {/if}
     {#if upstream?.error}
       <div class="settings-notice settings-notice--warn store-center-error" data-testid="plugin-upstream-error" role="status">
         <Icon name="alert-triangle" size={14} />
@@ -412,14 +392,6 @@
         <button class="btn btn--sm btn--secondary" onclick={() => { upstream = null; searchRetry += 1; }}>{i18n.t('settings.plugins.center.retry')}</button>
       </div>
     {/if}
-    {#if center?.error || centerFailure}
-      <div class="settings-notice settings-notice--warn store-center-error" data-testid="plugin-center-error" role="status">
-        <Icon name="alert-triangle" size={14} />
-        <span>{i18n.t('settings.plugins.center.loadFailed', { reason: center?.error || centerFailure })}</span>
-        <button class="plugin-link" onclick={() => void refreshCenter()}>{i18n.t('settings.plugins.center.retry')}</button>
-      </div>
-    {/if}
-
     {#if !query.trim()}
       <div class="settings-row-desc" data-testid="plugin-upstream-hint">{i18n.t('settings.plugins.upstream.searchHint')}</div>
     {/if}
@@ -451,6 +423,14 @@
               <span class="store-count">{entry.total}</span>
             </div>
             {#each entry.rows as item (item.id)}
+              {@const runtime = item.installed?.runtime}
+              {@const runtimeState = runtime?.state}
+              {@const statusAlert = item.installed?.reinstallRequired
+                ? i18n.t('settings.plugins.status.reinstallRequired')
+                : runtime && (runtimeState === 'waiting' || runtimeState === 'failed' || runtimeState === 'restarting'
+                  || (item.installed?.enabled && runtimeState === 'stopped' && runtime.crashes > 0))
+                  ? i18n.t(`settings.plugins.runtime.state.${runtimeState}`)
+                  : null}
               <button
                 type="button"
                 class="store-item"
@@ -469,12 +449,12 @@
                   <span class="store-item-desc">{item.description}</span>
                 </span>
                 <span class="store-item-state" data-state={item.updatable ? 'updatable' : item.status}>
-                  {#if item.installed?.runtime && (item.installed.runtime.state === 'failed' || item.installed.runtime.state === 'restarting')}
+                  {#if statusAlert}
                     <span
                       class="store-item-alert"
                       role="img"
-                      aria-label={i18n.t(`settings.plugins.runtime.state.${item.installed.runtime.state}`)}
-                      title={i18n.t(`settings.plugins.runtime.state.${item.installed.runtime.state}`)}
+                      aria-label={statusAlert}
+                      title={statusAlert}
                     ><Icon name="warning" size={14} /></span>
                   {:else if item.updatable}
                     <Icon name="download" size={14} />
@@ -514,8 +494,7 @@
 
   {#if staged}
     {@const preview = staged.kind === 'upstream' ? staged.preview.candidate : staged.preview}
-    {@const translated = staged.kind === 'upstream' ? staged.preview : null}
-    {@const componentsOnly = translated?.translationRuntime?.state === 'updateAvailable' && preview.installedVersion === preview.manifest.version}
+    {@const original = staged.kind === 'upstream' ? staged.preview : null}
     <div class="settings-section plugin-candidate" data-testid="plugin-candidate" data-operation={preview.operation} data-origin={staged.kind}>
       <div class="settings-card plugin-candidate-card">
         <div class="candidate-scroll" data-testid="plugin-candidate-scroll">
@@ -529,7 +508,7 @@
                   ? i18n.t('settings.plugins.candidate.versionChange', { from: preview.installedVersion, to: preview.manifest.version })
                   : `v${preview.manifest.version}`}
               </span>
-              <span class="settings-chip settings-chip--accent">{componentsOnly ? i18n.t('settings.plugins.translationRuntime.update') : preview.operation === 'upgrade' ? i18n.t('settings.plugins.upgrade') : i18n.t('settings.plugins.installAddress')}</span>
+              <span class="settings-chip settings-chip--accent">{preview.operation === 'upgrade' ? i18n.t('settings.plugins.upgrade') : i18n.t('settings.plugins.installAddress')}</span>
             </div>
             <span class="settings-row-desc">{manifestText(preview.manifest, 'description') || preview.manifest.id}</span>
           </div>
@@ -543,53 +522,32 @@
                 : i18n.t('settings.plugins.candidate.dataChanged', { from: preview.dataSchemaFrom, to: preview.manifest.dataSchemaVersion })}
             </div>
           {/if}
-          {#if translated}
-            <div class="plugin-perm" data-testid="candidate-translation">
-              <span class="settings-row-title">{i18n.t('settings.plugins.upstream.translation')}</span>
+          {#if original}
+            <div class="plugin-perm" data-testid="candidate-origin">
+              <span class="settings-row-title">{i18n.t('settings.plugins.upstream.origin')}</span>
               <div class="settings-row-desc">
-                {i18n.t('settings.plugins.upstream.publisher')}：{translated.publisher || i18n.t('common.notProvided')}
-                {translated.official ? i18n.t('settings.plugins.upstream.official') : i18n.t('settings.plugins.upstream.thirdParty')}
+                {i18n.t('settings.plugins.upstream.publisher')}：{original.publisher || i18n.t('common.notProvided')}
+                {original.official ? i18n.t('settings.plugins.upstream.official') : i18n.t('settings.plugins.upstream.thirdParty')}
               </div>
-              <div class="settings-row-desc">{i18n.t(translated.github ? 'settings.plugins.github.notice' : 'settings.plugins.upstream.notice')}</div>
-              {#each [['tools', translated.translation.tools], ['commands', translated.translation.commands], ['modelSources', translated.translation.modelSources], ['unmounted', translated.translation.unmountedSlots]] as [key, values] (key)}
-                <div class="settings-row-desc">
-                  <span class="settings-row-title">{i18n.t(`settings.plugins.upstream.${key}`)}</span>
-                  {(values as string[]).length ? (values as string[]).join('、')
-                    : preview.manifest.extension?.runtimeContributions?.some((kind) => kind === key)
-                      ? i18n.t('settings.plugins.upstream.runtimePending')
-                      : i18n.t('settings.plugins.upstream.none')}
-                </div>
-              {/each}
-              {#if translated.translation.degraded.length > 0}
-                <div class="settings-row-desc">
-                  <span class="settings-row-title">{i18n.t('settings.plugins.upstream.degraded')}</span>
-                  <div class="settings-rows">
-                    {#each translated.translation.degraded as entry (`${entry.name}:${entry.status}`)}
-                      <div class="settings-row">
-                        <div class="settings-row-copy">
-                          <span class="settings-row-title">{entry.name}（{entry.status}）</span>
-                          <span class="settings-row-desc">{entry.note}</span>
-                        </div>
-                      </div>
-                    {/each}
-                  </div>
-                </div>
-              {/if}
-              {#if translated.translation.omittedFiles > 0}
-                <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.omitted', { count: translated.translation.omittedFiles })}</div>
-              {/if}
-              {#if translated.github}<div class="settings-row-desc settings-mono" data-testid="plugin-candidate-github" dir="ltr">github:{translated.github.repository}#{translated.github.commit}</div>{/if}
-              <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.integrity')} <span class="settings-mono" title={translated.integrity}>{translated.integrity.slice(0, 24)}</span></div>
+              <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.notice')}</div>
+              <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.runtimePending')}</div>
+              <div class="settings-row-desc">{i18n.t('settings.plugins.upstream.integrity')} <span class="settings-mono" title={original.integrity}>{original.integrity.slice(0, 24)}</span></div>
             </div>
           {/if}
-          <div class="settings-row-desc" data-testid={componentsOnly ? 'candidate-runtime-update' : undefined}>
-            {componentsOnly ? i18n.t('settings.plugins.translationRuntime.confirm') : preview.operation === 'upgrade' ? i18n.t('settings.plugins.candidate.upgradeHint') : i18n.t('settings.plugins.candidate.installHint')}
+          <div class="settings-row-desc">
+            {preview.operation === 'upgrade' ? i18n.t('settings.plugins.candidate.upgradeHint') : i18n.t('settings.plugins.candidate.installHint')}
             <span class="settings-mono" title={preview.digest}>{i18n.t('settings.plugins.digest', { digest: preview.digest.slice(0, 12) })}</span>
           </div>
         </div>
         </div>
         <div class="settings-card-foot" data-testid="plugin-candidate-actions">
-          <button class="btn btn--sm btn--secondary" data-action="cancel-candidate" onclick={() => { staged = null; }} disabled={busy}>{i18n.t('settings.plugins.candidate.cancel')}</button>
+          {#if canCancelInstall}
+            <button class="btn btn--sm btn--secondary" data-testid="plugin-cancel-install" disabled={cancellingInstall} onclick={() => void cancelActiveInstall()}>
+              {cancellingInstall ? i18n.t('settings.plugins.candidate.cancelling') : i18n.t('settings.plugins.candidate.cancelOperation')}
+            </button>
+          {:else}
+            <button class="btn btn--sm btn--secondary" data-action="cancel-candidate" onclick={() => { staged = null; }} disabled={busy}>{i18n.t('settings.plugins.candidate.cancel')}</button>
+          {/if}
           <button class="btn btn--lg btn--primary" data-action="confirm-candidate" onclick={() => void confirmStaged()} disabled={busy}>
             {#if busy}<Icon name="loader" class="spinning" size={14} /> {busyLabel}
             {:else}{preview.operation === 'upgrade' ? i18n.t('settings.plugins.candidate.confirmUpgrade') : i18n.t('settings.plugins.candidate.confirmInstall')}{/if}
@@ -608,8 +566,16 @@
               {busyLabel}
               previewing={previewController !== null}
               onCancelPreview={cancelPreview}
+              {canCancelInstall}
+              {cancellingInstall}
+              onCancelInstall={() => void cancelActiveInstall()}
               onInstall={() => void installItem(selected)}
-              onUpdateFromCenter={() => void updateFromCenter(selected)}
+              onUpdateFromUpstream={() => void updateFromUpstream(selected)}
+              onReinstall={() => {
+                const req = selected.installed ? installedUpstreamRequest(selected.installed) : null;
+                if (req) void upgradeUpstream(req);
+              }}
+              onRestartHost={() => void run(() => restartPluginHost())}
               onUninstall={() => void uninstallItem(selected)}
               onEnable={() => void run(() => enablePlugin(selected.installed!))}
               onDisable={() => void run(() => disablePlugin(selected.installed!))}
@@ -641,37 +607,6 @@
     {/if}
     <div class="sources-body">
       <section>
-        <h4>{i18n.t('settings.plugins.center.title')}</h4>
-        <div class="settings-row-desc">{i18n.t('settings.plugins.section.availableDesc')}</div>
-        <div class="settings-inline-form">
-          <input class="form-input" data-testid="plugin-center-url" bind:value={centerUrl} placeholder={i18n.t('settings.plugins.center.urlPlaceholder')} disabled={busy} />
-          <button class="btn btn--sm btn--primary" data-testid="plugin-center-save" disabled={busy} onclick={() => void saveCenterConfig()}>{i18n.t('settings.plugins.center.save')}</button>
-        </div>
-        {#if center}
-          <div class="settings-row-desc">
-            <span class="settings-chip" class:settings-chip--ok={center.verified} class:settings-chip--warn={!center.verified && Boolean(center.config.url)}>
-              {center.verified ? i18n.t('settings.plugins.center.verified') : i18n.t('settings.plugins.center.unverified')}
-            </span>
-          </div>
-        {/if}
-        {#if center && hasCatalog && !center.verified}
-          <div class="settings-notice settings-notice--warn" data-testid="plugin-center-unsigned"><Icon name="alert-triangle" size={14} /><span>{i18n.t('settings.plugins.center.unsigned')}</span></div>
-        {/if}
-        {#if center?.error}
-          <div class="settings-notice settings-notice--error" role="alert"><Icon name="alert-circle" size={14} /><span>{center.error}</span></div>
-        {/if}
-        <button class="plugin-link" data-testid="plugin-center-advanced" aria-expanded={centerConfigOpen} onclick={() => { centerConfigOpen = !centerConfigOpen; }}>
-          {i18n.t('settings.plugins.center.advanced')}
-        </button>
-        {#if centerConfigOpen}
-          <div class="settings-row-desc">{i18n.t('settings.plugins.center.advancedHint')}</div>
-          <div class="settings-inline-form">
-            <input class="form-input" bind:value={centerKeyId} placeholder={i18n.t('settings.plugins.center.keyIdPlaceholder')} disabled={busy} />
-            <input class="form-input" bind:value={centerPublicKey} placeholder={i18n.t('settings.plugins.center.publicKeyPlaceholder')} disabled={busy} />
-          </div>
-        {/if}
-      </section>
-      <section>
         <h4>{i18n.t('settings.plugins.section.other')}</h4>
         <div class="settings-row-desc">{i18n.t('settings.plugins.section.otherDesc')}</div>
         <div class="settings-inline-form">
@@ -682,7 +617,7 @@
           <span class="settings-row-desc">{i18n.t('settings.plugins.installLocalDesc')}</span>
           <label class="btn btn--sm btn--secondary" class:plugin-disabled={busy}>
             {i18n.t('settings.plugins.chooseZip')}
-            <input type="file" accept=".zip,application/zip" hidden onchange={submitFile} disabled={busy} />
+            <input type="file" accept=".tgz,.tar.gz,application/gzip,application/x-gzip" hidden onchange={submitFile} disabled={busy} />
           </label>
         </div>
       </section>
@@ -734,8 +669,6 @@
     .store-list { border-right: 0; border-bottom: var(--magi-hairline) solid var(--border); }
   }
   .plugin-perm { display: grid; gap: var(--space-2); }
-  .plugin-link { justify-self: start; align-self: flex-start; padding: 0; border: 0; background: transparent; color: var(--foreground-muted); font-size: var(--text-xs); cursor: pointer; }
-  .plugin-link:hover { color: var(--primary); }
   .plugin-disabled { opacity: 0.45; pointer-events: none; }
   .plugins-status { margin: var(--space-3); flex: 0 1 auto; max-height: 35%; overflow-y: auto; }
   .plugin-message-text { white-space: pre-wrap; overflow-wrap: anywhere; }

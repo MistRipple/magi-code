@@ -1315,6 +1315,554 @@ fn compatible_response_normalizes_missing_tool_call_identity_and_reasoning_alias
     assert!(canonical.tool_calls[0].id.starts_with("call_compat_0_"));
 }
 
+/// 经真实的 HTTP 流式路径调用一次，返回传输观察到的全部流记录（最多一份）与响应。
+fn observe_stream_records(
+    body: String,
+    tools: Option<Vec<crate::types::ChatToolDefinition>>,
+) -> (
+    Vec<Vec<serde_json::Value>>,
+    Result<ModelResponse, BridgeClientError>,
+) {
+    let server = spawn_mock_server_with_response_text(200, "text/event-stream", body);
+    let client = HttpModelBridgeClient::new(
+        server.address,
+        Some("test-key".to_string()),
+        "any-openai-compatible-model".to_string(),
+    );
+    let records = std::cell::RefCell::new(Vec::new());
+    let response = client.invoke_observed(
+        ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "openai-compatible".into(),
+            prompt: "x".into(),
+            messages: None,
+            tools,
+            tool_choice: None,
+        },
+        ModelInvocationOptions {
+            on_delta: Some(&|_| {}),
+            on_retry: &|_| {},
+            is_cancelled: &|| false,
+            max_output_tokens: None,
+        },
+        &|event| {
+            if let ModelTransportEvent::StreamRecorded(stream) = event {
+                records.borrow_mut().push(stream.clone());
+            }
+            Ok(())
+        },
+    );
+    (records.into_inner(), response)
+}
+
+#[test]
+fn a_successful_stream_is_recorded_with_its_delta_boundaries_and_canonical_tool_names() {
+    let tool = crate::types::ChatToolDefinition {
+        kind: "function".to_string(),
+        function: crate::types::ChatToolFunctionDefinition {
+            name: "web_search".to_string(),
+            description: "搜索网页".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        origin: crate::types::ChatToolOrigin::Builtin,
+    };
+    let wire_name = HttpModelBridgeClient::new(
+        "http://127.0.0.1:1".to_string(),
+        Some("k".to_string()),
+        "any-openai-compatible-model".to_string(),
+    )
+    .build_http_request(
+        &ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "openai-compatible".into(),
+            prompt: "x".into(),
+            messages: None,
+            tools: Some(vec![tool.clone()]),
+            tool_choice: None,
+        },
+        true,
+    )
+    .unwrap()
+    .tool_name_codec
+    .encode_name("web_search");
+    let event = |value: serde_json::Value| format!("data: {value}\n\n");
+    let body = [
+        event(serde_json::json!({"choices": [{"delta": {"content": "你"}}]})),
+        event(serde_json::json!({"choices": [{"delta": {"content": "好"}}]})),
+        event(serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call_1", "type": "function",
+            "function": {"name": wire_name, "arguments": ""}}]}}]})),
+        event(serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "function": {"arguments": "{\"query\":\"Magi\"}"}}]}}]})),
+        event(serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let (records, response) = observe_stream_records(body, Some(vec![tool]));
+    let response = response.expect("stream should succeed");
+    assert_eq!(response.tool_calls[0].function.name, "web_search");
+    assert_eq!(
+        records.len(),
+        1,
+        "exactly one stream record per successful attempt"
+    );
+    let stream = &records[0];
+    let rendered = serde_json::to_string(stream).unwrap();
+    assert!(
+        !rendered.contains(&wire_name),
+        "wire tool names must be decoded: {rendered}"
+    );
+    // 文字两个增量保留边界，没有被合成一个。
+    let text = stream
+        .iter()
+        .find(|record| record["type"] == "text-chunks")
+        .unwrap();
+    assert_eq!(text["texts"], serde_json::json!(["你", "好"]));
+    let ends: Vec<_> = stream
+        .iter()
+        .filter(|record| record["chunk"]["type"] == "block-end")
+        .map(|record| record["chunk"]["block"].clone())
+        .collect();
+    assert_eq!(ends[0], serde_json::json!({"type": "text", "text": "你好"}));
+    assert_eq!(
+        ends[1],
+        serde_json::json!({"type": "tool-call", "id": "call_1", "name": "web_search",
+                           "arguments": "{\"query\":\"Magi\"}"})
+    );
+    assert_eq!(
+        stream.last().unwrap()["chunk"]["reason"],
+        serde_json::json!({"kind": "tool-calls"})
+    );
+}
+
+#[test]
+fn a_stream_without_a_normalizable_stop_reason_records_nothing() {
+    let body = [
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": "x"}}]})
+        ),
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "content_filter"}]})
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let (records, response) = observe_stream_records(body, None);
+    assert!(response.is_ok());
+    assert!(records.is_empty(), "no invented finish: {records:?}");
+}
+
+#[test]
+fn live_stream_events_follow_attempt_lifecycle_and_abandon_unnormalizable_streams() {
+    let body = [
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": "你"}}]})
+        ),
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": "好"}}]})
+        ),
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let server = spawn_mock_server_with_response_text(200, "text/event-stream", body);
+    let client = HttpModelBridgeClient::new(
+        server.address,
+        Some("test-key".to_string()),
+        "any-openai-compatible-model".to_string(),
+    );
+    let trace = std::cell::RefCell::new(Vec::<String>::new());
+    let response = client.invoke_observed(
+        ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "openai-compatible".into(),
+            prompt: "x".into(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        },
+        ModelInvocationOptions {
+            on_delta: Some(&|_| {}),
+            on_retry: &|_| {},
+            is_cancelled: &|| false,
+            max_output_tokens: None,
+        },
+        &|event| {
+            match event {
+                ModelTransportEvent::LiveStreamStart => trace.borrow_mut().push("start".into()),
+                ModelTransportEvent::LiveStreamChunk(item) => {
+                    trace.borrow_mut().push(format!(
+                        "chunk:{}",
+                        item.chunk["type"].as_str().unwrap_or_default()
+                    ));
+                }
+                ModelTransportEvent::LiveStreamAbandon => trace.borrow_mut().push("abandon".into()),
+                ModelTransportEvent::StreamRecorded(_) => {
+                    trace.borrow_mut().push("recorded".into())
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    );
+    assert!(response.is_ok());
+    assert_eq!(
+        trace.into_inner(),
+        vec![
+            "start",
+            "chunk:block-start",
+            "chunk:text-delta",
+            "chunk:text-delta",
+            "chunk:block-end",
+            "chunk:finish",
+            "recorded",
+        ]
+    );
+
+    // 无法归一终止原因的流：先发实时块，最后发 abandon，不发 recorded。
+    let unnormalizable = [
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": "x"}}]})
+        ),
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "content_filter"}]})
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let server = spawn_mock_server_with_response_text(200, "text/event-stream", unnormalizable);
+    let client = HttpModelBridgeClient::new(
+        server.address,
+        Some("test-key".to_string()),
+        "any-openai-compatible-model".to_string(),
+    );
+    let trace = std::cell::RefCell::new(Vec::<String>::new());
+    let response = client.invoke_observed(
+        ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "openai-compatible".into(),
+            prompt: "x".into(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        },
+        ModelInvocationOptions {
+            on_delta: Some(&|_| {}),
+            on_retry: &|_| {},
+            is_cancelled: &|| false,
+            max_output_tokens: None,
+        },
+        &|event| {
+            match event {
+                ModelTransportEvent::LiveStreamStart => trace.borrow_mut().push("start".into()),
+                ModelTransportEvent::LiveStreamChunk(item) => {
+                    trace.borrow_mut().push(format!(
+                        "chunk:{}",
+                        item.chunk["type"].as_str().unwrap_or_default()
+                    ));
+                }
+                ModelTransportEvent::LiveStreamAbandon => trace.borrow_mut().push("abandon".into()),
+                ModelTransportEvent::StreamRecorded(_) => {
+                    trace.borrow_mut().push("recorded".into())
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    );
+    assert!(response.is_ok());
+    assert_eq!(
+        trace.into_inner(),
+        vec!["start", "chunk:block-start", "chunk:text-delta", "abandon"]
+    );
+}
+
+#[test]
+fn a_failed_stream_records_unclosed_deltas_and_error_finish() {
+    let tool = crate::types::ChatToolDefinition {
+        kind: "function".to_string(),
+        function: crate::types::ChatToolFunctionDefinition {
+            name: "web_search".to_string(),
+            description: "搜索网页".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        origin: crate::types::ChatToolOrigin::Builtin,
+    };
+    let wire_name = HttpModelBridgeClient::new(
+        "http://127.0.0.1:1".to_string(),
+        Some("k".to_string()),
+        "any-openai-compatible-model".to_string(),
+    )
+    .build_http_request(
+        &ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "openai-compatible".into(),
+            prompt: "x".into(),
+            messages: None,
+            tools: Some(vec![tool.clone()]),
+            tool_choice: None,
+        },
+        true,
+    )
+    .unwrap()
+    .tool_name_codec
+    .encode_name("web_search");
+    let event = |value: serde_json::Value| format!("data: {value}\n\n");
+    let body = [
+        event(serde_json::json!({"choices": [{"delta": {"content": "半截"}}]})),
+        event(serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call_1", "type": "function",
+            "function": {"name": wire_name, "arguments": "{\"q\":"}}]}}]})),
+        event(serde_json::json!({"error": {"type": "invalid_request_error", "message": "upstream boom"}})),
+    ]
+    .concat();
+    let (records, response) = observe_stream_records(body, Some(vec![tool]));
+    assert!(response.is_err());
+    assert_eq!(records.len(), 1);
+    let stream = &records[0];
+    let rendered = serde_json::to_string(stream).unwrap();
+    assert!(
+        !rendered.contains(&wire_name),
+        "wire name leaked: {rendered}"
+    );
+    assert!(
+        stream
+            .iter()
+            .all(|record| record["chunk"]["type"] != "block-end"),
+        "unclosed blocks must stay open on failed stream"
+    );
+    let finish = stream.last().unwrap();
+    assert_eq!(finish["chunk"]["type"], "finish");
+    assert_eq!(finish["chunk"]["reason"]["kind"], "error");
+    assert_eq!(
+        finish["chunk"]["reason"]["failure"]["code"],
+        "MODEL_PROVIDER_REJECTED"
+    );
+    assert!(
+        finish["chunk"]["reason"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("upstream boom")
+    );
+}
+
+fn drain_http_request(stream: &mut std::net::TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let header_end = loop {
+        let read = stream.read(&mut chunk).expect("should read");
+        assert!(read > 0);
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+    let content_length = header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    while buffer.len() < header_end + content_length {
+        let read = stream.read(&mut chunk).expect("should read body");
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+#[test]
+fn a_retried_http_error_records_failed_attempt_before_succeeded_attempt() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            drain_http_request(&mut stream);
+            if attempt == 0 {
+                let body = r#"{"error":{"message":"temporarily unavailable"}}"#;
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).expect("write 503");
+            } else {
+                let body = [
+                    format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"choices": [{"delta": {"content": "恢复"}}]})
+                    ),
+                    format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+                    ),
+                    "data: [DONE]\n\n".to_string(),
+                ]
+                .concat();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).expect("write 200");
+            }
+        }
+    });
+    let client = HttpModelBridgeClient::new(
+        format!("http://{addr}"),
+        Some("test-key".to_string()),
+        "any-openai-compatible-model".to_string(),
+    );
+    let records = std::cell::RefCell::new(Vec::new());
+    let response = client.invoke_observed(
+        ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "openai-compatible".into(),
+            prompt: "x".into(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        },
+        ModelInvocationOptions {
+            on_delta: Some(&|_| {}),
+            on_retry: &|_| {},
+            is_cancelled: &|| false,
+            max_output_tokens: None,
+        },
+        &|event| {
+            if let ModelTransportEvent::StreamRecorded(stream) = event {
+                records.borrow_mut().push(stream.clone());
+            }
+            Ok(())
+        },
+    );
+    server.join().expect("server thread");
+    assert_eq!(
+        response.expect("retry succeeds").content.as_deref(),
+        Some("恢复")
+    );
+    let records = records.into_inner();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[0].last().unwrap()["chunk"]["reason"]["kind"],
+        "error"
+    );
+    assert_eq!(
+        records[0].last().unwrap()["chunk"]["reason"]["failure"]["code"],
+        "provider_http_503"
+    );
+    assert_eq!(
+        records[0].last().unwrap()["chunk"]["reason"]["failure"]["status"],
+        503
+    );
+    assert_eq!(
+        records[1].last().unwrap()["chunk"]["reason"]["kind"],
+        "stop"
+    );
+}
+
+#[test]
+fn a_cancelled_stream_records_aborted_finish_with_unclosed_deltas() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        drain_http_request(&mut stream);
+        let first = format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": "半截输出"}}]})
+        );
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+            first.len(),
+            first
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.flush();
+        let _ = done_rx.recv_timeout(Duration::from_secs(5));
+    });
+    let client = HttpModelBridgeClient::new(
+        format!("http://{addr}"),
+        Some("test-key".to_string()),
+        "any-openai-compatible-model".to_string(),
+    );
+    let cancelled = AtomicBool::new(false);
+    let records = std::cell::RefCell::new(Vec::new());
+    let response = client.invoke_observed(
+        ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "openai-compatible".into(),
+            prompt: "x".into(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        },
+        ModelInvocationOptions {
+            on_delta: Some(&|delta| {
+                if !delta.content.is_empty() {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+            }),
+            on_retry: &|_| {},
+            is_cancelled: &|| cancelled.load(Ordering::SeqCst),
+            max_output_tokens: None,
+        },
+        &|event| {
+            if let ModelTransportEvent::StreamRecorded(stream) = event {
+                records.borrow_mut().push(stream.clone());
+            }
+            Ok(())
+        },
+    );
+    let _ = done_tx.send(());
+    server.join().expect("server thread");
+    assert!(model_invocation_error_is_cancelled(
+        &response.expect_err("stream must cancel")
+    ));
+    let records = records.into_inner();
+    assert_eq!(records.len(), 1);
+    let stream = &records[0];
+    assert!(
+        stream.iter().any(|record| record["type"] == "text-chunks"
+            && record["texts"] == serde_json::json!(["半截输出"])),
+        "partial text delta must be preserved: {stream:?}"
+    );
+    assert!(
+        stream
+            .iter()
+            .all(|record| record["chunk"]["type"] != "block-end")
+    );
+    let finish = stream.last().unwrap();
+    assert_eq!(finish["chunk"]["reason"]["kind"], "aborted");
+    assert_eq!(finish["chunk"]["reason"]["failure"]["code"], "CANCELLED");
+    assert!(finish["chunk"]["reason"]["failure"].get("status").is_none());
+}
+
 #[test]
 fn streaming_tool_calls_restore_canonical_tool_name() {
     let tool_definition = crate::types::ChatToolDefinition {
@@ -4306,6 +4854,42 @@ fn streaming_retry_reports_runtime_lifecycle() {
             },
         ]
     );
+}
+
+#[test]
+fn single_transport_attempt_does_not_replay_failed_requests() {
+    for streaming in [false, true] {
+        let server = spawn_mock_server_with_response_text(
+            503,
+            "application/json",
+            r#"{"error":{"message":"provider process stopped"}}"#.to_string(),
+        );
+        let client = HttpModelBridgeClient::new(server.address, None, "test-model".into())
+            .without_transport_retries();
+        let request = ModelInvocationRequest {
+            cache_affinity_key: None,
+            prompt_cache_key: None,
+            provider: "openai-compatible".into(),
+            prompt: "hello".into(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        let on_retry = |event: &ModelRetryRuntimeEvent| events.borrow_mut().push(event.clone());
+        let result = if streaming {
+            client.invoke_streaming_with_retry_events(request, &|_| {}, &on_retry)
+        } else {
+            client.invoke_with_retry_events_and_cancellation(request, &on_retry, &|| false)
+        };
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("provider process stopped")
+        );
+        assert!(events.into_inner().is_empty());
+    }
 }
 
 #[test]

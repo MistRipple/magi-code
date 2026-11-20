@@ -1,3 +1,4 @@
+mod attempt_stream;
 mod dispatch;
 mod executor_capabilities;
 mod executor_receipt;
@@ -15,6 +16,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use attempt_stream::{AttemptStreamFailure, AttemptStreamRecorder, LiveStreamChunk};
 pub use dispatch::BridgeDispatchRuntime;
 pub use executor_capabilities::{
     native_executor_capabilities, text_executor_capabilities, validate_executor_request,

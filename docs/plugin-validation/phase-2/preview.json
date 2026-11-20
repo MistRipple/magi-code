@@ -1,0 +1,37 @@
+{
+  "buildIdentity": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+  "daemonSha256": "866ee7f286467075dd39ec73653d7e9de584593bce182dec68bf4ffc6237b94a",
+  "sdkLockSha256": "d3c2f75c3212b96733ec7cf9afda06de9d228f708f2e970eadda0279444f8679",
+  "samples": [
+    {
+      "name": "@idoall/dsh-notify",
+      "version": "0.4.9",
+      "httpStatus": 200,
+      "identicalArchive": true
+    },
+    {
+      "name": "dsh-plugin-mission-control",
+      "version": "0.2.1",
+      "httpStatus": 200,
+      "identicalArchive": true
+    },
+    {
+      "name": "dsh-eval-control",
+      "version": "0.5.0",
+      "httpStatus": 200,
+      "identicalArchive": true
+    },
+    {
+      "name": "dsh-plugin-message-history",
+      "version": "1.0.6",
+      "httpStatus": 200,
+      "identicalArchive": true
+    },
+    {
+      "name": "dsh-better-sidebar",
+      "version": "0.32.1",
+      "httpStatus": 200,
+      "identicalArchive": true
+    }
+  ]
+}

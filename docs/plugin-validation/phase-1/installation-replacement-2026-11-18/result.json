@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-11-18T02:07:13.453968+00:00",
+  "scope": "prepared-original-installation-replacement-and-source-edits",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "sdkVersion": "0.2.2-rc.3",
+  "hostLockSha256": "bd07ad02d666df160691105ca8bf86f6abd6f3c0ed87d020c6b7d8e1245db164",
+  "originals": [
+    {
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.12",
+      "tarball": "https://registry.npmjs.org/dsh-plugin-mgr/-/dsh-plugin-mgr-0.2.12.tgz",
+      "integrity": "sha512-NlEUaaJ6uOekU95H0pw0sGCfluOaiOJV3FFKLzaI4NiD+F5GGqb2srrqP179vemWaF7M+QzxroZk04Wg2vnmCQ==",
+      "archiveSha256": "694b301bdd9c116e8fb01b1820e13932b9ad398bda5d1e6139db0de35372be9c",
+      "project": "target/dsh-phase-1/projects/mgr-shared-sdk-0.2.12-gcxvikq1",
+      "dependencyLockSha256": "817e6aadef3872a6ed13a2a5ac9f4463b2867dcd011bfce037843f4248263ca0",
+      "lockedDependencyRecord": "docs/plugin-validation/phase-1/admission-2026-11-17/dependencies/mgr-0.2.12/package-lock.json",
+      "verifiedOriginalFiles": {
+        "LICENSE": "d650e965595d51ade8795344e77785c82bfa3bb3c1f41f3d5f57c4ca19d5966e",
+        "dist/client.js": "b61f0eea61fe099c7bf0787c64e0e4f4152203e8772feba4eb46ca7727799051",
+        "dist/http-MkkbSIz0.js": "5ff9e78fb73110b211ea15f8e802efbff1fd35ac3b132a99dfebbe3b473481f7",
+        "dist/index.js": "8135d5a4ad5e2bc6bcebcc78eb1a934e132fe38871cabfd01e84b7030a328cfc",
+        "dist/internal.js": "fb6571bdb7412655fefc97906a5ebba74900eed0b9c1f83b3900debbf120d4be",
+        "package.json": "9e4143f1ff342182a010d9c37a2495f046f30a60365e91d4c99fc633442b56da",
+        "README.md": "69b9eee2f9c249e66800aa0eaa247c3041423532d5a542ec769bbbe38fffe2e3",
+        "icon.svg": "6307668063214a63967fed558e1a73194a3394911288cf833dbea0892f49df74",
+        "cordis.patch.yml": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9"
+      }
+    },
+    {
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.13",
+      "tarball": "https://registry.npmjs.org/dsh-plugin-mgr/-/dsh-plugin-mgr-0.2.13.tgz",
+      "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+      "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+      "project": "target/dsh-phase-1/projects/mgr-web-admission-2026-11-18",
+      "dependencyLockSha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e",
+      "lockedDependencyRecord": "docs/plugin-validation/phase-1/admission-2026-11-17/dependencies/mgr-0.2.13/package-lock.json",
+      "verifiedOriginalFiles": {
+        "LICENSE": "d650e965595d51ade8795344e77785c82bfa3bb3c1f41f3d5f57c4ca19d5966e",
+        "dist/client.js": "fe305e14c80b6fcf95e54a96c341dbf14d289531b5eefb3205d4f007bd9bec1c",
+        "dist/http-q4G0rVPe.js": "9a2b24830ea79ea2793de04cb49034fccc4fb78ed2a3d175d972dc96ba24e9eb",
+        "dist/index.js": "5c81bd2b0c5e54292294bc5ab70a62b31c48b65b73576539b95889efb084fd0d",
+        "dist/internal.js": "6dce13d22cfce594bed2feee96ee8d100f81321a2919fd77d965cebcd0e90464",
+        "package.json": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+        "README.md": "69b9eee2f9c249e66800aa0eaa247c3041423532d5a542ec769bbbe38fffe2e3",
+        "icon.svg": "6307668063214a63967fed558e1a73194a3394911288cf833dbea0892f49df74",
+        "cordis.patch.yml": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9"
+      }
+    }
+  ],
+  "sourceSha256": {
+    "crates/magi-plugin-system/src/lifecycle/loading.rs": "037d9083f3d613a1cd896aa6f78336da027e89a1041779482dc80bd9b809059f",
+    "crates/magi-plugin-system/src/lifecycle/loading/edit.rs": "65eb7b6d4701a0df1cec75973ee0d75dad0a1d840651de06c47c2a62d77d3690",
+    "crates/magi-plugin-system/src/loading_runtime.rs": "262cf88558a7ad8a70a971aec3e2213264797ed36dfffb1e8aabaf2029533fd9",
+    "crates/magi-plugin-system/src/loading_runtime/host_services.rs": "635ad673fd6fa2309991dc087fb39b267b47f8d33fc90e9a5a50a28e63b36db7",
+    "crates/magi-plugin-system/src/loading_runtime/source_monitor.rs": "c3909e15dab847a2ae7c1c15498de332884c6e1e301fd3e8bc5c6e10fe0693ed",
+    "crates/magi-plugin-system/tests/loading_host.rs": "a357db91d175288ff7d929d94392bc0873d3999f81c6c620e3db72b7ae5f75ec",
+    "crates/magi-extension-host/runtime/dsh/configuration.mjs": "8ce1f034acb5e52dfc0823c502fd4c139a2492f81cf030481041e011dcbc5faf",
+    "crates/magi-extension-host/runtime/dsh/configuration-edit.mjs": "c88cd773340f242e56f8a1ef0e57cb515d91cd3ca9c607fb45bccbab9a2456b5"
+  },
+  "reproducedBeforeEditFix": "Re-enabling a bundle-inserted row changed the insertion layer to disabled:false while the effective user overlay remained disabled:true. The accepted graph omitted the plugin.",
+  "result": {
+    "activationOrderPreserved": true,
+    "business": "not-run",
+    "finalStatus": {
+      "activationGeneration": 3,
+      "callEpoch": 1,
+      "configurationEpoch": 1,
+      "hostGeneration": 1,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader",
+        "webServer"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.13"
+    },
+    "invalidManifestRejected": true,
+    "reopenedVersion": "0.2.13",
+    "revisions": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "scope": "immutable-installation-input-replacement",
+    "versions": [
+      "0.2.12",
+      "0.2.13"
+    ]
+  },
+  "verification": {
+    "rustPasses": 185,
+    "fixedOriginalRustPasses": 6,
+    "nodePassesWithFixedOriginalProject": 62,
+    "gatewayPassed": true,
+    "clippyPassed": true
+  },
+  "unverified": [
+    "online package transaction and cancellation",
+    "Magi Settings update UI",
+    "public Loader and production coordinator",
+    "original Electron page business"
+  ]
+}

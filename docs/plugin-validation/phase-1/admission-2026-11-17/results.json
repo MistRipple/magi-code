@@ -1,0 +1,224 @@
+{
+  "scope": "original-package-admission-and-source-parsing",
+  "businessStatus": "not-run",
+  "records": [
+    {
+      "project": "mgr-0.2.12",
+      "status": "admission-verified",
+      "name": "dsh-connect-workbuddy",
+      "version": "5.21.2",
+      "manifestSha256": "a2b725145d6c0aa2ce0011316802ff12d030946ce87a03ea376abb351c287f86",
+      "entry": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/dsh-connect-workbuddy/lib/index.js",
+      "runtimeVersion": "0.2.2-rc.3",
+      "clientDeclared": true,
+      "sdkModules": {
+        "@deepseek-ai/cordis": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/cordis/lib/index.js",
+        "@deepseek-ai/dsh-atomic-write": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-atomic-write/lib/index.js",
+        "@deepseek-ai/dsh-attachment": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-attachment/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-primitives": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-client-ui-primitives/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-renderer": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-client-ui-renderer/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-settings": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/index.js",
+        "@deepseek-ai/dsh-home-paths": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-home-paths/lib/index.js",
+        "@deepseek-ai/dsh-host-webserver": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-host-webserver/lib/index.js",
+        "@deepseek-ai/dsh-llm": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-llm/lib/index.js",
+        "@deepseek-ai/dsh-llm-pi-ai": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js",
+        "@deepseek-ai/dsh-settings": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-settings/lib/index.js"
+      },
+      "originalFilesChecked": 29,
+      "originalFilesUnchanged": true
+    },
+    {
+      "project": "mgr-0.2.12",
+      "status": "admission-verified",
+      "name": "dsh-plugin-ops-bundle",
+      "version": "0.20.8",
+      "manifestSha256": "6d41e6189aab6857f1b71ad8cd7c5bfa324bd4bc2454e6cf85a664da0322bda8",
+      "entry": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/dsh-plugin-ops-bundle/lib/index.js",
+      "runtimeVersion": "0.2.2-rc.3",
+      "clientDeclared": true,
+      "sdkModules": {
+        "@deepseek-ai/cordis": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/cordis/lib/index.js"
+      },
+      "originalFilesChecked": 17,
+      "originalFilesUnchanged": true
+    },
+    {
+      "project": "mgr-0.2.12",
+      "status": "admission-verified",
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.12",
+      "manifestSha256": "9e4143f1ff342182a010d9c37a2495f046f30a60365e91d4c99fc633442b56da",
+      "entry": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/dsh-plugin-mgr/dist/index.js",
+      "runtimeVersion": "0.2.2-rc.3",
+      "clientDeclared": true,
+      "sdkModules": {
+        "@deepseek-ai/cordis": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/cordis/lib/index.js",
+        "@deepseek-ai/dsh-tools": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-tools/lib/index.js"
+      },
+      "originalFilesChecked": 9,
+      "originalFilesUnchanged": true
+    },
+    {
+      "project": "mgr-0.2.12",
+      "status": "admission-verified",
+      "name": "dsh-free-search",
+      "version": "0.9.41",
+      "manifestSha256": "a18084bf31fde6b811d5bacc599f949fcafd9361b0897727bfcd7a60190c4b2c",
+      "entry": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/dsh-free-search/lib/index.js",
+      "runtimeVersion": "0.2.2-rc.3",
+      "clientDeclared": true,
+      "sdkModules": {
+        "@deepseek-ai/cordis": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/cordis/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-commands": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-client-ui-commands/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-plugin-manager": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-client-ui-plugin-manager/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-renderer": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-client-ui-renderer/lib/index.js",
+        "@deepseek-ai/dsh-settings": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-settings/lib/index.js",
+        "@deepseek-ai/dsh-tools": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-tools/lib/index.js"
+      },
+      "originalFilesChecked": 62,
+      "originalFilesUnchanged": true
+    },
+    {
+      "project": "mgr-0.2.12",
+      "status": "admission-verified",
+      "name": "dsh-rea",
+      "version": "1.2.0",
+      "manifestSha256": "3ccba7f6885e4f8bfe5d41bd1092afabc2e8207aa17edfba2dc90231263cd473",
+      "entry": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/dsh-rea/lib/index.js",
+      "runtimeVersion": "0.2.2-rc.3",
+      "clientDeclared": true,
+      "sdkModules": {
+        "@deepseek-ai/dsh-mcp-client": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-mcp-client/lib/index.js",
+        "@deepseek-ai/dsh-typert-protocol": "target/dsh-phase-1/projects/mgr-0.2.12/node_modules/@deepseek-ai/dsh-typert-protocol/lib/index.js"
+      },
+      "originalFilesChecked": 12,
+      "originalFilesUnchanged": true
+    },
+    {
+      "project": "mgr-0.2.12",
+      "package": "dsh-plugin-mgr",
+      "status": "source-parsed",
+      "name": "cordis.patch.yml",
+      "sha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+      "entries": [
+        {
+          "insert": [
+            {
+              "id": "dsh-plugin-mgr",
+              "name": "dsh-plugin-mgr"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "project": "mgr-0.2.13",
+      "status": "admission-verified",
+      "name": "dsh-connect-workbuddy",
+      "version": "5.21.2",
+      "manifestSha256": "a2b725145d6c0aa2ce0011316802ff12d030946ce87a03ea376abb351c287f86",
+      "entry": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/dsh-connect-workbuddy/lib/index.js",
+      "runtimeVersion": "0.2.2-rc.3",
+      "clientDeclared": true,
+      "sdkModules": {
+        "@deepseek-ai/cordis": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/cordis/lib/index.js",
+        "@deepseek-ai/dsh-atomic-write": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-atomic-write/lib/index.js",
+        "@deepseek-ai/dsh-attachment": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-attachment/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-primitives": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-client-ui-primitives/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-renderer": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-client-ui-renderer/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-settings": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/index.js",
+        "@deepseek-ai/dsh-home-paths": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-home-paths/lib/index.js",
+        "@deepseek-ai/dsh-host-webserver": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-host-webserver/lib/index.js",
+        "@deepseek-ai/dsh-llm": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-llm/lib/index.js",
+        "@deepseek-ai/dsh-llm-pi-ai": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js",
+        "@deepseek-ai/dsh-settings": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-settings/lib/index.js"
+      },
+      "originalFilesChecked": 29,
+      "originalFilesUnchanged": true
+    },
+    {
+      "project": "mgr-0.2.13",
+      "status": "admission-verified",
+      "name": "dsh-plugin-ops-bundle",
+      "version": "0.20.8",
+      "manifestSha256": "6d41e6189aab6857f1b71ad8cd7c5bfa324bd4bc2454e6cf85a664da0322bda8",
+      "entry": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/dsh-plugin-ops-bundle/lib/index.js",
+      "runtimeVersion": "0.2.2-rc.3",
+      "clientDeclared": true,
+      "sdkModules": {
+        "@deepseek-ai/cordis": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/cordis/lib/index.js"
+      },
+      "originalFilesChecked": 17,
+      "originalFilesUnchanged": true
+    },
+    {
+      "project": "mgr-0.2.13",
+      "status": "admission-verified",
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.13",
+      "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "entry": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/dsh-plugin-mgr/dist/index.js",
+      "runtimeVersion": "0.2.2-rc.3",
+      "clientDeclared": true,
+      "sdkModules": {
+        "@deepseek-ai/cordis": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/cordis/lib/index.js",
+        "@deepseek-ai/dsh-tools": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-tools/lib/index.js"
+      },
+      "originalFilesChecked": 9,
+      "originalFilesUnchanged": true
+    },
+    {
+      "project": "mgr-0.2.13",
+      "status": "admission-verified",
+      "name": "dsh-free-search",
+      "version": "0.9.41",
+      "manifestSha256": "a18084bf31fde6b811d5bacc599f949fcafd9361b0897727bfcd7a60190c4b2c",
+      "entry": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/dsh-free-search/lib/index.js",
+      "runtimeVersion": "0.2.2-rc.3",
+      "clientDeclared": true,
+      "sdkModules": {
+        "@deepseek-ai/cordis": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/cordis/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-commands": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-client-ui-commands/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-plugin-manager": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-client-ui-plugin-manager/lib/index.js",
+        "@deepseek-ai/dsh-client-ui-renderer": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-client-ui-renderer/lib/index.js",
+        "@deepseek-ai/dsh-settings": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-settings/lib/index.js",
+        "@deepseek-ai/dsh-tools": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-tools/lib/index.js"
+      },
+      "originalFilesChecked": 62,
+      "originalFilesUnchanged": true
+    },
+    {
+      "project": "mgr-0.2.13",
+      "status": "admission-verified",
+      "name": "dsh-rea",
+      "version": "1.2.0",
+      "manifestSha256": "3ccba7f6885e4f8bfe5d41bd1092afabc2e8207aa17edfba2dc90231263cd473",
+      "entry": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/dsh-rea/lib/index.js",
+      "runtimeVersion": "0.2.2-rc.3",
+      "clientDeclared": true,
+      "sdkModules": {
+        "@deepseek-ai/dsh-mcp-client": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-mcp-client/lib/index.js",
+        "@deepseek-ai/dsh-typert-protocol": "target/dsh-phase-1/projects/mgr-0.2.13/node_modules/@deepseek-ai/dsh-typert-protocol/lib/index.js"
+      },
+      "originalFilesChecked": 12,
+      "originalFilesUnchanged": true
+    },
+    {
+      "project": "mgr-0.2.13",
+      "package": "dsh-plugin-mgr",
+      "status": "source-parsed",
+      "name": "cordis.patch.yml",
+      "sha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+      "entries": [
+        {
+          "insert": [
+            {
+              "id": "dsh-plugin-mgr",
+              "name": "dsh-plugin-mgr"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

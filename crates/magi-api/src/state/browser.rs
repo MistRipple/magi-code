@@ -228,8 +228,7 @@ impl ApiState {
             .snapshot()
             .sessions
             .into_iter()
-            // App 级会话不属于任何 Magi 会话，只按 owner 的 Session 分支参与孤儿判定
-            // （设计基线 §5.3）。
+            // App 级会话不属于任何 Magi 会话，只按 owner 的 Session 分支参与孤儿判定。
             .filter(|session| {
                 session.lifecycle.is_open()
                     && session

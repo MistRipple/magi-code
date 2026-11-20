@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { downloadArtifact } from "@electron/get";
 import { extract as extractZip } from "@electron-internal/extract-zip";
 import { build as esbuild } from "esbuild";
-import { nodeRuntimeFileName, readNodeRuntimePin, runNodeRuntimePreflight, stageNodeRuntime } from "./node-runtime.mjs";
+import { nodeRuntimeFileName, npmRuntimeEntry, readNodeRuntimePin, runNodeRuntimePreflight, stageNodeRuntime } from "./node-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
@@ -19,7 +19,7 @@ export const desktopDist = join(desktopRoot, "dist");
 export const workerDist = join(repositoryRoot, "browser-automation-worker", "dist");
 export const lighthouseRuntimeDist = join(desktopDist, "lighthouse-runtime");
 export const nodeRuntimeDist = join(desktopDist, "node-runtime");
-export const compatRuntimeDist = join(desktopDist, "compat");
+export const dshHostDist = join(desktopDist, "dsh");
 export const webDist = join(repositoryRoot, "web", "dist");
 
 const runtimePackages = ["electron", "electron-updater", "ws", "devtools-protocol", "lighthouse"];
@@ -83,10 +83,10 @@ export async function buildDesktopJavaScript({ development = false } = {}) {
 
 export async function buildWebAssets() {
   await run(process.platform === "win32" ? "npm.cmd" : "npm", [
+    "--prefix",
+    join(repositoryRoot, "web"),
     "run",
     "build",
-    "--workspace",
-    "magi-web",
   ], repositoryRoot);
   await assertFile(join(webDist, "web.html"), "Web Renderer 构建产物");
 }
@@ -137,8 +137,9 @@ export async function prepareReleaseMetadata() {
   const files = [];
   await appendFileHash(files, daemonBinary("release"), daemonResourcePath());
   await appendFileHash(files, join(nodeRuntimeDist, nodeRuntimeFileName), `daemon/node/${nodeRuntimeFileName}`);
+  await appendTreeHashes(files, join(nodeRuntimeDist, "npm"), "daemon/node/npm");
+  await appendTreeHashes(files, dshHostDist, "daemon/dsh");
   await appendFileHash(files, join(workerDist, "index.cjs"), "browser-automation-worker/index.cjs");
-  await appendTreeHashes(files, compatRuntimeDist, "daemon/compat");
   await appendTreeHashes(files, lighthouseRuntimeDist, "browser-automation-worker");
   await appendTreeHashes(files, webDist, "web/dist");
   await appendTreeHashes(files, join(resources, "licenses"), "licenses");
@@ -216,59 +217,57 @@ export async function assertReleaseInputs() {
     assertFile(daemonBinary("release"), "Rust daemon sidecar"),
     assertFile(join(desktopDist, "resources", "browser-capability-manifest.json"), "能力清单"),
     assertFile(join(nodeRuntimeDist, nodeRuntimeFileName), "随包 Node"),
-    assertFile(join(compatRuntimeDist, "cli.mjs"), "上游插件翻译运行时"),
-    assertFile(join(compatRuntimeDist, "dist", "dsh-client-host.js"), "上游插件页面运行时"),
-    assertFile(join(compatRuntimeDist, "dist", "translation-runtime.json"), "插件运行组件版本"),
+    assertFile(join(dshHostDist, "runtime", "entry.mjs"), "DSH 共享宿主"),
+    assertFile(join(dshHostDist, "runtime", "prepare-dependencies.mjs"), "DSH 原包依赖准备入口"),
+    assertFile(join(dshHostDist, "runtime", "dist", "dsh-client-host.js"), "DSH 原生客户端页面宿主"),
+    assertFile(join(dshHostDist, "runtime", "dist", "dsh-client-host.css"), "DSH 原生客户端页面宿主样式"),
   ]);
   await runNodeRuntimePreflight(nodeRuntimeDist);
 }
 
-/** 准备扩展宿主使用的固定版本 Node（归档摘要固定在 node-runtime.json）。 */
+/** 准备扩展宿主使用的固定 Node 和 npm（归档摘要固定在 node-runtime.json）。 */
 export async function stageExtensionNode() {
   return stageNodeRuntime(nodeRuntimeDist);
 }
 
-/**
- * 准备上游生态插件的翻译运行时（`scripts/compat`）：翻译器源码、预构建的页面运行时，
- * 以及按锁文件精确安装的生产依赖。依赖只来自锁文件固定的 registry 摘要；不运行任何安装脚本，
- * 包含当前平台的可选依赖（图片转换使用 sharp 的预编译模块）。
- */
-export async function stageCompatRuntime() {
-  const source = join(repositoryRoot, "scripts", "compat");
-  await rm(compatRuntimeDist, { recursive: true, force: true });
-  await mkdir(compatRuntimeDist, { recursive: true });
-  const entries = ["cli.mjs", "core", "dsh", "runtime", "install", "package.json", "package-lock.json"];
-  for (const entry of entries) {
-    await cp(join(source, entry), join(compatRuntimeDist, entry), { recursive: true, dereference: false });
+/** 共享宿主和候选安装项目引用同一份锁定 SDK。 */
+export async function stageDshHost() {
+  const source = join(repositoryRoot, "crates", "magi-extension-host", "runtime", "dsh");
+  const runtime = join(dshHostDist, "runtime");
+  await rm(dshHostDist, { recursive: true, force: true });
+  await mkdir(join(runtime, "dist"), { recursive: true });
+  const node = join(nodeRuntimeDist, nodeRuntimeFileName);
+  const npm = join(nodeRuntimeDist, npmRuntimeEntry);
+  const install = ["ci", "--include=optional", "--ignore-scripts", "--no-audit", "--no-fund", "--bin-links=false"];
+  const clientBuild = await mkdtemp(join(tmpdir(), "magi-dsh-client-"));
+  try {
+    for (const name of ["package.json", "package-lock.json", "build-client-host.mjs", "client-host"]) {
+      await cp(join(source, name), join(clientBuild, name), { recursive: true });
+    }
+    await run(node, [npm, ...install, "--include=dev"], clientBuild);
+    await run(node, [join(clientBuild, "build-client-host.mjs"), join(runtime, "dist")], clientBuild);
+  } finally {
+    await rm(clientBuild, { recursive: true, force: true });
   }
-  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-  await execFileAsync(
-    npmCommand,
-    ["ci", "--omit=dev", "--include=optional", "--ignore-scripts", "--no-audit", "--no-fund"],
-    { cwd: compatRuntimeDist, maxBuffer: 16 * 1024 * 1024, shell: process.platform === "win32" },
-  );
-  // npm 的内部缓存文件不属于发行物，且以点开头的 node_modules 元数据会被打包器按依赖清单特殊处理。
-  await rm(join(compatRuntimeDist, "node_modules", ".package-lock.json"), { force: true });
-  await rm(join(compatRuntimeDist, "node_modules", ".bin"), { recursive: true, force: true });
-  // electron-builder 不复制 .gitkeep；在生成资源摘要前移除空目录占位，保持逐文件校验完整。
-  for (const path of await walkFiles(compatRuntimeDist)) {
-    if (basename(path) === ".gitkeep") await rm(path);
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".mjs") || entry.name === "build-include-journal.mjs"
+        || entry.name === "include-journal.entry.mjs" || entry.name === "build-client-host.mjs") continue;
+    await cp(join(source, entry.name), join(runtime, entry.name));
   }
-  // esbuild 来自根 workspace；页面依赖只读取刚安装的发行暂存目录。
-  await execFileAsync(process.execPath, [join(source, "tools", "build-client-shim.mjs"), compatRuntimeDist], {
-    cwd: repositoryRoot, maxBuffer: 16 * 1024 * 1024,
-  });
-  const { access: probe } = await import("node:fs/promises");
-  await probe(join(compatRuntimeDist, "node_modules", "@deepseek-ai", "cordis", "package.json"));
+  await cp(join(source, "package.json"), join(runtime, "package.json"));
+  await cp(join(source, "package.json"), join(dshHostDist, "package.json"));
+  await cp(join(source, "package-lock.json"), join(dshHostDist, "package-lock.json"));
+  await run(node, [npm, ...install, "--omit=dev"], dshHostDist);
+  await rm(join(dshHostDist, "node_modules", ".package-lock.json"), { force: true });
 }
 
-/** Node 许可证与来源声明随发行物一起交付。 */
+/** Node 和 npm 许可证与来源声明随发行物一起交付。 */
 export async function stageNodeRuntimeLicense(destination) {
   const pin = await readNodeRuntimePin();
   await cp(join(nodeRuntimeDist, "LICENSE"), join(destination, "Node-LICENSE"));
   await writeFile(
     join(destination, "NODE-RUNTIME-NOTICE.json"),
-    `${JSON.stringify({ name: "node", version: pin.version, license: "MIT", source: `${pin.source}/${pin.archive.file}`, sha256: pin.archive.sha256 }, null, 2)}\n`,
+    `${JSON.stringify({ name: "node", version: pin.version, license: "MIT", npmVersion: pin.npmVersion, source: `${pin.source}/${pin.archive.file}`, sha256: pin.archive.sha256 }, null, 2)}\n`,
     "utf8",
   );
 }

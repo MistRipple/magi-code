@@ -44,6 +44,8 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     overlay?: boolean;
     desktopSurface?: boolean;
     visible?: boolean;
+    /** 仅为当前会话中已打开的插件文档保留右栏时，卸下原生面板。 */
+    parked?: boolean;
     /** Main 声明的代理正在使用的页面；不可见时在离屏内容槽中保持挂载。 */
     agentRetainedSurfaces?: MagiDesktopBrowserSurfaceSnapshot[];
   }
@@ -53,6 +55,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     overlay = false,
     desktopSurface = false,
     visible = true,
+    parked = false,
     agentRetainedSurfaces = [],
   }: Props = $props();
 
@@ -72,6 +75,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     visible: boolean;
   };
   const browserHosts = $derived.by<BrowserHostEntry[]>(() => {
+    if (parked) return [];
     const entries: BrowserHostEntry[] = openTabs
       .filter((tab) => tab.kind === 'browser')
       .map((tab) => ({
@@ -146,6 +150,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
   let creatingBrowserPane = $state(false);
   let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
   const pluginManifests = $derived(pluginProjection().manifests);
+  const pluginCloseHandlers = new Map<string, () => Promise<void>>();
   const canCreateBrowserPane = $derived(Boolean(
     desktopSurface
       && window.magiDesktop
@@ -254,7 +259,13 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
 
   type LauncherToolKind = 'agents' | 'browser' | 'terminal' | 'plugin' | 'managePlugins';
 
-  const pluginViews = $derived.by(() => pluginManifests.flatMap((manifest) => manifest.contributions?.views?.filter((view) => view.placements.includes('rightPane')).map((view) => ({ manifest, view })) ?? []));
+  const pluginViews = $derived.by(() => {
+    return pluginManifests.flatMap(manifest => (
+      manifest.contributions.views?.filter(view => view.placements.includes('rightPane') && view.priority != null)
+        .map(view => ({ manifest, view })) ?? []
+    )).sort((a, b) => (a.view.priority ?? 0) - (b.view.priority ?? 0)
+      || a.manifest.id.localeCompare(b.manifest.id) || a.view.id.localeCompare(b.view.id));
+  });
   const pluginViewNeedsSession = $derived(!rightPaneState.activeSessionId.trim());
   const launcherTools = $derived<LauncherTool[]>([
     {
@@ -373,7 +384,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     if (kind === 'plugin') {
       const item = pluginViews.find(({ manifest, view }) => manifest.id === tool.pluginId && view.id === tool.contributionId);
       if (item) {
-        openPluginTab({ pluginId: item.manifest.id, contributionId: item.view.id, entry: item.view.entry, label: `${item.manifest.name}: ${item.view.title}`, workspaceId: rightPaneState.activeWorkspaceId, workspacePath: workspaceRoot, sessionId: rightPaneState.activeSessionId });
+        openPluginTab({ pluginId: item.manifest.id, contributionId: item.view.id, entry: item.view.entry, label: item.view.title, workspaceId: rightPaneState.activeWorkspaceId, workspacePath: workspaceRoot, sessionId: rightPaneState.activeSessionId });
         closeLauncher();
       }
       return;
@@ -441,12 +452,8 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     }
   }
   const activeTab = $derived.by<RightPaneTab | null>(() => {
-    const scopeKey = rightPaneState.activeScopeKey;
-    const state = scopeKey ? rightPaneState.perSession[scopeKey] : undefined;
-    const activeTabId = state?.activeTabId;
-    return activeTabId
-      ? state?.openTabs.find((tab) => tab.id === activeTabId) ?? null
-      : null;
+    if (parked) return null;
+    return openTabs.find((tab) => tab.id === paneState.activeTabId) ?? null;
   });
 
 
@@ -964,10 +971,16 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     setActiveRightPaneTab(paneScopeKey, tabId);
   }
 
-  function handleTabClose(event: MouseEvent, tabId: string) {
+  async function handleTabClose(event: MouseEvent, tabId: string) {
     event.stopPropagation();
     if (recentlyDragged()) return;
     const tab = openTabs.find((item) => item.id === tabId);
+    if (tab?.kind === 'plugin') {
+      const scope = paneScopeKey;
+      await pluginCloseHandlers.get(JSON.stringify([scope, tabId]))?.();
+      closeTab(scope, tabId);
+      return;
+    }
     if (tab) rememberClosedTab(tab);
     closeTab(paneScopeKey, tabId);
     if (tab?.kind === 'browser') {
@@ -1060,7 +1073,7 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
   }
 </script>
 
-<aside class="right-pane" data-magi-surface={overlay ? 'window' : undefined} aria-label={i18n.t('rightPane.title')}>
+<aside class="right-pane" hidden={parked} data-magi-surface={overlay ? 'window' : undefined} aria-label={i18n.t('rightPane.title')}>
   <!-- 顶部 Tab 条；右栏折叠入口由工作台外壳固定在窗口右上角。 -->
   <header class="right-pane-tabbar" class:right-pane-tabbar--overlay={overlay}>
     {#if overlay}
@@ -1242,7 +1255,39 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
 
 
 
-    <!-- 离场期间保留该页签自己的身份，不能让仍在清理的子组件读取已经清空的 activeTab。 -->
+    {#key paneScopeKey}
+      {#each openTabs.filter(tab => tab.kind === 'plugin') as tab (tab.id)}
+        {@const payload = tab.payload as PluginTabPayload}
+        {@const presented = tab.id === activeTab?.id && visible && !paneState.collapsed}
+        {@const closeKey = JSON.stringify([paneScopeKey, tab.id])}
+        {#if payload.sessionId}
+          <div class="right-pane-plugin-tab-host" hidden={!presented}>
+            <PluginTabContent
+              pluginId={payload.pluginId}
+              entry={payload.entry}
+              label={tab.label}
+              placement="rightPane"
+              sessionId={payload.sessionId}
+              paneTab={{
+                id: tab.id,
+                viewId: payload.contributionId,
+                sessionId: payload.sessionId,
+                title: tab.label,
+                visible: presented,
+                expanded: !paneState.collapsed,
+                overlay,
+                navigation: $state.snapshot(payload.navigation) ?? { address: '', revision: 0 },
+              }}
+              registerClose={(close) => {
+                pluginCloseHandlers.set(closeKey, close);
+                return () => { if (pluginCloseHandlers.get(closeKey) === close) pluginCloseHandlers.delete(closeKey); };
+              }}
+            />
+          </div>
+        {/if}
+      {/each}
+    {/key}
+    <!-- 离场期间保留该页签自己的身份。 -->
     {#each activeTab ? [activeTab] : [] as renderedTab (renderedTab.id)}
     {#if renderedTab.kind === 'agent'}
       {@const agentPayload = renderedTab.payload as AgentTabPayload}
@@ -1263,20 +1308,12 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
         sessionId={terminalPayload.sessionId}
       />
       {/key}
-    {:else if renderedTab.kind === 'browser'}
-      <!-- BrowserTabContent 已在上方的内容槽中渲染；这里不能再进入文件预览分支。 -->
+    {:else if renderedTab.kind === 'browser' || renderedTab.kind === 'plugin'}
+      <!-- 浏览器和插件内容使用上方的独立内容槽。 -->
     {:else if renderedTab.kind === 'launcher'}
       {@render launcherPage()}
     {:else if renderedTab.kind === 'agents'}
       <AgentListTabContent />
-    {:else if renderedTab.kind === 'plugin'}
-      {@const pluginPayload = renderedTab.payload as PluginTabPayload}
-      <PluginTabContent
-        pluginId={pluginPayload.pluginId}
-        entry={pluginPayload.entry}
-        label={renderedTab.label}
-        active={visible}
-      />
     {:else if previewLoading}
       <div class="right-pane-state"><LoadingText text={i18n.t('web.filePreviewLoading')} size={14} /></div>
     {:else if previewError}
@@ -1421,6 +1458,8 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     overflow: hidden;
   }
 
+  .right-pane[hidden] { display: none; }
+
   .right-pane-browser-tab-host {
     position: absolute;
     inset: 0;
@@ -1429,7 +1468,14 @@ import { agentUrl, buildFilePreviewQuery, closeBrowserTab, closeTerminalSession,
     min-height: 0;
     overflow: hidden;
   }
-  .right-pane-browser-tab-host[hidden] { display: none; }
+  .right-pane-plugin-tab-host {
+    min-width: 0;
+    min-height: 0;
+    flex: 1;
+    display: flex;
+  }
+  .right-pane-browser-tab-host[hidden],
+  .right-pane-plugin-tab-host[hidden] { display: none; }
   /* 后台保留必须是「移出可见区域」而不是 display:none：guest 只有在内容槽有真实
      布局尺寸时才能注册并持续接收自动化命令。 */
   .right-pane-browser-tab-host--background {

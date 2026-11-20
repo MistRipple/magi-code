@@ -800,6 +800,7 @@ async fn execute_dispatch_submission(
         requested_workspace_id,
         placeholder_title,
         accepted_at,
+        request.project_directories.as_ref(),
     )?;
     // 项目 cwd 由 submit_dispatch_submission 沿冻结绑定统一解析。
     let execution_root = workspace_id
@@ -2129,6 +2130,7 @@ mod tests {
             Some(workspace_id.clone()),
             "真实首条消息",
             UtcMillis::now(),
+            None,
         )
         .expect("dispatch session should resolve");
 
@@ -2150,9 +2152,15 @@ mod tests {
             .expect("workspace should register");
         let accepted_at = UtcMillis(1_779_700_000_000);
 
-        let (resolved_session_id, created_session, _) =
-            resolve_turn_session(&state, None, Some(workspace_id), "新会话", accepted_at)
-                .expect("dispatch session should resolve");
+        let (resolved_session_id, created_session, _) = resolve_turn_session(
+            &state,
+            None,
+            Some(workspace_id),
+            "新会话",
+            accepted_at,
+            None,
+        )
+        .expect("dispatch session should resolve");
 
         let session = state
             .session_store
@@ -2195,6 +2203,7 @@ mod tests {
             Some(workspace_id.clone()),
             "后续消息",
             UtcMillis::now(),
+            None,
         )
         .expect("dispatch session should resolve");
 

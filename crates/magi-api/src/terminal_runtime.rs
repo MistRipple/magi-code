@@ -376,6 +376,40 @@ impl TerminalSessionManager {
             })
     }
 
+    pub(crate) fn list(&self, session_id: Option<&str>) -> Vec<Arc<TerminalSession>> {
+        self.sessions
+            .lock()
+            .expect("terminal sessions lock poisoned")
+            .values()
+            .filter(|terminal| {
+                session_id.is_none_or(|target| terminal.binding().session_id == target)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn get(&self, terminal_tab_id: &str) -> Option<Arc<TerminalSession>> {
+        self.sessions
+            .lock()
+            .expect("terminal sessions lock poisoned")
+            .get(terminal_tab_id)
+            .cloned()
+    }
+
+    pub(crate) fn close_by_id(&self, terminal_tab_id: &str) -> bool {
+        let session = self
+            .sessions
+            .lock()
+            .expect("terminal sessions lock poisoned")
+            .remove(terminal_tab_id);
+        if let Some(session) = session {
+            session.terminate();
+            true
+        } else {
+            false
+        }
+    }
+
     #[cfg(test)]
     fn active_count(&self) -> usize {
         self.sessions

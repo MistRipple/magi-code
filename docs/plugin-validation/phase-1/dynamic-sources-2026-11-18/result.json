@@ -1,0 +1,123 @@
+{
+  "schemaVersion": 1,
+  "scope": "dynamic-include-file-closure-and-durable-edit-recovery",
+  "capturedAt": "2026-11-18T01:04:56.097430+00:00",
+  "magi": {
+    "commit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "workingTree": "development-in-progress"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v26.13.1"
+  },
+  "hostLock": {
+    "path": "crates/magi-extension-host/runtime/dsh/package-lock.json",
+    "sha256": "9cbccb124b07ce443f6ca31bdfe3fa1f4c538aa58bf8096cfdcfffc416104e3c"
+  },
+  "preparedProject": "target/dsh-phase-1/projects/mgr-dynamic-sources-2026-11-18",
+  "dependencyLock": {
+    "path": "target/dsh-phase-1/projects/mgr-dynamic-sources-2026-11-18/package-lock.json",
+    "sha256": "117bba38169f61a8392ff554e0214e2d6bb75108a9f026d1ab214fe5887fa51e"
+  },
+  "original": {
+    "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+    "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+    "name": "dsh-plugin-mgr",
+    "version": "0.2.13",
+    "verifiedOriginalFiles": {
+      "LICENSE": "d650e965595d51ade8795344e77785c82bfa3bb3c1f41f3d5f57c4ca19d5966e",
+      "dist/client.js": "fe305e14c80b6fcf95e54a96c341dbf14d289531b5eefb3205d4f007bd9bec1c",
+      "dist/http-q4G0rVPe.js": "9a2b24830ea79ea2793de04cb49034fccc4fb78ed2a3d175d972dc96ba24e9eb",
+      "dist/index.js": "5c81bd2b0c5e54292294bc5ab70a62b31c48b65b73576539b95889efb084fd0d",
+      "dist/internal.js": "6dce13d22cfce594bed2feee96ee8d100f81321a2919fd77d965cebcd0e90464",
+      "package.json": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+      "README.md": "69b9eee2f9c249e66800aa0eaa247c3041423532d5a542ec769bbbe38fffe2e3",
+      "icon.svg": "6307668063214a63967fed558e1a73194a3394911288cf833dbea0892f49df74",
+      "cordis.patch.yml": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9"
+    }
+  },
+  "sourceSha256": {
+    "crates/magi-extension-host/runtime/dsh/build-include-journal.mjs": "2bc5b4a44f251918c9061aeeb0178462cdddd0c008a8cfafd4462ea74c88cdcf",
+    "crates/magi-extension-host/runtime/dsh/committed-tree.mjs": "f5070a3a5152e9fec32108179de69a116c85adb3d3cf44659ca076b1ac3eeb21",
+    "crates/magi-extension-host/runtime/dsh/configuration-access.mjs": "b63e6faefd27a7d9785527fde4730600fef7e251dc2f18253f0064d82f646706",
+    "crates/magi-extension-host/runtime/dsh/configuration-edit.mjs": "8d5843d0733748ed1c39298ddfbdf4e87bbc1ce5ee4e260a534a86cb37d557a2",
+    "crates/magi-extension-host/runtime/dsh/configuration-group.mjs": "a3433cc52232c3cec64230b80e47a9a53bd0f814eca89f34b9e06e48475c52e5",
+    "crates/magi-extension-host/runtime/dsh/configuration-order.mjs": "39d8107d22d104cd1430f0f97be2a8ac72421f46adb7412f6188e64db7b14010",
+    "crates/magi-extension-host/runtime/dsh/configuration.mjs": "a253c7688f30df63880e09a9afc53c2b0ed623a770bb96b7cc638f09ee0d219c",
+    "crates/magi-extension-host/runtime/dsh/entry.mjs": "429482167a3b5069514023f617fa1f9581c670854499005a68964729a59fc856",
+    "crates/magi-extension-host/runtime/dsh/include-journal.entry.mjs": "71bcb5073022ad0476505cb2915c17bf69f0d34ce44bc8bf022ca916493a4bbd",
+    "crates/magi-extension-host/runtime/dsh/include-journal.generated.mjs": "d6adf43ccd07df6c60709b06dee0f0e180a7cf5f6a6fef88ffe565b5f2e11c32",
+    "crates/magi-extension-host/runtime/dsh/lifecycle.mjs": "630e2b88ca6f34b66c1639bc6b05e63f5c22431fbcd8fe37138232e15d6b822c",
+    "crates/magi-extension-host/runtime/dsh/loading-objects.mjs": "e326462e9ae7e19c76b1f8f360bf4cf3dcb495134418cf994d950748a60ccfb2",
+    "crates/magi-extension-host/runtime/dsh/packages.mjs": "ac10dcd3a6f67fee94caf1abcafc28637ab3eac0c059453eb2be8c8c60f4572d",
+    "crates/magi-extension-host/runtime/dsh/test/committed-tree.test.mjs": "50940df7dd356ce422d66e2372e21c6909b7dff21d736a8d06a229b4d685d823",
+    "crates/magi-extension-host/runtime/dsh/test/configuration-access.test.mjs": "dfe3728137d22adad1673e3dbc13ca1af66c6932a909d436651dc2122983aab3",
+    "crates/magi-extension-host/runtime/dsh/test/configuration-edit.test.mjs": "8d210ecc9299659a332620da33460ddf597de1e27a3217d63795ea08f4567f1d",
+    "crates/magi-extension-host/runtime/dsh/test/configuration.test.mjs": "17c77fa91a369db21d47dcee96f0d71ccbe2f4d661fdbaf300b243180db8af6a",
+    "crates/magi-extension-host/runtime/dsh/test/lifecycle.test.mjs": "590b80f7b43b3755ce166ad2ebe3c1f5d08d237c99b64a7fddd212893f707df5",
+    "crates/magi-extension-host/runtime/dsh/test/memory-root.test.mjs": "103bb24ad865e1e552ed081195a2271b1a2f3039cb54f6c57eb5e0716ed80cff",
+    "crates/magi-extension-host/runtime/dsh/test/packages.test.mjs": "ee0eeb4570107f07f01560e5e3aa7ddd1a1ed0a05ca7bed479209182f5c252dc",
+    "crates/magi-plugin-system/src/lifecycle/loading.rs": "76e571a74748da60d43a70277d290a158502eebc2b20b77f6490418f4042579a",
+    "crates/magi-plugin-system/src/lifecycle/loading/edit.rs": "c437de9e1ef610c4b3cd39a35affe7fa49c867c3836593c4b73fef11632bcf0c",
+    "crates/magi-plugin-system/src/loading_runtime.rs": "392c7909b7609d6d4790b32cecc5165d879e73a45171a49389d528db240028ad",
+    "crates/magi-plugin-system/src/loading_runtime/source_monitor.rs": "bb5c4df80308b34cc9d90005f9f8c299ab94c6d39b1a98c434ba8422ded77349",
+    "crates/magi-plugin-system/tests/loading.rs": "a7b7e217c1e91c25503524298340b49734748212576f694e913934d0d77c36b8",
+    "crates/magi-plugin-system/tests/loading_host.rs": "36786fe9a2903704616f0e39c8ede86c61c7e2d6f33ef19587b32526b73f1403",
+    "crates/magi-plugin-system/tests/loading_runtime.rs": "c49c2af07739bfbd4dfd3b994f71a6de9a3f8c99888b46eef6b7ac74c4b3fb96"
+  },
+  "verification": {
+    "nodePassed": 60,
+    "rustPassed": 183,
+    "rustIgnored": 5,
+    "originalRustPassed": 5,
+    "clippy": "passed"
+  },
+  "runtimeTests": [
+    "discovered_include_sources_recover_from_missing_files_and_leave_the_admitted_set_when_removed",
+    "recovery_rechecks_newly_referenced_source_before_accepting_a_saved_parent",
+    "a_partial_multi_source_save_survives_restart_without_admitting_the_partial_graph"
+  ],
+  "originalSourceIntake": {
+    "acceptedRevisions": [
+      1,
+      2,
+      3
+    ],
+    "activationGenerations": [
+      1,
+      2
+    ],
+    "bundleSha256": "8d1ec6ce0da3d9c1d728e97c3622f0a908922d16f2370cbda841c392221557e9",
+    "business": "not-run",
+    "candidateWriter": "original dist/internal.js disableRows and enableRows",
+    "finalStatus": {
+      "activationGeneration": 2,
+      "configurationEpoch": 1,
+      "hostGeneration": 1,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader",
+        "webServer"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.13"
+    },
+    "manifestSha256": "7f7f2df34558c37a8b81417b4fc60074915f82ab06172fe9c520954cfea3cf4d",
+    "originalBundleUnchanged": true,
+    "package": "dsh-plugin-mgr@0.2.13",
+    "scope": "source-notification-intake",
+    "states": [
+      "waiting",
+      "removed",
+      "waiting"
+    ]
+  },
+  "unverified": [
+    "Include.initial and evaluated Include paths",
+    "public Loader and WebServer",
+    "production daemon/Electron",
+    "Mgr page and business tasks"
+  ]
+}

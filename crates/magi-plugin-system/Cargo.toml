@@ -16,9 +16,11 @@ zip.workspace = true
 flate2 = "1"
 tar = "0.4"
 base64.workspace = true
-ring = "0.17"
 semver = "1"
 jsonschema = { version = "0.60", default-features = false }
+tokio.workspace = true
+notify.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+magi-process = { path = "../magi-process" }

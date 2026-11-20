@@ -37,7 +37,7 @@ impl TaskStore {
             .store(enabled, Ordering::Release);
     }
 
-    /// Set or replace the per-transition checkpoint callback (design 6.8).
+    /// Set or replace the per-transition checkpoint callback.
     pub fn set_checkpoint_callback(&self, callback: CheckpointCallback) {
         let mut guard = self
             .on_checkpoint

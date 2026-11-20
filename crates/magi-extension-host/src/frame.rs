@@ -1,4 +1,4 @@
-//! 帧：4 字节大端长度 + UTF-8 JSON 正文（见 `docs/extension-protocol-v1.md` 第 1 节）。
+//! 共享扩展宿主传输帧编解码：4 字节大端长度头 + UTF-8 JSON 正文。
 
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

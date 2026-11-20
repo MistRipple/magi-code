@@ -940,7 +940,10 @@ impl LlmTaskDispatcher {
             system_prompt,
             execution_settings_snapshot: execution_settings_snapshot.clone(),
         };
-        let (mut outcome, context_summary) = match self.execute_plugin_task_command(&invocation) {
+        let (mut outcome, context_summary) = match self
+            .execute_plugin_task_command(&invocation)
+            .or_else(|| self.execute_plugin_agent_loop(&invocation))
+        {
             Some(outcome) => (outcome, None),
             None => self.invoke_llm_with_tools(invocation),
         };
@@ -1665,7 +1668,7 @@ impl LlmTaskDispatcher {
 
     /// Synchronous inner dispatch logic; invoked either directly or inside
     /// `tokio::task::spawn_blocking` so the LLM call does not starve the
-    /// async runtime (design §1.3).
+    /// async runtime.
     fn dispatch_inner(
         &self,
         task: &magi_core::Task,

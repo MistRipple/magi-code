@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-11-18T02:46:52.431706+00:00",
+  "scope": "desktop-directory-package-and-contained-plugin-toolchain",
+  "platform": "darwin",
+  "arch": "arm64",
+  "magi": {
+    "productVersion": "3.0.62",
+    "gitCommit": "9fb6a66c93d06d6442c5b4db19ce5b280511b66b",
+    "gitDirty": true,
+    "electronVersion": "45.0.0",
+    "chromiumVersion": "156.0.8078.48"
+  },
+  "artifact": {
+    "kind": "directory",
+    "resources": "target/electron-dist/mac-arm64/Magi.app/Contents/Resources",
+    "resourceManifestSha256": "f3731815f59eab92d1f90776f7d0175ae846201fb82d2089d84e5e0b60320507",
+    "verifiedResourceFiles": 54722
+  },
+  "toolchain": {
+    "node": "26.13.0",
+    "npm": "11.20.0",
+    "nodeArchiveSha256": "d38bd5e5a2ddce6bbb5ce45e46e208337da4d51fffe611e567fd32073d6439f6",
+    "sdkLockSha256": "f357651dc7f38f034fa4f7993b125f427d6b7670aaaa87eafdc2610077f4ab34",
+    "emptyEnvironmentCheck": "passed"
+  },
+  "startup": {
+    "daemonHealth": "ok",
+    "packagedWorkbenchLoaded": true,
+    "daemonStoppedWithOwner": true
+  },
+  "mgr": {
+    "acceptedRevisions": [
+      1,
+      2
+    ],
+    "business": "not-run",
+    "cancelledDependencyPreparationPreservedRevision": true,
+    "first": {
+      "activationGeneration": 1,
+      "callEpoch": 1,
+      "configurationEpoch": 1,
+      "hostGeneration": 1,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader",
+        "webServer"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.12"
+    },
+    "newArchive": {
+      "archiveSha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+      "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw==",
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.13"
+    },
+    "oldArchive": {
+      "archiveSha256": "694b301bdd9c116e8fb01b1820e13932b9ad398bda5d1e6139db0de35372be9c",
+      "integrity": "sha512-NlEUaaJ6uOekU95H0pw0sGCfluOaiOJV3FFKLzaI4NiD+F5GGqb2srrqP179vemWaF7M+QzxroZk04Wg2vnmCQ==",
+      "name": "dsh-plugin-mgr",
+      "version": "0.2.12"
+    },
+    "replacement": {
+      "activationGeneration": 2,
+      "callEpoch": 1,
+      "configurationEpoch": 1,
+      "hostGeneration": 1,
+      "instanceId": "include:dsh-plugin-mgr",
+      "missingServices": [
+        "loader",
+        "webServer"
+      ],
+      "pluginId": "dsh-plugin-mgr",
+      "state": "waiting",
+      "version": "0.2.13"
+    },
+    "scope": "online-original-archive-and-native-loading-commit",
+    "dependencyLocks": [
+      {
+        "version": "0.2.12",
+        "dependencyLockSha256": "de71f0457b2a209adf3eebf0d98d6b1d64bd91400c7db837da19ac85a43715ea"
+      },
+      {
+        "version": "0.2.13",
+        "dependencyLockSha256": "ce35d80479428e83460a6afa2b58b92a39790834b312a00f4dad711e68400bb4"
+      }
+    ]
+  },
+  "jointDependencyPreparation": {
+    "packages": [
+      {
+        "name": "dsh-connect-workbuddy",
+        "version": "5.21.2",
+        "sha256": "3237011989e3d52483c1ec0e76874dd4d2f296a5b119cd25a08385cee0ab3fc0",
+        "integrity": "sha512-Yu2W+/WUCzPhP2fUi45B+L98GP7xTYQqSc0/XM7lQedaids5Kmj2LBqyJ3zI7SsrN4gtt84ZOnFqdlbKVU5NZg=="
+      },
+      {
+        "name": "dsh-plugin-ops-bundle",
+        "version": "0.20.8",
+        "sha256": "14b914c803cbdec515b61d44c41fa9f0be3cfc720e9b24c696980a06e24d1794",
+        "integrity": "sha512-QV/NVtRNqVfdLN0hT1HashQdu7cUhAFmpf7CFQn8MCBpsB+gHX9Ii2ZPiLQo3bY4b9+D1CmOcaOYSmcPKmnoXw=="
+      },
+      {
+        "name": "dsh-plugin-mgr",
+        "version": "0.2.13",
+        "sha256": "d4022f212060921d40d74ed18ac2dfc3cafc5be529e297b49e125b7294b32228",
+        "integrity": "sha512-Dp4ITiH2+wf6VdCASx3Q0W+MdVrqSA2QScGpD5e9PE15+21HVfdUAxEMN5/DXNV/WrsGL/LD6/mhvDIwP9gYaw=="
+      },
+      {
+        "name": "dsh-free-search",
+        "version": "0.9.41",
+        "sha256": "a9440128741e4e5f2d09810873fbd057a149c1117230550a98f79cab5fa05030",
+        "integrity": "sha512-d77vythaU13nuEsJN2LxScTWqiLKbj5zA0tFgxCqHLSnid7wa2Ep9/iqzM39sgvYpcqZ9dk9n/9r2nF0oA64XQ=="
+      },
+      {
+        "name": "dsh-rea",
+        "version": "1.2.0",
+        "sha256": "3671ae98e98d3f736cccb2d89a822d72fa2e142da5b89aa437f7082f3ee621b3",
+        "integrity": "sha512-nioBr1WqCACU9K7N6h6NLw9i03vAg/IWnJRtprTA7kdsGYRg/gptO70obW51ijtnZJw5dR5BjiV5R4KkcBfigA=="
+      }
+    ],
+    "lockedEntries": 198,
+    "dependencyLockSha256": "e88b69d21a54d7c179de28d16bdf24df0e4aff518253ffec7661900f45d66cab",
+    "originalFilesAndEntrypointsVerified": true
+  },
+  "checks": {
+    "desktopBuildAndTypecheck": "passed",
+    "pluginSystemAndExtensionHost": {
+      "passed": 185,
+      "ignored": 6
+    },
+    "dshRuntime": {
+      "passed": 61,
+      "skipped": 1
+    }
+  },
+  "remaining": [
+    "top-level workspace command (No workspaces found)",
+    "release preflight and installers",
+    "Windows and Linux",
+    "production shared host coordination",
+    "Settings online update and cancellation",
+    "public Loader and original Mgr page business"
+  ]
+}

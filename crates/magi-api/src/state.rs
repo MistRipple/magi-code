@@ -289,7 +289,7 @@ pub struct RunnerManager {
     /// 同一个持久化事务，Runner 不允许绕过该入口直接写 projection。
     checkpoint_persist: Option<TaskCheckpointPersist>,
     /// Maps a session to the root task IDs whose runners should be killed
-    /// when the session is closed (design 1.5: Session-Runner linkage).
+    /// when the session is closed (Session-Runner linkage).
     session_runner_index: Arc<Mutex<HashMap<SessionId, Vec<String>>>>,
 }
 
@@ -504,7 +504,7 @@ impl RunnerManager {
                 let cycle = bg_handle.cycle_count.fetch_add(1, Ordering::Relaxed) + 1;
                 let mut checkpointed_this_cycle = false;
 
-                // Checkpoint policy consumption (design 3.2).
+                // Checkpoint policy consumption.
                 if let Some(ref persist) = bg_checkpoint_persist {
                     let should_checkpoint = if let Some(root_task) =
                         bg_task_store.get_task(&root_id)
@@ -1451,12 +1451,8 @@ pub struct ApiState {
     execution_resources: ExecutionResourceCoordinator,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
-    /// 受信扩展宿主的运行状态来源；None 表示没有扩展宿主（例如纯 API 测试）。
-    pub(crate) extension_status: Option<Arc<dyn ExtensionStatusSource>>,
-    /// 插件视图后端路由的执行端口；None 表示没有可执行扩展。
-    pub(crate) plugin_route_executor: Option<Arc<dyn PluginRouteExecutor>>,
-    /// 上游生态插件的翻译工具链（随包 Node 与兼容运行时）；None 表示本机不能翻译上游插件。
-    pub(crate) plugin_toolchain: Option<PluginToolchain>,
+    /// 原生 DSH 插件平台端口（daemon 的共享宿主与包管理协调器实现）。
+    pub(crate) native_plugin_platform: Option<Arc<dyn crate::native_plugins::NativePluginPlatform>>,
     /// 扩展 `input` 钩子端口；None 表示没有可执行扩展。
     pub(crate) input_guard: Option<Arc<dyn magi_conversation_runtime::extension_hooks::InputGuard>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
@@ -1464,9 +1460,6 @@ pub struct ApiState {
     pub(crate) bind_host: String,
     /// 插件安装、授权和生命周期的唯一 daemon 领域服务。
     pub plugin_manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
-    pub(crate) plugin_jobs: Arc<crate::plugin_jobs::PluginJobs>,
-    pub(crate) plugin_installations: Arc<crate::plugin_installations::PluginInstallations>,
-    /// 升级时执行插件数据格式转换的 Worker 执行者；未装配时需要转换的升级被拒绝。
     pub(crate) mcp_service: Arc<crate::mcp_runtime::McpServiceRuntime>,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub conversation_registry: Arc<ConversationRegistry>,
@@ -2035,63 +2028,6 @@ fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
     }
 }
 
-/// 受信扩展宿主的监管状态与生命周期端口（daemon 的 ExtensionRuntime 实现它）。
-/// 状态属于宿主监管，插件管理器与 API 都不持有第二份。
-pub trait ExtensionStatusSource: Send + Sync {
-    /// 沿唯一监管器收敛已提交的激活意图；不更改安装、启停或授权事实。
-    fn reconcile(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
-        Box::pin(async { Err("扩展宿主未提供运行目录收敛端口".into()) })
-    }
-    fn validate_settings(
-        &self,
-        _plugin_id: String,
-        _value: serde_json::Value,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
-        Box::pin(async { Err("扩展宿主未提供设置校验端口".into()) })
-    }
-    fn status(
-        &self,
-        plugin_id: &str,
-    ) -> Option<magi_app_server_protocol::generated::PluginRuntimeStatus>;
-    /// 生命周期切换前关闭宿主准入并等待进程树退出；guard 登记保持到提交后的收敛。
-    fn quiesce(
-        &self,
-        _plugin_id: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
-        Box::pin(async { Err("扩展宿主未提供生命周期停止端口".into()) })
-    }
-}
-
-/// 翻译上游生态插件所需的本机工具链：随包 Node 与兼容运行时目录（含 `cli.mjs`）。
-/// 与扩展宿主使用同一份解析结果，API 只据此启动翻译进程，不自行寻找 Node。
-#[derive(Clone, Debug)]
-pub struct PluginToolchain {
-    pub node: std::path::PathBuf,
-    pub compat: std::path::PathBuf,
-}
-
-/// 插件视图后端路由的执行端口（daemon 的 PluginServices 实现）。
-/// 路由处理器运行在受信扩展宿主里；API 只转交请求，不持有插件状态，也不解释路由语义。
-pub trait PluginRouteExecutor: Send + Sync {
-    /// 把视图请求交给该插件的宿主。调用方（HTTP 请求）被丢弃时，实现应取消宿主侧的调用。
-    fn call(
-        &self,
-        plugin_id: String,
-        request: magi_app_server_protocol::generated::PluginRouteCallRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        magi_app_server_protocol::generated::PluginRouteCallResult,
-                        ApiError,
-                    >,
-                > + Send,
-        >,
-    >;
-}
-
 mod browser;
 mod persistence;
 mod session_git;
@@ -2115,9 +2051,6 @@ impl ApiState {
                 UtcMillis::now().0
             )))
             .expect("ApiState plugin manager should initialize");
-        let plugin_installations = Arc::new(
-            crate::plugin_installations::PluginInstallations::open(&plugin_manager),
-        );
         let plugin_manager = Arc::new(Mutex::new(plugin_manager));
         let browser_authority = Arc::new(Mutex::new(BrowserAuthority::new()));
         let browser_write_lock = Arc::new(Mutex::new(()));
@@ -2248,21 +2181,12 @@ impl ApiState {
             execution_resources,
             skill_runtime: None,
             skill_dispatch_runtime: None,
-            extension_status: None,
-            plugin_route_executor: None,
-            plugin_toolchain: None,
-            plugin_installations,
+            native_plugin_platform: None,
             input_guard: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             bind_host: "127.0.0.1".to_string(),
             plugin_manager,
             mcp_service: Arc::new(crate::mcp_runtime::McpServiceRuntime::in_memory()),
-            plugin_jobs: Arc::new(crate::plugin_jobs::PluginJobs::open(
-                std::env::temp_dir().join(format!(
-                    "magi-jobs-{}.json",
-                    magi_core::EventId::unique("test")
-                )),
-            )),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry,
             turn_coordinator,
@@ -2290,15 +2214,7 @@ impl ApiState {
         mut self,
         manager: Arc<Mutex<magi_plugin_system::PluginManager>>,
     ) -> Self {
-        self.plugin_installations =
-            Arc::new(crate::plugin_installations::PluginInstallations::open(
-                &manager.lock().expect("plugin manager assembly"),
-            ));
         self.plugin_manager = manager;
-        // Builder 的装配顺序不能让实时 Skill provider 永久捕获临时 manager。
-        if let Some(runtime) = self.skill_runtime.clone() {
-            self = self.with_skill_runtime(runtime);
-        }
         self
     }
 
@@ -2620,10 +2536,6 @@ impl ApiState {
         self
     }
 
-    pub fn start_plugin_jobs(&self) {
-        self.plugin_jobs.start(self.clone());
-    }
-
     /// 按原生 MCP 自己持久化的开关恢复监听，不读取或依赖插件安装/激活状态。
     pub fn start_mcp_service_if_enabled(&self) {
         let state = self.clone();
@@ -2696,66 +2608,15 @@ impl ApiState {
         mut self,
         skill_runtime: Arc<magi_skill_runtime::SkillRuntime>,
     ) -> Self {
-        let manager = self.plugin_manager.clone();
-        skill_runtime
-            .registry()
-            .set_live_provider(Arc::new(move || {
-                let manifests = manager
-                    .lock()
-                    .ok()
-                    .and_then(|manager| manager.manifests().ok())
-                    .unwrap_or_default();
-                manifests
-                    .into_iter()
-                    .flat_map(|manifest| {
-                        let plugin_id = manifest.id;
-                        manifest.contributions.skills.into_iter().map(move |skill| {
-                            magi_skill_runtime::SkillDefinition {
-                                description: skill.description,
-                                skill_id: magi_plugin_system::ContributionRef::new(
-                                    &plugin_id, skill.id,
-                                )
-                                .identity(),
-                                title: skill.title,
-                                instruction: skill.instruction,
-                                metadata: magi_skill_runtime::SkillMetadata {
-                                    category: "plugin".into(),
-                                    tags: vec![plugin_id.clone()],
-                                },
-                                restrict_standard_tools: false,
-                                allowed_tools: vec![],
-                                custom_tool_bindings: vec![],
-                                prompt_priority: 50,
-                            }
-                        })
-                    })
-                    .collect()
-            }));
         self.skill_runtime = Some(skill_runtime);
         self
     }
 
-    pub fn with_extension_status(mut self, source: Arc<dyn ExtensionStatusSource>) -> Self {
-        self.extension_status = Some(source);
-        self
-    }
-
-    pub fn with_plugin_toolchain(mut self, toolchain: PluginToolchain) -> Self {
-        self.plugin_toolchain = Some(toolchain);
-        self
-    }
-
-    pub fn with_optional_plugin_toolchain(mut self, toolchain: Option<PluginToolchain>) -> Self {
-        self.plugin_toolchain = toolchain;
-        self
-    }
-
-    pub(crate) fn managed_process_group(&self) -> &ManagedProcessGroup {
-        &self.managed_process_group
-    }
-
-    pub fn with_plugin_route_executor(mut self, executor: Arc<dyn PluginRouteExecutor>) -> Self {
-        self.plugin_route_executor = Some(executor);
+    pub fn with_native_plugin_platform(
+        mut self,
+        platform: Arc<dyn crate::native_plugins::NativePluginPlatform>,
+    ) -> Self {
+        self.native_plugin_platform = Some(platform);
         self
     }
 

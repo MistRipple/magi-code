@@ -1804,12 +1804,11 @@ pub struct PluginInstalled {
     pub upstream_archive_path: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "translationRuntime")]
-    pub translation_runtime: Option<PluginTranslationRuntimeStatus>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "disabledBy")]
     pub disabled_by: Option<PluginDisableInfo>,
+    #[serde(default)]
+    #[serde(rename = "reinstallRequired")]
+    pub reinstall_required: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1817,6 +1816,8 @@ pub struct PluginInstalled {
 pub enum PluginRuntimeState {
     #[serde(rename = "starting")]
     Starting,
+    #[serde(rename = "waiting")]
+    Waiting,
     #[serde(rename = "running")]
     Running,
     #[serde(rename = "restarting")]
@@ -1842,12 +1843,26 @@ pub struct PluginRuntimeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "instanceId")]
     pub instance_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "unmountedSlots")]
+    pub unmounted_slots: Vec<String>,
+    #[serde(default)]
+    #[serde(rename = "mountedSlots")]
+    pub mounted_slots: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "hasSettingsView")]
+    pub has_settings_view: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginList {
     pub plugins: Vec<PluginInstalled>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "configurationError")]
+    pub configuration_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1976,6 +1991,10 @@ pub struct PluginRouteCallRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "expectedInstanceId")]
     pub expected_instance_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "sessionId")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3550,28 +3569,6 @@ pub struct PluginUpstreamRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginTranslationNote {
-    pub name: String,
-    pub status: String,
-    pub note: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginTranslationSummary {
-    pub tools: Vec<String>,
-    pub commands: Vec<String>,
-    #[serde(rename = "modelSources")]
-    pub model_sources: Vec<String>,
-    #[serde(rename = "unmountedSlots")]
-    pub unmounted_slots: Vec<String>,
-    pub degraded: Vec<PluginTranslationNote>,
-    #[serde(rename = "omittedFiles")]
-    pub omitted_files: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginUpstreamPreview {
     pub candidate: PluginCandidatePreview,
     pub package: String,
@@ -3579,14 +3576,9 @@ pub struct PluginUpstreamPreview {
     pub integrity: String,
     pub publisher: String,
     pub official: bool,
-    pub translation: PluginTranslationSummary,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github: Option<PluginGithubSource>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "translationRuntime")]
-    pub translation_runtime: Option<PluginTranslationRuntimeStatus>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3629,32 +3621,6 @@ pub struct PluginRuntimeCatalog {
     pub settings_schema: Option<Value>,
     #[serde(default)]
     pub skills: Vec<PluginSkillContribution>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginDshCompatibilityProjection {
-    pub revision: u64,
-    #[serde(rename = "runtimeVersion")]
-    pub runtime_version: String,
-    #[serde(rename = "runtimeId")]
-    pub runtime_id: String,
-    pub exemptions: std::collections::BTreeMap<String, Vec<String>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginDshVersionExemptionRequest {
-    pub target: String,
-    #[serde(rename = "runtimeVersion")]
-    pub runtime_version: String,
-    #[serde(rename = "expectedRuntimeId")]
-    pub expected_runtime_id: String,
-    #[serde(rename = "expectedRevision")]
-    pub expected_revision: u64,
-    pub enabled: bool,
-    #[serde(rename = "acceptRisk")]
-    pub accept_risk: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3999,34 +3965,6 @@ pub struct PluginGithubSource {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PluginTranslationRuntimeState {
-    #[serde(rename = "current")]
-    Current,
-    #[serde(rename = "updateAvailable")]
-    UpdateAvailable,
-    #[serde(rename = "unavailable")]
-    Unavailable,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PluginTranslationRuntimeStatus {
-    pub state: PluginTranslationRuntimeState,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "installedId")]
-    pub installed_id: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "currentId")]
-    pub current_id: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
